@@ -1,0 +1,45 @@
+# Environment
+.env
+
+# Dependencies
+node_modules/
+
+# Native C++ addon build output
+build/
+native/build/
+*.node
+
+# SQLite databases (generated at runtime)
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Machine Learning Models (large binaries)
+models/
+
+# Claude CLI data
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Markdown
+*.md
+report.txt
+terminal.txt
+
+test-*
+
+native/vendor/*
+native/tree-sitter-arc/*

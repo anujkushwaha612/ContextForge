@@ -1,0 +1,27 @@
+# Default ContextForge configuration — copy to contextforge.config.yaml and customize for your setup
+proxy:
+  listen: "0.0.0.0:8080"
+  tls:
+    enabled: false
+    cert: "./certs/server.crt"
+    key: "./certs/server.key"
+
+providers:
+  openai:
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+  anthropic:
+    base_url: "https://api.anthropic.com/v1"
+    api_key: "${ANTHROPIC_API_KEY}"
+  groq:
+    base_url: "https://api.groq.com/openai/v1"
+    api_key: "${GROQ_API_KEY}"
+  ollama:
+    base_url: "http://localhost:11434/v1"
+
+default_provider: "openai"
+
+compression:
+  enabled: true
+  mode: "balanced"       # conservative | balanced | aggressive | lossless
+  fidelity_threshold: 0.95

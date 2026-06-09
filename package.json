@@ -1,0 +1,33 @@
+{
+  "name": "contextforge",
+  "version": "0.1.0",
+  "main": "src/index.js",
+  "bin": {
+    "contextforge": "src/cli/index.js"
+  },
+  "gypfile": false,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --env-file=.env src/server.js",
+    "start": "node src/server.js",
+    "agent": "node --env-file=.env langraph-agent.js"
+  },
+  "keywords": [
+    "llm",
+    "proxy",
+    "compression",
+    "context",
+    "openai",
+    "anthropic"
+  ],
+  "author": "",
+  "license": "ISC",
+  "description": "An Intelligent LLM Proxy — Context Compression, Semantic Caching, Model Routing",
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "better-sqlite3": "^12.10.0",
+    "crypto": "^1.0.1",
+    "node-addon-api": "^8.8.0",
+    "tiktoken": "^1.0.22"
+  }
+}
