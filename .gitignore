@@ -43,3 +43,5 @@ test-*
 
 native/vendor/*
 native/tree-sitter-arc/*
+
+CF-savings/

@@ -24,19 +24,20 @@
  * Check if the request has an explicit bypass header.
  * Mirrors headroom's _headroom_bypass_enabled helper.
  */
+
+import { countTokens } from "../compression/compressionHelper.js";
+
 export function isBypassEnabled(headers) {
   // Direct bypass header
-  const bypass = headers["x-contextforge-bypass"] ||
-                 headers["x-headroom-bypass"] ||
-                 "";
+  const bypass =
+    headers["x-contextforge-bypass"] || headers["x-headroom-bypass"] || "";
   if (["true", "1", "yes", "on"].includes(bypass.toLowerCase().trim())) {
     return true;
   }
 
   // Mode header
-  const mode = headers["x-contextforge-mode"] ||
-               headers["x-headroom-mode"] ||
-               "";
+  const mode =
+    headers["x-contextforge-mode"] || headers["x-headroom-mode"] || "";
   if (mode.toLowerCase().trim() === "passthrough") {
     return true;
   }
@@ -57,11 +58,11 @@ export class CompressionDecision {
     hasMessages,
   }) {
     // Freeze so downstream code cannot mutate the decision
-    this.shouldCompress        = shouldCompress;
-    this.passthroughReason     = passthroughReason;     // null when compressing
-    this.bypassHeaderSet       = bypassHeaderSet;
+    this.shouldCompress = shouldCompress;
+    this.passthroughReason = passthroughReason; // null when compressing
+    this.bypassHeaderSet = bypassHeaderSet;
     this.configOptimizeEnabled = configOptimizeEnabled;
-    this.hasMessages           = hasMessages;
+    this.hasMessages = hasMessages;
     Object.freeze(this);
   }
 
@@ -72,12 +73,23 @@ export class CompressionDecision {
    * @param {boolean} optimize  - From config/env (CF_OPTIMIZE env var)
    * @param {Array}   messages  - messages array from parsed payload
    */
-  static decide({ headers, optimize = true, messages }) {
-    const bypass    = isBypassEnabled(headers);
-    const configOk  = Boolean(optimize);
-    const hasMsgs   = Array.isArray(messages) && messages.length > 0;
+  static decide({ headers, optimize = true, messages, payload }) {
+    const tokenCount = countTokens(payload);
 
-    // Precedence: bypass > config > no_messages > compress
+    if (tokenCount < 500) {
+      return new CompressionDecision({
+        shouldCompress: false,
+        passthroughReason: `${tokenCount} tokens below minimum (500)`,
+        bypassHeaderSet: false,
+        configOptimizeEnabled: Boolean(optimize),
+        hasMessages: Array.isArray(messages) && messages.length > 0,
+      });
+    }
+
+    const bypass = isBypassEnabled(headers);
+    const configOk = Boolean(optimize);
+    const hasMsgs = Array.isArray(messages) && messages.length > 0;
+
     let reason = null;
     let should = false;
 
@@ -96,11 +108,11 @@ export class CompressionDecision {
     }
 
     return new CompressionDecision({
-      shouldCompress:        should,
-      passthroughReason:     reason,
-      bypassHeaderSet:       bypass,
+      shouldCompress: should,
+      passthroughReason: reason,
+      bypassHeaderSet: bypass,
       configOptimizeEnabled: configOk,
-      hasMessages:           hasMsgs,
+      hasMessages: hasMsgs,
     });
   }
 

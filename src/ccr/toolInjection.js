@@ -1,26 +1,34 @@
 /**
- * CCR Tool Injection — Port of headroom/ccr/tool_injection.py
+ * CCR Tool Injection
  *
- * Injects the contextforge_retrieve tool into requests when
- * compressed content is detected. Implements the sticky-on pattern
- * (PR-B7): once injected, the tool stays for the entire session.
+ * Fix 3: Tool schema sanitization cache in translateAnthropicToOpenAI
+ * is handled in helper.js. Here we just ensure scanForMarkers is
+ * incremental-friendly (stateless, called with only new messages).
  */
 
 export const CCR_TOOL_NAME = "contextforge_retrieve";
 
 // ─────────────────────────────────────────────
-// Tool definition per provider format
+// Tool definition — built once per provider, cached
 // ─────────────────────────────────────────────
 
+const _toolDefCache = new Map();
+
 export function createCCRToolDefinition(provider = "anthropic") {
+  if (_toolDefCache.has(provider)) {
+    return _toolDefCache.get(provider);
+  }
+
   const description =
     "Retrieve original uncompressed content that was compressed to save tokens. " +
     "Use this when you need more data than what's shown in compressed tool results. " +
     "The vault_id is provided in compression markers like " +
     "[content compressed... vault_id=cf_vault_xxxxx].";
 
+  let def;
+
   if (provider === "anthropic") {
-    return {
+    def = {
       name: CCR_TOOL_NAME,
       description,
       input_schema: {
@@ -40,50 +48,59 @@ export function createCCRToolDefinition(provider = "anthropic") {
         required: ["vault_id"],
       },
     };
+  } else {
+    def = {
+      type: "function",
+      function: {
+        name: CCR_TOOL_NAME,
+        description,
+        parameters: {
+          type: "object",
+          properties: {
+            vault_id: {
+              type: "string",
+              description: "Vault ID from the compression marker",
+            },
+            search_query: {
+              type: "string",
+              description: "Optional search query to filter results",
+            },
+          },
+          required: ["vault_id"],
+        },
+      },
+    };
   }
 
-  // OpenAI format (default — what your translated payload uses)
-  return {
-    type: "function",
-    function: {
-      name: CCR_TOOL_NAME,
-      description,
-      parameters: {
-        type: "object",
-        properties: {
-          vault_id: {
-            type: "string",
-            description: "Vault ID from the compression marker",
-          },
-          search_query: {
-            type: "string",
-            description: "Optional search query to filter results",
-          },
-        },
-        required: ["vault_id"],
-      },
-    },
-  };
+  _toolDefCache.set(provider, def);
+  return def;
 }
 
 // ─────────────────────────────────────────────
-// Marker detection — scans messages for vault IDs
-// Multiple patterns handle different compressor formats
+// Marker patterns — compiled once at module load
 // ─────────────────────────────────────────────
 
 const MARKER_PATTERNS = [
-  // Standard ContextForge vault format
   /vault_id[=:]\s*["']?(cf_vault_[a-z0-9_]+)["']?/gi,
-  // Tiered memory eviction format
   /Vault:\s*(cf_vault_[a-z0-9_]+)/gi,
-  // Tombstone format from compressSingleMessage
   /vault_id:\s*'(cf_vault_[a-z0-9_]+)'/gi,
-  // Generic fallback
   /\[.*?compressed.*?vault[_-]?id[=:]\s*([a-z0-9_]+)\]/gi,
 ];
 
+function extractVaultIds(text, resultSet) {
+  for (const pattern of MARKER_PATTERNS) {
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      if (match[1]) resultSet.add(match[1]);
+    }
+  }
+}
+
 /**
- * Scan messages for compression markers and extract vault IDs.
+ * Scan messages for compression markers.
+ * Stateless — caller decides which messages to pass (new vs all).
+ * In applyCCRPipeline we pass only new messages (incremental).
  */
 export function scanForMarkers(messages) {
   const detectedVaultIds = new Set();
@@ -118,31 +135,20 @@ export function scanForMarkers(messages) {
   return [...detectedVaultIds];
 }
 
-function extractVaultIds(text, resultSet) {
-  for (const pattern of MARKER_PATTERNS) {
-    pattern.lastIndex = 0;
-    let match;
-    while ((match = pattern.exec(text)) !== null) {
-      const vaultId = match[1];
-      if (vaultId) resultSet.add(vaultId);
-    }
-  }
-}
-
 // ─────────────────────────────────────────────
-// CCRToolInjector class
+// CCRToolInjector
 // ─────────────────────────────────────────────
 
 export class CCRToolInjector {
   constructor({
-    provider = "openai",        // "openai" after translation
+    provider = "openai",
     injectTool = true,
-    injectSystemInstructions = false, // we use tombstone markers instead
+    injectSystemInstructions = false,
   } = {}) {
-    this.provider = provider;
-    this.injectTool = injectTool;
+    this.provider                = provider;
+    this.injectTool              = injectTool;
     this.injectSystemInstructions = injectSystemInstructions;
-    this._detectedVaultIds = [];
+    this._detectedVaultIds       = [];
   }
 
   get hasCompressedContent() {
@@ -153,20 +159,11 @@ export class CCRToolInjector {
     return [...this._detectedVaultIds];
   }
 
-  /**
-   * Scan messages for compression markers.
-   */
   scanForMarkers(messages) {
     this._detectedVaultIds = scanForMarkers(messages);
     return this._detectedVaultIds;
   }
 
-  /**
-   * Inject the CCR tool into the tools array.
-   *
-   * PR-B7 sticky-on: if sessionHasDoneCCR is true, inject even when
-   * this turn has no fresh compression markers.
-   */
   injectToolDefinition(tools, { sessionHasDoneCCR = false } = {}) {
     if (!this.injectTool) return { tools: tools || [], wasInjected: false };
 
@@ -187,43 +184,42 @@ export class CCRToolInjector {
     return { tools: [...currentTools, ccrTool], wasInjected: true };
   }
 
-  /**
-   * Full request processing: scan + inject.
-   */
   processRequest(messages, tools, { sessionHasDoneCCR = false } = {}) {
-    this.scanForMarkers(messages);
+    // Note: in the incremental path (called from applyCCRPipeline),
+    // _detectedVaultIds is pre-set by the caller — don't overwrite
+    // by calling scanForMarkers on all messages here.
+    // Only scan if not already set externally.
+    if (this._detectedVaultIds.length === 0 && !sessionHasDoneCCR) {
+      this.scanForMarkers(messages);
+    }
 
     const shouldProcess = sessionHasDoneCCR || this.hasCompressedContent;
     if (!shouldProcess) {
       return { messages, tools, toolWasInjected: false };
     }
 
-    const { tools: updatedTools, wasInjected } = this.injectToolDefinition(tools, {
-      sessionHasDoneCCR,
-    });
+    const { tools: updatedTools, wasInjected } = this.injectToolDefinition(
+      tools,
+      { sessionHasDoneCCR },
+    );
 
     return {
       messages,
-      tools: updatedTools,
+      tools:          updatedTools,
       toolWasInjected: wasInjected,
     };
   }
 }
 
-/**
- * Parse a CCR tool call to extract vault_id and search_query.
- * Handles both OpenAI and Anthropic wire formats.
- */
 export function parseCCRToolCall(toolCall, provider = "openai") {
   let name, inputData;
 
   if (provider === "anthropic") {
-    name = toolCall.name;
+    name      = toolCall.name;
     inputData = toolCall.input || {};
   } else {
-    // OpenAI format
     const fn = toolCall.function || {};
-    name = fn.name;
+    name     = fn.name;
     try {
       inputData = JSON.parse(fn.arguments || "{}");
     } catch {
@@ -234,7 +230,7 @@ export function parseCCRToolCall(toolCall, provider = "openai") {
   if (name !== CCR_TOOL_NAME) return { vaultId: null, searchQuery: null };
 
   return {
-    vaultId: inputData.vault_id || null,
+    vaultId:     inputData.vault_id    || null,
     searchQuery: inputData.search_query || null,
   };
 }

@@ -1,14 +1,3 @@
-/**
- * Multi-turn context tracking for CCR.
- * Port of headroom/ccr/context_tracker.py
- *
- * Tracks compressed content across conversation turns and
- * proactively recommends expansion when new queries need that data.
- *
- * Critical: every operation is scoped to a workspaceKey to prevent
- * cross-project content leaks (the bug Headroom hit in production).
- */
-
 // ─────────────────────────────────────────────
 // Data structures
 // ─────────────────────────────────────────────
@@ -25,25 +14,25 @@ class CompressedContext {
     sampleContent,
     workspaceKey,
   }) {
-    this.vaultId             = vaultId;
-    this.turnNumber          = turnNumber;
-    this.timestamp           = timestamp;
-    this.toolName            = toolName;
-    this.originalItemCount   = originalItemCount;
+    this.vaultId = vaultId;
+    this.turnNumber = turnNumber;
+    this.timestamp = timestamp;
+    this.toolName = toolName;
+    this.originalItemCount = originalItemCount;
     this.compressedItemCount = compressedItemCount;
-    this.queryContext        = queryContext;
-    this.sampleContent       = sampleContent.slice(0, 2000);
-    this.workspaceKey        = workspaceKey;
+    this.queryContext = queryContext;
+    this.sampleContent = sampleContent.slice(0, 2000);
+    this.workspaceKey = workspaceKey;
   }
 }
 
 class ExpansionRecommendation {
   constructor({ vaultId, reason, relevanceScore, expandFull, searchQuery }) {
-    this.vaultId        = vaultId;
-    this.reason         = reason;
+    this.vaultId = vaultId;
+    this.reason = reason;
     this.relevanceScore = relevanceScore;
-    this.expandFull     = expandFull ?? true;
-    this.searchQuery    = searchQuery ?? null;
+    this.expandFull = expandFull ?? true;
+    this.searchQuery = searchQuery ?? null;
   }
 }
 
@@ -53,11 +42,11 @@ class ExpansionRecommendation {
 
 export class ContextTracker {
   constructor({
-    enabled              = true,
-    maxTrackedContexts   = 100,
-    relevanceThreshold   = 0.3,
-    maxContextAgeMs      = 300_000,  // 5 minutes
-    proactiveExpansion   = true,
+    enabled = true,
+    maxTrackedContexts = 100,
+    relevanceThreshold = 0.3,
+    maxContextAgeMs = 300_000, // 5 minutes
+    proactiveExpansion = true,
     maxProactiveExpansions = 2,
   } = {}) {
     this.config = {
@@ -83,19 +72,19 @@ export class ContextTracker {
   trackCompression({
     vaultId,
     turnNumber,
-    toolName       = null,
-    originalCount  = 0,
+    toolName = null,
+    originalCount = 0,
     compressedCount = 0,
     workspaceKey,
-    queryContext   = "",
-    sampleContent  = "",
+    queryContext = "",
+    sampleContent = "",
   }) {
     if (!this.config.enabled) return;
 
     if (!workspaceKey) {
       console.warn(
         "[ContextTracker] trackCompression called with empty workspaceKey — skipping. " +
-        "This prevents cross-project leaks."
+          "This prevents cross-project leaks.",
       );
       return;
     }
@@ -103,9 +92,9 @@ export class ContextTracker {
     const ctx = new CompressedContext({
       vaultId,
       turnNumber,
-      timestamp:           Date.now(),
+      timestamp: Date.now(),
       toolName,
-      originalItemCount:   originalCount,
+      originalItemCount: originalCount,
       compressedItemCount: compressedCount,
       queryContext,
       sampleContent,
@@ -131,7 +120,7 @@ export class ContextTracker {
 
     console.log(
       `[ContextTracker] Tracked compression ${vaultId} ` +
-      `(${originalCount} → ${compressedCount} items) workspace=${workspaceKey}`
+        `(${originalCount} → ${compressedCount} items) workspace=${workspaceKey}`,
     );
   }
 
@@ -146,7 +135,7 @@ export class ContextTracker {
     if (!workspaceKey) {
       console.debug(
         "[ContextTracker] analyzeQuery called with empty workspaceKey — " +
-        "returning no recommendations (fail-closed)"
+          "returning no recommendations (fail-closed)",
       );
       return [];
     }
@@ -173,16 +162,18 @@ export class ContextTracker {
 
       if (relevance >= this.config.relevanceThreshold) {
         const { expandFull, searchQuery } = this._determineExpansionType(
-          query, ctx, relevance
+          query,
+          ctx,
+          relevance,
         );
         recommendations.push(
           new ExpansionRecommendation({
             vaultId,
-            reason:         this._generateReason(query, ctx, relevance),
+            reason: this._generateReason(query, ctx, relevance),
             relevanceScore: relevance,
             expandFull,
             searchQuery,
-          })
+          }),
         );
       }
     }
@@ -235,12 +226,12 @@ export class ContextTracker {
       const toolLower = ctx.toolName.toLowerCase();
       if (
         ["find", "glob", "search", "grep", "ls", "bash"].some((w) =>
-          toolLower.includes(w)
+          toolLower.includes(w),
         )
       ) {
         if (
           ["file", "where", "find", "show", "list"].some((w) =>
-            queryLower.includes(w)
+            queryLower.includes(w),
           )
         ) {
           score += 0.1;
@@ -253,19 +244,93 @@ export class ContextTracker {
 
   _extractKeywords(text) {
     const STOP_WORDS = new Set([
-      "the","a","an","is","are","was","were","be","been","being",
-      "have","has","had","do","does","did","will","would","could",
-      "should","may","might","must","shall","can","to","of","in",
-      "for","on","with","at","by","from","as","into","and","but",
-      "if","or","this","that","these","those","what","which","who",
-      "it","its","me","my","i","you","we","they","them","their",
-      "here","there","when","where","why","how","all","each","few",
-      "more","most","just","only","own","same","so","than","too",
-      "very","not","no","nor","such","then","once",
+      "the",
+      "a",
+      "an",
+      "is",
+      "are",
+      "was",
+      "were",
+      "be",
+      "been",
+      "being",
+      "have",
+      "has",
+      "had",
+      "do",
+      "does",
+      "did",
+      "will",
+      "would",
+      "could",
+      "should",
+      "may",
+      "might",
+      "must",
+      "shall",
+      "can",
+      "to",
+      "of",
+      "in",
+      "for",
+      "on",
+      "with",
+      "at",
+      "by",
+      "from",
+      "as",
+      "into",
+      "and",
+      "but",
+      "if",
+      "or",
+      "this",
+      "that",
+      "these",
+      "those",
+      "what",
+      "which",
+      "who",
+      "it",
+      "its",
+      "me",
+      "my",
+      "i",
+      "you",
+      "we",
+      "they",
+      "them",
+      "their",
+      "here",
+      "there",
+      "when",
+      "where",
+      "why",
+      "how",
+      "all",
+      "each",
+      "few",
+      "more",
+      "most",
+      "just",
+      "only",
+      "own",
+      "same",
+      "so",
+      "than",
+      "too",
+      "very",
+      "not",
+      "no",
+      "nor",
+      "such",
+      "then",
+      "once",
     ]);
 
-    return (text.match(/\b[a-z][a-z0-9_./-]*[a-z0-9]\b|\b[a-z]{2,}\b/g) || [])
-      .filter((w) => !STOP_WORDS.has(w) && w.length >= 2);
+    return (
+      text.match(/\b[a-z][a-z0-9_./-]*[a-z0-9]\b|\b[a-z]{2,}\b/g) || []
+    ).filter((w) => !STOP_WORDS.has(w) && w.length >= 2);
   }
 
   _determineExpansionType(query, ctx, relevance) {
@@ -276,8 +341,18 @@ export class ContextTracker {
 
     const keywords = this._extractKeywords(query.toLowerCase());
     const specific = keywords.filter(
-      (k) => k.length >= 4 &&
-        !["file","code","show","find","list","what","more","data"].includes(k)
+      (k) =>
+        k.length >= 4 &&
+        ![
+          "file",
+          "code",
+          "show",
+          "find",
+          "list",
+          "what",
+          "more",
+          "data",
+        ].includes(k),
     );
 
     if (specific.length > 0) {
@@ -290,7 +365,9 @@ export class ContextTracker {
   _generateReason(query, ctx, relevance) {
     const parts = [];
     if (ctx.toolName) parts.push(`from ${ctx.toolName}`);
-    parts.push(`${ctx.originalItemCount} items compressed in turn ${ctx.turnNumber}`);
+    parts.push(
+      `${ctx.originalItemCount} items compressed in turn ${ctx.turnNumber}`,
+    );
     parts.push(relevance > 0.5 ? "high relevance" : "possible relevance");
     return parts.join(", ");
   }
@@ -306,13 +383,13 @@ export class ContextTracker {
   getStats() {
     return {
       trackedContexts: this._contexts.size,
-      currentTurn:     this._currentTurn,
-      config:          this.config,
+      currentTurn: this._currentTurn,
+      config: this.config,
       contexts: [...this._contexts.values()].map((ctx) => ({
-        vaultId:   ctx.vaultId,
-        turn:      ctx.turnNumber,
-        tool:      ctx.toolName,
-        items:     `${ctx.compressedItemCount}/${ctx.originalItemCount}`,
+        vaultId: ctx.vaultId,
+        turn: ctx.turnNumber,
+        tool: ctx.toolName,
+        items: `${ctx.compressedItemCount}/${ctx.originalItemCount}`,
         workspace: ctx.workspaceKey,
       })),
     };

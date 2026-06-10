@@ -4,7 +4,7 @@
  * Tools: memory_save, memory_search, memory_update, memory_delete, memory_list
  *
  * These are REAL tools (not Ghost Interceptor hacks).
- * The LLM calls them → the proxy intercepts before forwarding → executes → 
+ * The LLM calls them → the proxy intercepts before forwarding → executes →
  * injects tool result → continues.
  *
  * This is exactly how headroom does it in memory_handler.py handle_memory_tool_calls()
@@ -37,11 +37,13 @@ export function getMemoryToolDefinitions() {
           properties: {
             content: {
               type: "string",
-              description: "The information to remember. Be specific and self-contained.",
+              description:
+                "The information to remember. Be specific and self-contained.",
             },
             importance: {
               type: "number",
-              description: "Importance score 0.0-1.0. Default 0.5. Use 0.9+ for critical decisions.",
+              description:
+                "Importance score 0.0-1.0. Default 0.5. Use 0.9+ for critical decisions.",
             },
           },
           required: ["content"],
@@ -136,8 +138,8 @@ export function getMemoryToolDefinitions() {
 
 export function injectMemoryTools(payload, { sessionHasMemory = false } = {}) {
   // Check if this request has any memory-related content
-  const hasMemoryMarkers = sessionHasMemory ||
-    payloadHasMemoryContent(payload.messages);
+  const hasMemoryMarkers =
+    sessionHasMemory || payloadHasMemoryContent(payload.messages);
 
   // Always inject — memory tools should always be available
   // (unlike CCR which only injects when vault markers exist)
@@ -158,8 +160,10 @@ export function injectMemoryTools(payload, { sessionHasMemory = false } = {}) {
 function payloadHasMemoryContent(messages) {
   if (!messages) return false;
   for (const msg of messages) {
-    const content = typeof msg.content === "string"
-      ? msg.content : JSON.stringify(msg.content);
+    const content =
+      typeof msg.content === "string"
+        ? msg.content
+        : JSON.stringify(msg.content);
     if (content.includes("mem_") || content.includes("memory_")) return true;
   }
   return false;
@@ -171,8 +175,8 @@ function payloadHasMemoryContent(messages) {
 
 export function hasMemoryToolCalls(message) {
   if (!message?.tool_calls) return false;
-  return message.tool_calls.some(tc =>
-    MEMORY_TOOL_NAMES.has(tc.function?.name)
+  return message.tool_calls.some((tc) =>
+    MEMORY_TOOL_NAMES.has(tc.function?.name),
   );
 }
 
@@ -182,10 +186,11 @@ export function hasMemoryToolCalls(message) {
 // Returns array of tool result messages to append
 // ─────────────────────────────────────────────
 
-export function executeMemoryToolCalls(message, memoryHandler, {
-  userId,
-  workspace = "",
-}) {
+export async function executeMemoryToolCalls(
+  message,
+  memoryHandler,
+  { userId, workspace = "" },
+) {
   if (!message?.tool_calls) return [];
 
   const results = [];
@@ -199,71 +204,74 @@ export function executeMemoryToolCalls(message, memoryHandler, {
       args = JSON.parse(tc.function?.arguments || "{}");
     } catch (_) {}
 
-    const callId  = tc.id;
-    let   content = "";
+    const callId = tc.id;
+    let content = "";
 
     try {
       if (name === "memory_save") {
-        const id = memoryHandler.save({
+        const id = await memoryHandler.save({
           userId,
           workspace,
-          content:    args.content || "",
+          content: args.content || "",
           importance: args.importance ?? 0.5,
         });
         content = JSON.stringify({
-          status:    "saved",
+          status: "saved",
           memory_id: id,
-          content:   (args.content || "").slice(0, 100),
+          content: (args.content || "").slice(0, 100),
         });
-
       } else if (name === "memory_search") {
-        const found = memoryHandler.search({
+        const found = await memoryHandler.search({
           userId,
           workspace,
           query: args.query || "",
-          topK:  args.top_k ?? 5,
-        });
-        content = JSON.stringify({
-          status:   "found",
-          count:    found.length,
-          memories: found.map(r => ({
-            id:      r.id,
-            content: r.content,
-            score:   Math.round(r.score * 1000) / 1000,
-          })),
+          topK: args.top_k ?? 5,
         });
 
+        // SAFEGUARD: Ensure 'found' is always treated as an array
+        const safeFound = Array.isArray(found) ? found : [];
+
+        content = JSON.stringify({
+          status: "found",
+          count: safeFound.length,
+          memories: safeFound.map((r) => ({
+            id: r.id,
+            content: r.content,
+            score: Math.round((r.score || 0) * 1000) / 1000,
+          })),
+        });
       } else if (name === "memory_update") {
-        const ok = memoryHandler.update({
-          id:      args.memory_id || "",
+        const ok = await memoryHandler.update({
+          id: args.memory_id || "",
           content: args.new_content || "",
         });
         content = JSON.stringify({
-          status:    ok ? "updated" : "not_found",
+          status: ok ? "updated" : "not_found",
           memory_id: args.memory_id,
         });
-
       } else if (name === "memory_delete") {
-        const ok = memoryHandler.delete(args.memory_id || "");
+        const ok = memoryHandler.delete(args.memory_id || ""); // synchronous in memoryHandler
         content = JSON.stringify({
-          status:    ok ? "deleted" : "not_found",
+          status: ok ? "deleted" : "not_found",
           memory_id: args.memory_id,
         });
-
       } else if (name === "memory_list") {
         const limit = Math.min(args.limit ?? 10, 50);
-        const items = memoryHandler.list({ userId, workspace, limit });
+        const items = memoryHandler.list({ userId, workspace, limit }); // synchronous
+
+        // SAFEGUARD: Ensure 'items' is always treated as an array
+        const safeItems = Array.isArray(items) ? items : [];
+
         content = JSON.stringify({
-          status:   "ok",
-          count:    items.length,
-          memories: items.map(r => ({
-            id:         r.id,
-            content:    r.content.slice(0, 150),
+          status: "ok",
+          count: safeItems.length,
+          memories: safeItems.map((r) => ({
+            id: r.id,
+            content: (r.content || "").slice(0, 150),
             created_at: r.createdAt,
           })),
         });
       }
-
     } catch (err) {
       console.error(`[Memory] Tool ${name} failed:`, err.message);
       content = JSON.stringify({ status: "error", error: err.message });
@@ -272,7 +280,7 @@ export function executeMemoryToolCalls(message, memoryHandler, {
     console.log(`[Memory] Executed: ${name} → ${content.slice(0, 80)}`);
 
     results.push({
-      role:         "tool",
+      role: "tool",
       tool_call_id: callId,
       name,
       content,

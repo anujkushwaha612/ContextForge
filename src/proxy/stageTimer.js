@@ -207,4 +207,6 @@ export const STAGES = {
   MEMORY_INJECT: "memory_inject",
   MEMORY_CONTEXT: "memory_context",
   SEMANTIC_DEDUP: "semantic_dedup",
+  CACHE_ALIGN: "cache_align",
+  GRAPH_INJECT: "graph_inject",
 };

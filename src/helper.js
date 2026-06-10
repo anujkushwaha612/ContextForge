@@ -3,8 +3,9 @@ import { existsSync, readFileSync } from "node:fs";
 
 import crypto from "node:crypto";
 import { saveToVault } from "./logging/cacheDb.js"; // Assume this maps to your SQLite writing layer
-import { classifyContent } from "./compression/contentDetector.js";
 import { computeOptimalK } from "./compression/adaptiveSizer.js";
+import { classifyContentAsync } from "./compression/contentDetector.js";
+import { scoreNodesByAnomaly } from "./compression/anomalyScorer.js";
 
 export function detectMutation(payloadStr) {
   const fileOpMatch = payloadStr.match(
@@ -41,100 +42,533 @@ export function hashFile(filePath) {
 // ========================================================
 // 1. INBOUND TRANSLATION: Anthropic JSON -> OpenAI JSON
 // ========================================================
-export function translateAnthropicToOpenAI(payload) {
-  const openAiPayload = JSON.parse(JSON.stringify(payload));
 
-  // Translate System Prompt
-  if (openAiPayload.system) {
-    let sysContent = openAiPayload.system;
-    if (Array.isArray(openAiPayload.system)) {
-      sysContent = openAiPayload.system
-        .filter((s) => s.type === "text")
-        .map((s) => s.text)
-        .join("\n");
+// ─────────────────────────────────────────────
+// Tool array cache
+// One entry per unique tool set — keyed by fast integer fingerprint.
+// Tools never change mid-session so this is a permanent cache.
+// ─────────────────────────────────────────────
+
+const _toolArrayCache = new Map();
+const _TOOL_ARRAY_CACHE_MAX = 20;
+
+function _toolArrayKey(tools) {
+  let key = tools.length;
+  for (let i = 0; i < tools.length; i++) {
+    const t = tools[i];
+    const name = t.name || t.function?.name || "";
+    const schemaStr = JSON.stringify(t.input_schema || t.parameters || {});
+    key = (key * 31 + name.length + schemaStr.length + i) | 0;
+  }
+  return key;
+}
+
+function _sanitizeToolArray(tools) {
+  const key = _toolArrayKey(tools);
+  if (_toolArrayCache.has(key)) return _toolArrayCache.get(key);
+
+  const sanitized = tools.map(_sanitizeTool);
+
+  if (_toolArrayCache.size >= _TOOL_ARRAY_CACHE_MAX) {
+    _toolArrayCache.delete(_toolArrayCache.keys().next().value);
+  }
+  _toolArrayCache.set(key, sanitized);
+  return sanitized;
+}
+
+// ─────────────────────────────────────────────
+// Per-request prefix cache
+//
+// Stores the previous request's raw input messages and translated output.
+// On each request, find how many messages at the START are identical
+// to the previous request (stable prefix), translate only the suffix.
+//
+// System message is handled OUTSIDE this cache — it's prepended after
+// translation so it doesn't interfere with prefix comparison.
+// ─────────────────────────────────────────────
+
+let _prevInputMessages = null;
+let _prevOutputMessages = null;
+
+function _findStablePrefix(currentMsgs) {
+  if (!_prevInputMessages || !_prevOutputMessages) return 0;
+
+  const maxCheck = Math.min(currentMsgs.length, _prevInputMessages.length);
+  let i = 0;
+
+  for (; i < maxCheck; i++) {
+    const cur = currentMsgs[i];
+    const prev = _prevInputMessages[i];
+
+    // Same object reference — identical (V8 optimizes this heavily)
+    if (cur === prev) continue;
+
+    // Role mismatch — stop
+    if (cur.role !== prev.role) break;
+
+    // String content — direct compare
+    if (typeof cur.content === "string" && typeof prev.content === "string") {
+      if (cur.content !== prev.content) break;
+      continue;
     }
-    openAiPayload.messages = [
-      { role: "system", content: sysContent },
-      ...(openAiPayload.messages || []),
-    ];
-    delete openAiPayload.system;
+
+    // Array content — cheap pre-check before full stringify
+    if (Array.isArray(cur.content) && Array.isArray(prev.content)) {
+      if (cur.content.length !== prev.content.length) break;
+      if (cur.content[0]?.type !== prev.content[0]?.type) break;
+      // Full check only when pre-check passes (same length + same first type)
+      if (JSON.stringify(cur.content) !== JSON.stringify(prev.content)) break;
+      continue;
+    }
+
+    // Mixed types — different
+    break;
   }
 
-  // Translate Message History Content Blocks
-  if (openAiPayload.messages) {
-    openAiPayload.messages = openAiPayload.messages.map((msg) => {
-      if (Array.isArray(msg.content)) {
-        // Translate tool execution results back from Claude Code
-        if (
-          msg.role === "user" &&
-          msg.content.some((b) => b.type === "tool_result")
-        ) {
-          const toolResults = msg.content.filter(
-            (b) => b.type === "tool_result",
-          );
-          return toolResults.map((tr) => ({
-            role: "tool",
-            tool_call_id: tr.tool_use_id,
-            content: Array.isArray(tr.content)
-              ? tr.content.map((c) => c.text).join("\n")
-              : tr.content || "",
-          }));
-        }
+  return i;
+}
 
-        // Translate historical tool calls emitted by the assistant
-        if (
-          msg.role === "assistant" &&
-          msg.content.some((b) => b.type === "tool_use")
-        ) {
-          const textBlocks = msg.content.filter((b) => b.type === "text");
-          const toolUseBlocks = msg.content.filter(
-            (b) => b.type === "tool_use",
-          );
-          return {
-            ...msg,
-            content: textBlocks.map((b) => b.text).join("\n") || null,
-            tool_calls: toolUseBlocks.map((tu) => ({
-              id: tu.id,
-              type: "function",
-              function: {
-                name: tu.name,
-                arguments: JSON.stringify(tu.input || {}),
-              },
-            })),
-          };
-        }
+/**
+ * Count how many OUTPUT messages the first N input messages produce.
+ * Does NOT re-translate — inspects input shape only.
+ *
+ * Expansion rules:
+ *   user with tool_results → (N tool messages) + (1 user message if has text)
+ *   everything else        → 1 output message
+ */
+function _countOutputMessages(inputSlice) {
+  let count = 0;
+  for (const msg of inputSlice) {
+    if (
+      msg.role === "user" &&
+      Array.isArray(msg.content) &&
+      msg.content.some((b) => b.type === "tool_result")
+    ) {
+      const toolCount = msg.content.filter(
+        (b) => b.type === "tool_result",
+      ).length;
+      const hasText = msg.content.some(
+        (b) => b.type === "text" && b.text?.trim(),
+      );
+      count += toolCount + (hasText ? 1 : 0);
+    } else {
+      count += 1;
+    }
+  }
+  return count;
+}
 
-        // Standard text block flattening
-        const textContent = msg.content
-          .filter((block) => block.type === "text")
-          .map((block) => block.text)
-          .join("\n");
-        return { ...msg, content: textContent };
+function _translateMessages(messages) {
+  const stableCount = _findStablePrefix(messages);
+
+  let translated;
+
+  if (stableCount === 0) {
+    // No stable prefix — translate everything
+    translated = messages.map(_translateMessage).flat();
+  } else if (stableCount === messages.length) {
+    // Entire array identical to last request — reuse output directly
+    // This is the common case for mid-conversation turns with no new messages
+    translated = _prevOutputMessages;
+  } else {
+    // Partial match — reuse stable prefix output, translate only the suffix
+    const stableOutputCount = _countOutputMessages(
+      _prevInputMessages.slice(0, stableCount),
+    );
+    const stableOutputPrefix = _prevOutputMessages.slice(0, stableOutputCount);
+    const newSuffix = messages.slice(stableCount).map(_translateMessage).flat();
+
+    translated = [...stableOutputPrefix, ...newSuffix];
+  }
+
+  // Store for next request — store INPUT messages (before system prepend)
+  _prevInputMessages = messages;
+  _prevOutputMessages = translated;
+
+  return translated;
+}
+
+// ─────────────────────────────────────────────
+// Per-message cache
+// Only useful for array-content messages (Anthropic format).
+// String-content and already-translated messages hit fast paths
+// before reaching the cache.
+// ─────────────────────────────────────────────
+
+const _msgCache = new Map();
+const _MSG_CACHE_MAX = 500;
+
+function _msgKey(msg) {
+  // Only called for array-content messages
+  const json = JSON.stringify(msg.content);
+  return msg.role + "|" + msg.content.length + "|" + json.slice(0, 200);
+}
+
+function _cacheGet(msg) {
+  if (!Array.isArray(msg.content)) return null;
+  return _msgCache.get(_msgKey(msg)) ?? null;
+}
+
+function _cacheSet(msg, translated) {
+  if (!Array.isArray(msg.content)) return;
+  if (_msgCache.size >= _MSG_CACHE_MAX) {
+    _msgCache.delete(_msgCache.keys().next().value);
+  }
+  _msgCache.set(_msgKey(msg), translated);
+}
+
+// ─────────────────────────────────────────────
+// Tool schema sanitization
+// ─────────────────────────────────────────────
+
+const _toolCache = new Map();
+
+function _sanitizeTool(tool) {
+  const schemaStr = JSON.stringify(tool.input_schema || tool.parameters || {});
+  const cacheKey =
+    (tool.name || tool.function?.name || "") +
+    "|" +
+    schemaStr.length +
+    "|" +
+    schemaStr.slice(0, 64);
+
+  if (_toolCache.has(cacheKey)) return _toolCache.get(cacheKey);
+
+  const params = JSON.parse(schemaStr);
+  _stripJsonSchemaMeta(params);
+
+  const sanitized = {
+    type: "function",
+    function: {
+      name: tool.name || tool.function?.name,
+      description: tool.description || tool.function?.description,
+      parameters: params,
+    },
+  };
+
+  _toolCache.set(cacheKey, sanitized);
+  return sanitized;
+}
+
+function _stripJsonSchemaMeta(obj) {
+  if (!obj || typeof obj !== "object") return;
+
+  delete obj.$schema;
+  delete obj.$defs;
+  delete obj.$id;
+  delete obj.$comment;
+
+  if (obj.properties && typeof obj.properties === "object") {
+    for (const prop of Object.values(obj.properties)) {
+      _stripJsonSchemaMeta(prop);
+    }
+  }
+
+  if (obj.items && typeof obj.items === "object") {
+    _stripJsonSchemaMeta(obj.items);
+  }
+
+  for (const key of ["anyOf", "oneOf", "allOf"]) {
+    if (Array.isArray(obj[key])) {
+      for (const entry of obj[key]) _stripJsonSchemaMeta(entry);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+// Per-message translation
+// ─────────────────────────────────────────────
+
+function _translateMessage(msg) {
+  // ── Fast paths — no allocation, no cache lookup ──
+  if (msg.role === "tool") return msg; // already translated
+  if (msg.role === "system") return msg; // passthrough
+  if (!Array.isArray(msg.content)) return msg; // already flat string
+
+  // ── Cache check (array-content only) ──
+  const cached = _cacheGet(msg);
+  if (cached) return cached;
+
+  let result;
+
+  // ── User message with tool_result blocks ──
+  if (
+    msg.role === "user" &&
+    msg.content.some((b) => b.type === "tool_result")
+  ) {
+    const toolMessages = [];
+    const textParts = [];
+
+    for (const block of msg.content) {
+      if (block.type === "tool_result") {
+        const content = Array.isArray(block.content)
+          ? block.content
+              .filter((c) => c.type === "text")
+              .map((c) => c.text)
+              .join("\n")
+          : block.content || "";
+
+        toolMessages.push({
+          role: "tool",
+          tool_call_id: block.tool_use_id,
+          ...(block.name ? { name: block.name } : {}),
+          content,
+        });
+      } else if (block.type === "text" && block.text?.trim()) {
+        textParts.push(block.text);
       }
-      return msg;
-    });
+    }
 
-    openAiPayload.messages = openAiPayload.messages.flat();
+    if (textParts.length > 0) {
+      toolMessages.push({ role: "user", content: textParts.join("\n") });
+    }
+
+    result = toolMessages;
+    _cacheSet(msg, result);
+    return result;
   }
 
-  // Natively translate Anthropic Tool Schemas to OpenAI Parameters
-  if (openAiPayload.tools && Array.isArray(openAiPayload.tools)) {
-    openAiPayload.tools = openAiPayload.tools.map((tool) => ({
-      type: "function",
-      function: {
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.input_schema ||
-          tool.parameters || { type: "object", properties: {} },
-      },
-    }));
+  // ── Assistant message with tool_use blocks ──
+  if (
+    msg.role === "assistant" &&
+    msg.content.some((b) => b.type === "tool_use")
+  ) {
+    const textParts = [];
+    const tool_calls = [];
+
+    for (const block of msg.content) {
+      if (block.type === "text" && block.text) {
+        textParts.push(block.text);
+      } else if (block.type === "tool_use") {
+        tool_calls.push({
+          id: block.id,
+          type: "function",
+          function: {
+            name: block.name,
+            arguments:
+              typeof block.input === "string"
+                ? block.input
+                : JSON.stringify(block.input || {}),
+          },
+        });
+      }
+    }
+
+    result = {
+      role: "assistant",
+      content: textParts.join("\n") || null,
+      tool_calls,
+    };
+    _cacheSet(msg, result);
+    return result;
+  }
+
+  // ── Standard text-only flattening ──
+  const textContent = msg.content
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+
+  result = { ...msg, content: textContent };
+  _cacheSet(msg, result);
+  return result;
+}
+
+// ─────────────────────────────────────────────
+// Main export
+// ─────────────────────────────────────────────
+
+export function translateAnthropicToOpenAI(payload) {
+  const out = { ...payload };
+
+  // ── System prompt — extracted BEFORE message translation ──
+  // Keeping system separate prevents a new object reference from
+  // breaking the stable prefix comparison on every request.
+  let systemMessage = null;
+  if (out.system) {
+    const sysContent = Array.isArray(out.system)
+      ? out.system
+          .filter((s) => s.type === "text")
+          .map((s) => s.text)
+          .join("\n")
+      : out.system;
+    systemMessage = { role: "system", content: sysContent };
+    delete out.system;
+  }
+
+  // ── Message history ──
+  // Translate original messages (without system) so prefix comparison
+  // works correctly across requests.
+  if (out.messages) {
+    const translatedMsgs = _translateMessages(out.messages);
+    // Prepend system after translation
+    out.messages = systemMessage
+      ? [systemMessage, ...translatedMsgs]
+      : translatedMsgs;
+  } else if (systemMessage) {
+    out.messages = [systemMessage];
+  }
+
+  // ── Tool schema translation ──
+  if (Array.isArray(out.tools)) {
+    out.tools = _sanitizeToolArray(out.tools);
     console.log(
-      `[Tool Translator] 🛠️ Natively mapped ${openAiPayload.tools.length} schemas to OpenAI parameters.`,
+      `[Tool Translator] 🛠️ Natively mapped ${out.tools.length} schemas`,
     );
   }
 
-  return openAiPayload;
+  return out;
 }
+
+/**
+ * Validates and repairs OpenAI message sequence.
+ * Returns { valid: boolean, issues: string[], messages: Message[] }
+ *
+ * Repair strategy (in order):
+ *  1. Orphaned tool messages   → dropped
+ *  2. tool_call_id mismatch    → remapped (1 candidate) or dropped (ambiguous)
+ *  3. assistant content=""     → null when tool_calls present
+ *  4. consecutive assistant    → merged
+ *  5. consecutive user         → merged
+ *  6. ends on bare assistant   → flagged only (not mutated)
+ */
+// export function validateAndRepairMessages(messages) {
+//   const issues = [];
+//   const fixed = [];
+
+//   for (let i = 0; i < messages.length; i++) {
+//     const msg = messages[i];
+//     const prev = fixed[fixed.length - 1];
+
+//     // ── Rule 1: tool message must follow assistant with tool_calls ──
+//     if (msg.role === "tool") {
+//       if (!prev || prev.role !== "assistant" || !prev.tool_calls?.length) {
+//         issues.push(
+//           `[${i}] orphaned tool message dropped (prev role: ${prev?.role ?? "none"})`,
+//         );
+//         continue;
+//       }
+
+//       // ── Rule 2: tool_call_id must match preceding assistant's tool_calls ──
+//       if (msg.tool_call_id) {
+//         const ids = prev.tool_calls.map((tc) => tc.id);
+//         const exactMatch = ids.includes(msg.tool_call_id);
+
+//         if (!exactMatch) {
+//           if (ids.length === 1) {
+//             // Only one candidate — unambiguous remap
+//             issues.push(
+//               `[${i}] tool_call_id remapped: "${msg.tool_call_id}" → "${ids[0]}"`,
+//             );
+//             fixed.push({ ...msg, tool_call_id: ids[0] });
+//             continue;
+//           }
+
+//           // Multiple candidates — find best match by name if available
+//           const msgName = msg.name;
+//           if (msgName) {
+//             const nameMatch = prev.tool_calls.find(
+//               (tc) => tc.function?.name === msgName,
+//             );
+//             if (nameMatch) {
+//               issues.push(
+//                 `[${i}] tool_call_id remapped by name match "${msgName}": ` +
+//                   `"${msg.tool_call_id}" → "${nameMatch.id}"`,
+//               );
+//               fixed.push({ ...msg, tool_call_id: nameMatch.id });
+//               continue;
+//             }
+//           }
+
+//           // Ambiguous — cannot safely remap, drop to prevent model confusion
+//           issues.push(
+//             `[${i}] tool_call_id "${msg.tool_call_id}" ambiguous across ` +
+//               `[${ids.join(", ")}] — dropped`,
+//           );
+//           continue;
+//         }
+//       }
+//     }
+
+//     // ── Rule 3: assistant content="" → null when tool_calls present ──
+//     if (msg.role === "assistant" && msg.tool_calls?.length > 0) {
+//       if (msg.content === "" || msg.content === undefined) {
+//         if (msg.content === "") {
+//           issues.push(`[${i}] assistant content="" → null`);
+//         }
+//         fixed.push({ ...msg, content: null });
+//         continue;
+//       }
+//     }
+
+//     // ── Rule 4: no two assistant messages in a row ──
+//     if (msg.role === "assistant" && prev?.role === "assistant") {
+//       issues.push(`[${i}] consecutive assistant messages → merged`);
+//       const last = fixed[fixed.length - 1];
+
+//       const mergedContent =
+//         [last.content, msg.content]
+//           .filter((c) => c != null && c !== "")
+//           .join("\n") || null;
+
+//       const seenIds = new Set();
+//       const mergedToolCalls = [
+//         ...(last.tool_calls || []),
+//         ...(msg.tool_calls || []),
+//       ].filter((tc) => {
+//         // Deduplicate tool_calls by id during merge
+//         if (seenIds.has(tc.id)) return false;
+//         seenIds.add(tc.id);
+//         return true;
+//       });
+
+//       fixed[fixed.length - 1] = {
+//         ...last,
+//         content: mergedContent,
+//         ...(mergedToolCalls.length ? { tool_calls: mergedToolCalls } : {}),
+//       };
+//       continue;
+//     }
+
+//     // ── Rule 5: no two user messages in a row ──
+//     if (msg.role === "user" && prev?.role === "user") {
+//       issues.push(`[${i}] consecutive user messages → merged`);
+//       const last = fixed[fixed.length - 1];
+
+//       // Handle both string and array content formats
+//       const lastContent = Array.isArray(last.content)
+//         ? last.content
+//         : [{ type: "text", text: last.content ?? "" }];
+//       const msgContent = Array.isArray(msg.content)
+//         ? msg.content
+//         : [{ type: "text", text: msg.content ?? "" }];
+
+//       fixed[fixed.length - 1] = {
+//         ...last,
+//         content: [...lastContent, ...msgContent],
+//       };
+//       continue;
+//     }
+
+//     fixed.push(msg);
+//   }
+
+//   // ── Rule 6: flag if sequence ends on a bare assistant turn ──
+//   const last = fixed[fixed.length - 1];
+//   if (
+//     last?.role === "assistant" &&
+//     (!last.tool_calls || last.tool_calls.length === 0)
+//   ) {
+//     issues.push(`Sequence ends on bare assistant message — model may loop`);
+//   }
+
+//   if (issues.length > 0) {
+//     console.warn(`[MsgValidator] ⚠️  Fixed ${issues.length} issue(s):`);
+//     for (const issue of issues) console.warn(`  • ${issue}`);
+//   }
+
+//   return { valid: issues.length === 0, issues, messages: fixed };
+// }
 
 // ========================================================
 // 2. STRIP ANTHROPIC NON-STANDARD ROOT PARAMETERS
@@ -653,13 +1087,15 @@ export function scrubToolResults(payload) {
  * Walks the payload and attaches a `_cf_type` tag to each tool result
  * after it has been scrubbed.
  */
-export function tagToolResults(payload) {
+export async function tagToolResults(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
-  let typesReport = { json: 0, code: 0, log: 0, diff: 0, text: 0 };
+  let typesReport = { json: 0, code: 0, log: 0, diff: 0, text: 0, markdown: 0 };
+  let skippedAlreadyTagged = 0;
 
-  // Build a lookup of tool_call_id → tool name from assistant messages
-  // so we can attach the filename hint from tool args
+  // ── Build tool call metadata lookup ──
+  // Must run before the classification loop so backfill
+  // can apply _filename to already-tagged messages too.
   const toolCallMeta = new Map();
   for (const msg of payload.messages) {
     if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
@@ -668,52 +1104,89 @@ export function tagToolResults(payload) {
           const args = JSON.parse(tc.function?.arguments || "{}");
           toolCallMeta.set(tc.id, {
             toolName: tc.function?.name || "",
-            // Claude Code file tools use "path" or "file_path" or "filename"
-            filePath: args.path || args.file_path || args.filename || null,
+            filePath:
+              args.path ||
+              args.file_path ||
+              args.filename ||
+              args.filepath ||
+              args.input?.path ||
+              args.file ||
+              null,
             command: args.command || null,
+            // Store full args so semanticDedup can probe them directly
+            args,
           });
         } catch (_) {}
       }
     }
   }
 
-  payload.messages = payload.messages.map((msg) => {
+  const classifyJobs = [];
+
+  for (const msg of payload.messages) {
     if (msg.role === "tool" && typeof msg.content === "string") {
+      // ── ALWAYS backfill metadata regardless of tag status ──
+      // Prior fix: already-tagged messages hit `continue` before
+      // toolCallMeta.get() — so _filename was only set on turn 1.
+      // On turn 2+ the dedup saw _filename=undefined → no-key → skip.
       const meta = toolCallMeta.get(msg.tool_call_id);
-
-      // Attach filename if we can infer it
-      if (meta?.filePath && !msg._filename) {
-        msg._filename = meta.filePath;
+      if (meta) {
+        if (meta.filePath && !msg._filename) msg._filename = meta.filePath;
+        if (meta.toolName && !msg._toolName) msg._toolName = meta.toolName;
+        if (meta.command && !msg._command) msg._command = meta.command;
+        // Expose full args for downstream consumers (semanticDedup._args)
+        if (!msg._args) msg._args = meta.args;
       }
 
-      // Attach tool name for deduplication key construction
-      if (meta?.toolName && !msg._toolName) {
-        msg._toolName = meta.toolName;
+      // Already tagged — skip Magika, just count
+      if (msg._cf_type) {
+        skippedAlreadyTagged++;
+        typesReport[msg._cf_type] = (typesReport[msg._cf_type] || 0) + 1;
+        continue;
       }
 
-      msg._cf_type = classifyContent(msg.content);
-      typesReport[msg._cf_type]++;
+      // New message — classify and tag
+      classifyJobs.push(
+        classifyContentAsync(msg.content).then((type) => {
+          msg._cf_type = type;
+          typesReport[type] = (typesReport[type] || 0) + 1;
+        }),
+      );
     }
 
     if (msg.role === "user" && Array.isArray(msg.content)) {
-      msg.content = msg.content.map((block) => {
+      for (const block of msg.content) {
         if (block.type === "tool_result" && typeof block.content === "string") {
-          block._cf_type = classifyContent(block.content);
-          typesReport[block._cf_type]++;
+          if (block._cf_type) {
+            skippedAlreadyTagged++;
+            typesReport[block._cf_type] =
+              (typesReport[block._cf_type] || 0) + 1;
+            continue;
+          }
+
+          classifyJobs.push(
+            classifyContentAsync(block.content).then((type) => {
+              block._cf_type = type;
+              typesReport[type] = (typesReport[type] || 0) + 1;
+            }),
+          );
         }
-        return block;
-      });
+      }
     }
+  }
 
-    return msg;
-  });
+  await Promise.all(classifyJobs);
 
+  const newlyClassified = classifyJobs.length;
   console.log(
     `[ContentRouter] 🏷️  Tagged tool results: ` +
       Object.entries(typesReport)
         .filter(([_, count]) => count > 0)
         .map(([type, count]) => `${count}x ${type}`)
-        .join(", "),
+        .join(", ") +
+      (skippedAlreadyTagged > 0
+        ? ` (${skippedAlreadyTagged} cached, ${newlyClassified} new)`
+        : ""),
   );
 
   return payload;
@@ -939,6 +1412,85 @@ export function pruneDiffOutput(text) {
       .reduce((sum, l) => sum + l.length + 1, 0),
   };
 }
+
+/*
+ * Prunes markdown by collapsing large unchanged sections.
+ * Keeps: headings, code blocks, lists with errors, first/last paragraphs
+ * Removes: long prose paragraphs with no structural markers
+ */
+export function pruneMarkdownOutput(text) {
+  if (typeof text !== "string" || text.length === 0) {
+    return { kept: text, vaulted: false };
+  }
+
+  const lines = text.split(/\r?\n/);
+  if (lines.length < 20) return { kept: text, vaulted: false };
+
+  const keep = new Array(lines.length).fill(false);
+
+  // Always keep structural lines
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const isHeading = /^#{1,6}\s/.test(line);
+    const isCodeFence = /^```/.test(line);
+    const isList = /^[-*+]\s|^\d+\.\s/.test(line);
+    const isBlockquote = /^>/.test(line);
+    const hasError = LOG_KEEP_PATTERNS.some((p) => p.test(line));
+    const isHorizontalRule = /^[-*_]{3,}\s*$/.test(line);
+
+    if (
+      isHeading ||
+      isCodeFence ||
+      isList ||
+      isBlockquote ||
+      hasError ||
+      isHorizontalRule
+    ) {
+      keep[i] = true;
+      // Keep surrounding context
+      if (i > 0) keep[i - 1] = true;
+      if (i < lines.length - 1) keep[i + 1] = true;
+    }
+  }
+
+  // Always keep first 5 and last 3 lines
+  for (let i = 0; i < Math.min(5, lines.length); i++) keep[i] = true;
+  for (let i = Math.max(0, lines.length - 3); i < lines.length; i++)
+    keep[i] = true;
+
+  const removedCount = keep.filter(Boolean).length;
+  if (removedCount < lines.length * 0.3) {
+    return { kept: text, vaulted: false };
+  }
+
+  // Build output with gap markers
+  const result = [];
+  let gapCount = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (keep[i]) {
+      if (gapCount > 0) {
+        result.push(`[... ${gapCount} lines of prose omitted ...]`);
+        gapCount = 0;
+      }
+      result.push(lines[i]);
+    } else {
+      gapCount++;
+    }
+  }
+  if (gapCount > 0) result.push(`[... ${gapCount} lines of prose omitted ...]`);
+
+  const removedLines = lines.length - keep.filter(Boolean).length;
+  return {
+    kept: result.join("\n"),
+    vaulted: removedLines > lines.length * 0.3,
+    originalText: text,
+    removedLines,
+    removedChars: lines
+      .filter((_, i) => !keep[i])
+      .reduce((sum, l) => sum + l.length + 1, 0),
+  };
+}
+
 /**
  * Processes all tool results in the payload that have a _cf_type tag,
  * applying the appropriate pruner.
@@ -949,9 +1501,11 @@ export function pruneToolResults(payload) {
   let pruneStats = {
     log: 0,
     diff: 0,
+    markdown: 0,
     charsSaved: 0,
     linesRemoved: 0,
     vaultsCreated: 0,
+    skipped: 0, // already-pruned messages skipped this turn
   };
 
   payload.messages = payload.messages.map((msg) => {
@@ -960,6 +1514,16 @@ export function pruneToolResults(payload) {
       typeof msg.content === "string" &&
       msg._cf_type
     ) {
+      // ── Skip already-pruned messages ──
+      // _prunedVaultId is set the first time we prune this message.
+      // On subsequent turns the content is already the short summary —
+      // re-pruning it would either be a no-op or corrupt the summary.
+      // Vault re-creation wastes disk and inflates vaultsCreated stats.
+      if (msg._prunedVaultId) {
+        pruneStats.skipped++;
+        return msg;
+      }
+
       const beforeLen = msg.content.length;
       let result;
 
@@ -972,12 +1536,15 @@ export function pruneToolResults(payload) {
           result = pruneDiffOutput(msg.content);
           pruneStats.diff++;
           break;
+        case "markdown":
+          result = pruneMarkdownOutput(msg.content);
+          pruneStats.markdown++;
+          break;
         default:
-          return msg; // no pruning for json, code, text in this feature
+          return msg;
       }
 
       if (result.vaulted && result.originalText) {
-        // Store the full original in the vault
         const vaultId = saveToVault(result.originalText);
         pruneStats.vaultsCreated++;
         pruneStats.charsSaved += beforeLen - result.kept.length;
@@ -985,7 +1552,8 @@ export function pruneToolResults(payload) {
 
         console.log(
           `[Log Pruner] ${msg._cf_type.toUpperCase()} pruned: ` +
-            `removed ${result.removedLines} lines (~${Math.floor((result.removedChars || 0) / 4)} tokens) → Vault ${vaultId}`,
+            `removed ${result.removedLines} lines ` +
+            `(~${Math.floor((result.removedChars || 0) / 4)} tokens) → Vault ${vaultId}`,
         );
 
         return {
@@ -995,12 +1563,14 @@ export function pruneToolResults(payload) {
         };
       }
 
-      // Non-vaulted case: just replace content with pruned version
+      // Non-vaulted: content replaced in-place, no vault needed
+      // Do NOT set _prunedVaultId here — content was not vaulted,
+      // so future turns should re-check (content may grow prunable)
       msg.content = result.kept;
       return msg;
     }
 
-    // For user content blocks (Anthropic pre-translation)
+    // ── User content blocks (Anthropic pre-translation) ──
     if (msg.role === "user" && Array.isArray(msg.content)) {
       return {
         ...msg,
@@ -1010,8 +1580,15 @@ export function pruneToolResults(payload) {
             typeof block.content === "string" &&
             block._cf_type
           ) {
+            // Same skip logic for pre-translation blocks
+            if (block._prunedVaultId) {
+              pruneStats.skipped++;
+              return block;
+            }
+
             const beforeLen = block.content.length;
             let result;
+
             switch (block._cf_type) {
               case "log":
                 result = pruneLogOutput(block.content);
@@ -1019,14 +1596,19 @@ export function pruneToolResults(payload) {
               case "diff":
                 result = pruneDiffOutput(block.content);
                 break;
+              case "markdown":
+                result = pruneMarkdownOutput(block.content);
+                break;
               default:
                 return block;
             }
+
             if (result.vaulted && result.originalText) {
               const vaultId = saveToVault(result.originalText);
               console.log(
                 `[Log Pruner] ${block._cf_type.toUpperCase()} pruned (Anthropic block): ` +
-                  `removed ${result.removedLines} lines (~${Math.floor((result.removedChars || 0) / 4)} tokens) → Vault ${vaultId}`,
+                  `removed ${result.removedLines} lines ` +
+                  `(~${Math.floor((result.removedChars || 0) / 4)} tokens) → Vault ${vaultId}`,
               );
               return {
                 ...block,
@@ -1034,6 +1616,7 @@ export function pruneToolResults(payload) {
                 _prunedVaultId: vaultId,
               };
             }
+
             return { ...block, content: result.kept };
           }
           return block;
@@ -1044,12 +1627,15 @@ export function pruneToolResults(payload) {
     return msg;
   });
 
-  if (pruneStats.log + pruneStats.diff > 0) {
+  const processed = pruneStats.log + pruneStats.diff + pruneStats.markdown;
+  if (processed > 0 || pruneStats.skipped > 0) {
     console.log(
-      `[Pruner Summary] Processed ${pruneStats.log} logs, ${pruneStats.diff} diffs | ` +
+      `[Pruner Summary] Processed ${pruneStats.log} logs, ` +
+        `${pruneStats.diff} diffs, ${pruneStats.markdown} markdown | ` +
         `Lines removed: ${pruneStats.linesRemoved} | ` +
         `Chars saved: ${pruneStats.charsSaved} (~${Math.floor(pruneStats.charsSaved / 4)} tokens) | ` +
-        `Vaults: ${pruneStats.vaultsCreated}`,
+        `Vaults: ${pruneStats.vaultsCreated} | ` +
+        `Skipped (already pruned): ${pruneStats.skipped}`,
     );
   }
 
@@ -1358,39 +1944,37 @@ export function sliceJsonOutput(text, messages = []) {
   console.log(`[JSON Slicer] Extracted ${nodes.length} leaf nodes`);
 
   if (nodes.length < 10) {
-    console.log(
-      `[JSON Slicer] ⏭️  Too small (${nodes.length} nodes < 10 threshold)`,
-    );
     return { kept: text, vaulted: false };
   }
 
-  const queryKeywords = extractQueryKeywords(messages);
-  console.log(
-    `[JSON Slicer] Keywords: [${queryKeywords.slice(0, 5).join(", ")}...]`,
-  );
+  // ── Anomaly scorer (C++ backed) — replaces old ALWAYS_KEEP_PATTERNS ──
+  const { alwaysKeep, detectionSummary } = scoreNodesByAnomaly(nodes, {
+    zThreshold: 2.0,
+    iqrMultiplier: 1.5,
+    firstLastN: 2,
+  });
 
+  console.log(`[JSON Slicer] 🔬 Anomaly detection: ${detectionSummary}`);
+
+  // ── Keyword scorer (unchanged) ──
+  const queryKeywords = extractQueryKeywords(messages);
   const scored = nodes.map((node) => ({
     ...node,
-    alwaysKeep: isAlwaysKeep(node.path),
+    alwaysKeep: alwaysKeep.has(nodes.indexOf(node)),
     score: scoreJsonNode(node.path, node.value, queryKeywords),
   }));
 
-  const alwaysKeep = scored.filter((n) => n.alwaysKeep);
+  const alwaysKeepNodes = scored.filter((n) => n.alwaysKeep);
   const scoredOnly = scored
     .filter((n) => !n.alwaysKeep)
     .sort((a, b) => b.score - a.score);
 
   const itemStrings = nodes.map((n) => `${n.path} ${String(n.value ?? "")}`);
-  const optimalK = computeOptimalK(
-    itemStrings,
-    policy.adaptiveSizerBias,
-    3,
-    50,
-  );
+  const optimalK = computeOptimalK(itemStrings, payload?.__policy ?? null);
   const topScored = scoredOnly.slice(0, optimalK);
 
   const keptSet = new Map();
-  for (const n of [...alwaysKeep, ...topScored]) {
+  for (const n of [...alwaysKeepNodes, ...topScored]) {
     keptSet.set(n.path, n);
   }
   const keptNodes = [...keptSet.values()];
@@ -1402,19 +1986,11 @@ export function sliceJsonOutput(text, messages = []) {
   );
 
   if (removalRatio < 0.5) {
-    console.log(`[JSON Slicer] ⏭️  Insufficient reduction (need >50%)`);
     return { kept: text, vaulted: false };
   }
 
-  // Vault the original
   const vaultId = saveToVault(text);
-
-  // Build summary
   const summary = buildJsonSliceSummary(keptNodes, nodes.length, vaultId);
-
-  console.log(
-    `[JSON Slicer] ✅ Sliced ${nodes.length} → ${keptNodes.length} nodes → Vault ${vaultId}`,
-  );
 
   return {
     kept: summary,
@@ -1504,29 +2080,97 @@ export function sliceJsonToolResults(payload) {
 // PHASE 3, FEATURE 7: PREDICTIVE CONTEXT INJECTION
 // ============================================================
 
+// ─────────────────────────────────────────────
+// Source code context detector
+// Prevents false positives when the LLM reads
+// source files that contain the word "error" in
+// comments, variable names, regex literals, etc.
+// ─────────────────────────────────────────────
+
 /**
- * Patterns that indicate a tool result is a failure.
+ * Heuristics that indicate the content is source code being read,
+ * not an actual runtime error output.
+ */
+const SOURCE_CODE_SIGNALS = [
+  // Line numbers prefixed (e.g. "146    // comment")
+  /^\s*\d{1,4}\s{1,8}[^\s]/m,
+  // Common code constructs
+  /\bexport\s+(function|const|class|default)\b/,
+  /\bimport\s+\{[^}]+\}\s+from\b/,
+  /\/\/\s*(TODO|FIXME|NOTE|HACK|LOG|ERROR|WARN)/i,
+  // Regex literals inside strings (the ERR_ case)
+  /\/\\b\w+\\b\//,
+  /\/\\\w+\//,
+  // Stack traces are NOT source code — they have "at " prefixes
+];
+
+const STACK_TRACE_SIGNALS = [
+  /^\s+at\s+\S+\s+\(/m, // "  at functionName (file:line)"
+  /^\s+at\s+async\s+/m, // "  at async ..."
+];
+
+/**
+ * Returns true if content looks like source code being read,
+ * not a runtime error output.
+ * Stack traces are excluded — they look like code but ARE errors.
+ */
+function isSourceCodeContent(content) {
+  if (typeof content !== "string") return false;
+
+  // If it has stack trace signals, it's a real error — not source code
+  if (STACK_TRACE_SIGNALS.some((p) => p.test(content))) return false;
+
+  const matchCount = SOURCE_CODE_SIGNALS.filter((p) => p.test(content)).length;
+  // Require at least 2 signals to avoid false positives on short snippets
+  return matchCount >= 2;
+}
+
+// ─────────────────────────────────────────────
+// Failure detection
+// ─────────────────────────────────────────────
+
+/**
+ * Patterns that indicate a tool result is a genuine runtime failure.
+ *
+ * Rules for adding patterns here:
+ *  - Must be specific enough to not match source code comments
+ *  - "error" alone is NOT enough — must have structural context
+ *  - Prefer anchored or compound patterns over single keywords
  */
 const FAILURE_SIGNALS = [
+  // Shell / process errors
   /\bcommand not found\b/i,
   /\bno such file or directory\b/i,
-  /\bcannot find module\b/i,
-  /\bmodule not found\b/i,
   /\bpermission denied\b/i,
-  /\berror\b/i, // ✅ FIX: Added /i flag to catch 'Error:', 'ERROR', 'error'
   /\bfailed with exit code\b/i,
-  /\bnpm ERR\b/i,
-  /\bSyntaxError\b/,
-  /\bTypeError\b/,
-  /\bReferenceError\b/,
   /\bexited with code [^0]\b/i,
-  /\bcannot read propert/i,
-  /\bis not defined\b/i,
+  /\bnpm ERR!\b/, // must have the ! — not just ERR
   /\bEACCES\b/,
   /\bENOENT\b/,
   /\bECONNREFUSED\b/,
   /\bEADDRINUSE\b/,
   /\bEPERM\b/,
+
+  // Node.js module errors
+  /\bcannot find module\b/i,
+  /\bmodule not found\b/i,
+
+  // JavaScript runtime exceptions — must appear at line start or after newline
+  // to avoid matching "SyntaxError" inside a comment or regex
+  /(?:^|\n)\s*SyntaxError:/,
+  /(?:^|\n)\s*TypeError:/,
+  /(?:^|\n)\s*ReferenceError:/,
+  /(?:^|\n)\s*RangeError:/,
+  /(?:^|\n)\s*Error:/, // capital E, colon required
+
+  // Property access errors (specific enough)
+  /\bcannot read propert(?:y|ies) of\b/i,
+  /\bis not defined\b/i,
+  /\bis not a function\b/i,
+
+  // Tool-level error wrappers (from Claude / MCP)
+  /<tool_use_error>/i,
+  /\bNo such tool available\b/i,
 ];
 
 const TRIVIAL_ERROR_PATTERNS = [
@@ -1536,7 +2180,7 @@ const TRIVIAL_ERROR_PATTERNS = [
   /already exists/i,
   /is not a directory/i,
   /permission denied/i,
-  /cannot find module/i, // only trivial if short
+  /cannot find module/i,
 ];
 
 function isTrivialError(content) {
@@ -1548,25 +2192,59 @@ function isTrivialError(content) {
 }
 
 /**
- * Detects whether a tool result content looks like a failure.
+ * Detects whether a tool result content looks like a genuine runtime failure.
+ * Guards against false positives from source code reads.
  */
 function isFailedToolResult(content) {
   if (typeof content !== "string") return false;
+
+  // Early exit: if this looks like source code, skip it entirely
+  // This handles the "146  // Log level bracket [ERROR]" false positive
+  if (isSourceCodeContent(content)) return false;
+
   return FAILURE_SIGNALS.some((pattern) => pattern.test(content));
 }
 
+// ─────────────────────────────────────────────
+// Signal extraction
+// ─────────────────────────────────────────────
+
 /**
- * Extracts the most meaningful error snippet for search.
+ * Extracts the most meaningful error snippet for the BM25 search query.
+ * Prefers lines that contain strong signals over generic matches.
  */
 function extractErrorSignal(content) {
   const lines = content.split("\n");
+
+  // Priority 1: lines with strong structural signals (exceptions, tool errors)
+  const STRONG_SIGNALS = [
+    /(?:^|\s)(?:SyntaxError|TypeError|ReferenceError|RangeError|Error):/,
+    /<tool_use_error>/i,
+    /\bNo such tool available\b/i,
+    /\bENOENT\b/,
+    /\bECONNREFUSED\b/,
+    /\bnpm ERR!\b/,
+  ];
+
+  for (const line of lines) {
+    if (STRONG_SIGNALS.some((p) => p.test(line))) {
+      return line.trim().slice(0, 200);
+    }
+  }
+
+  // Priority 2: first line that matches any failure signal
   for (const line of lines) {
     if (FAILURE_SIGNALS.some((p) => p.test(line))) {
       return line.trim().slice(0, 200);
     }
   }
+
   return content.slice(0, 200);
 }
+
+// ─────────────────────────────────────────────
+// Suggestion builder
+// ─────────────────────────────────────────────
 
 /**
  * Builds the suggestion block appended to the error message.
@@ -1582,7 +2260,6 @@ function buildSuggestionBlock(searchQuery, results) {
   ];
 
   for (let i = 0; i < results.length; i++) {
-    // ✅ FIX: Safely grab the BM25 sparse score and format it correctly
     const score =
       results[i].sparseScore !== undefined
         ? results[i].sparseScore
@@ -1601,12 +2278,14 @@ function buildSuggestionBlock(searchQuery, results) {
 
   return lines.join("\n");
 }
+
+// ─────────────────────────────────────────────
+// Orchestrator
+// ─────────────────────────────────────────────
+
 /**
- * Orchestrator: walks all tool results in the payload,
- * detects failures, and appends predictive suggestions.
- *
- * Requires getStaticEmbedding and hybridRetriever because
- * they live in server.js scope — pass them in here.
+ * Walks all tool results in the payload, detects genuine runtime failures,
+ * and appends predictive BM25 suggestions from the project vault.
  */
 export function applyPredictiveInjection(payload, hybridRetriever) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
@@ -1615,90 +2294,81 @@ export function applyPredictiveInjection(payload, hybridRetriever) {
   let injectCount = 0;
 
   payload.messages = payload.messages.map((msg) => {
-    if (msg.role === "tool" && typeof msg.content === "string") {
-      if (!isFailedToolResult(msg.content)) return msg;
-      if (isTrivialError(msg.content)) {
-        console.log(
-          `[Predictive Injection] ⏭️  Skipping trivial error (${msg.content.split("\n").length} lines)`,
-        );
-        return msg;
-      }
+    if (msg.role !== "tool" || typeof msg.content !== "string") return msg;
 
-      try {
-        const errorSignal = extractErrorSignal(msg.content);
+    // ── Gate 1: is this actually a failure? ──
+    if (!isFailedToolResult(msg.content)) return msg;
 
-        let searchQuery = errorSignal;
-        for (let i = payload.messages.length - 1; i >= 0; i--) {
-          if (payload.messages[i].role === "user") {
-            const userText =
-              typeof payload.messages[i].content === "string"
-                ? payload.messages[i].content
-                : "";
-            if (userText.length > 0) {
-              searchQuery = `${userText.slice(0, 100)} ${errorSignal}`;
-            }
-            break;
-          }
-        }
-
-        console.log(
-          `[Predictive Injection] 🔍 Failure detected: "${errorSignal.slice(0, 80)}"`,
-        );
-
-        let results = [];
-        try {
-          // ── BEFORE: wasteful hybrid call ──────────────────────────────
-          // const zeroDenseVec = new Float32Array(384).fill(0);
-          // results = hybridRetriever.hybridSearch(zeroDenseVec, 5, 0.0, searchQuery);
-          //
-          // ── AFTER: dedicated sparse search ───────────────────────────
-          // - No Float32Array(384) allocation
-          // - No 384-float JS→C++ transfer
-          // - No HNSW search on a zero vector
-          // - O(candidates) instead of O(n²) duplicate check
-          // - minScore=1.5 pushed into C++ — no JS filter pass needed
-          results = hybridRetriever.sparseSearch(
-            searchQuery,
-            5, // top k
-            1.5, // minScore — replaces the JS .filter() below
-          );
-        } catch (searchErr) {
-          console.warn(
-            `[Predictive Injection] Search error: ${searchErr.message}`,
-          );
-          return msg;
-        }
-
-        if (!results || results.length === 0) return msg;
-
-        // ── Score + length filter ─────────────────────────────────────
-        // minScore=1.5 already handled in C++
-        // Only need length check here
-        const meaningful = results.filter((r) => {
-          const textLength = (r.breadcrumb || "").length;
-          return textLength > 100;
-        });
-
-        if (meaningful.length === 0) {
-          console.log(
-            `[Predictive Injection] Results ignored (breadcrumb too short)`,
-          );
-          return msg;
-        }
-
-        const suggestion = buildSuggestionBlock(searchQuery, meaningful);
-        console.log(
-          `[Predictive Injection] 💡 Injected ${meaningful.length} high-quality hint(s)`,
-        );
-        injectCount++;
-
-        return { ...msg, content: msg.content + suggestion };
-      } catch (err) {
-        console.warn(`[Predictive Injection] ⚠️ Failed: ${err.message}`);
-        return msg;
-      }
+    // ── Gate 2: is it trivially short and self-explanatory? ──
+    if (isTrivialError(msg.content)) {
+      console.log(
+        `[Predictive Injection] ⏭️  Skipping trivial error ` +
+          `(${msg.content.split("\n").filter((l) => l.trim()).length} lines)`,
+      );
+      return msg;
     }
-    return msg;
+
+    try {
+      const errorSignal = extractErrorSignal(msg.content);
+
+      // Enrich query with recent user intent
+      let searchQuery = errorSignal;
+      for (let i = payload.messages.length - 1; i >= 0; i--) {
+        if (payload.messages[i].role === "user") {
+          const userText =
+            typeof payload.messages[i].content === "string"
+              ? payload.messages[i].content
+              : "";
+          if (userText.length > 0) {
+            searchQuery = `${userText.slice(0, 100)} ${errorSignal}`;
+          }
+          break;
+        }
+      }
+
+      console.log(
+        `[Predictive Injection] 🔍 Failure detected: "${errorSignal.slice(0, 80)}"`,
+      );
+
+      let results = [];
+      try {
+        results = hybridRetriever.sparseSearch(
+          searchQuery,
+          5, // top k
+          1.5, // minScore — pushed into C++, no JS filter pass needed
+        );
+      } catch (searchErr) {
+        console.warn(
+          `[Predictive Injection] Search error: ${searchErr.message}`,
+        );
+        return msg;
+      }
+
+      if (!results || results.length === 0) return msg;
+
+      // Only length check needed — minScore already handled in C++
+      const meaningful = results.filter(
+        (r) => (r.breadcrumb || "").length > 100,
+      );
+
+      if (meaningful.length === 0) {
+        console.log(
+          `[Predictive Injection] Results ignored (breadcrumb too short)`,
+        );
+        return msg;
+      }
+
+      const suggestion = buildSuggestionBlock(searchQuery, meaningful);
+      console.log(
+        `[Predictive Injection] 💡 Injected ${meaningful.length} high-quality hint(s)`,
+      );
+      injectCount++;
+
+      return { ...msg, content: msg.content + suggestion };
+    } catch (err) {
+      console.warn(`[Predictive Injection] ⚠️ Failed: ${err.message}`);
+      return msg;
+    }
   });
 
   if (injectCount > 0) {

@@ -18,6 +18,7 @@
                 "src/persistent_memory.cpp",
                 "src/onnx_embedder.cpp",
                 "src/embed_cache.cpp",
+                "src/anomaly_scorer.cpp",
 
                 "tree-sitter-src/tree-sitter/lib/src/lib.c",
 

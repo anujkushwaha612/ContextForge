@@ -1,385 +1,361 @@
 /**
- * Content type detection for multi-format compression.
- * Direct port of headroom/transforms/content_detector.py
- * with additions for ContextForge's tool result shapes.
+ * contentDetector.js
  *
- * Detection priority:
- *   1. JSON array (SmartCrusher compatible)
- *   2. Git diff (high confidence threshold)
- *   3. HTML (needs extraction not compression)
- *   4. Search results (grep/ripgrep format)
- *   5. Build/log output
- *   6. Source code
- *   7. Plain text (fallback)
+ * Production-grade content classifier for LLM tool results.
+ *
+ * Architecture: Weighted Evidence Engine (WEE)
+ * -------------------------------------------
+ * Runs all detectors in parallel and calculates a confidence score for each.
+ *
+ * Robustness Strategy:
+ * 1. Strategic Sampling: head + mid + tail, kept SEPARATE (not concatenated)
+ *    to prevent split markers from poisoning anchored regex matches.
+ * 2. Evidence Weighing: Strong (+0.5) vs Weak (+0.1, capped at +0.4).
+ * 3. Negative Constraints: Conflicting signals reduce score (-0.4 per penalty).
+ * 4. Confidence Threshold: Below 0.35 → "text" default.
+ * 5. Code Override: Strong code signals always win over log/text
+ *    to prevent source files with date comments from being pruned as logs.
  */
 
+import crypto from "node:crypto";
+
 // ─────────────────────────────────────────────
-// Content type enum
+// Configuration
 // ─────────────────────────────────────────────
 
-export const ContentType = {
-  JSON_ARRAY:     "json_array",
-  JSON_OBJECT:    "json_object",  // non-array JSON (your existing "json" type)
-  SOURCE_CODE:    "source_code",
-  SEARCH_RESULTS: "search",
-  BUILD_OUTPUT:   "build",
-  GIT_DIFF:       "diff",
-  HTML:           "html",
-  PLAIN_TEXT:     "text",
+const CACHE_MAX            = 2000;
+const SAMPLE_SIZE          = 1024;
+const CONFIDENCE_THRESHOLD = 0.35;
+const PENALTY_WEIGHT       = 0.4;  // reduced from 0.7 — penalties should demote, not destroy
+
+const _cache = new Map();
+const _stats = {
+  cacheHit:        0,
+  totalClassified: 0,
+  byType: { json: 0, code: 0, log: 0, diff: 0, text: 0, markdown: 0 },
 };
 
 // ─────────────────────────────────────────────
-// Pre-compiled patterns (module-level, zero re-compile cost)
+// Signal Definitions
+//
+// Penalty design rules:
+//   - Penalties should DEMOTE a type, not zero it out
+//   - Only penalize on unmistakable signals of a DIFFERENT type
+//   - Code penalty must NOT fire on JS object literals (quoted keys are valid JS)
+//   - Log penalty must NOT fire on source files that mention log levels in comments
 // ─────────────────────────────────────────────
 
-const SEARCH_RESULT_PATTERN = /^[^\s:]+:\d+:/m;
+const SIGNALS = {
+  json: {
+    strong: [
+      // Must close correctly — not just start with {
+      // Checked against full text in _classifyJson fast-path
+      /^[\s\n]*\{\s*"\w+":/,          // object with first quoted key
+      /^[\s\n]*\[\s*\{/,              // array of objects
+      /^[\s\n]*\[\s*"[^"]*"\s*[,\]]/,  // array of strings
+    ],
+    weak: [
+      /:\s*\[/, /:\s*\{/, /"(\w+)":/, /true\b/, /false\b/, /null\b/,
+    ],
+    // Only penalize on unmistakable NON-json code patterns
+    // NOT quoted keys — those are valid in both JSON and JS
+    penalty: [
+      /\bfunction\s+\w+\s*\(/,        // named function declaration
+      /\bconst\s+\w+\s*=\s*(?!["'\d{[])/,  // const without immediate literal
+      /\bimport\s+\{[^}]+\}\s+from\s+['"]/,  // ES module import
+      /=>\s*\{/,                      // arrow function body
+      /\bclass\s+\w+/,               // class declaration
+    ],
+  },
 
-// Extended diff detection — handles merge commits, combined diffs
-const DIFF_HEADER_PATTERN = /^(diff --git|diff --combined |diff --cc |--- a\/|@@\s+-\d+,\d+\s+\+\d+,\d+\s+@@|@@@+\s+-\d+)/m;
-const DIFF_CHANGE_PATTERN  = /^[+-][^+-]/m;
+  code: {
+    strong: [
+      // Module-level keywords at line start — unmistakable code
+      /^(import|export)\s+(default\s+)?(function|class|const|let|var|\{)/m,
+      /^(const|let|var)\s+\w+\s*=/m,
+      /^(function|async function)\s+\w+\s*\(/m,
+      /^class\s+\w+(\s+extends\s+\w+)?\s*\{/m,
+      // Language-specific unmistakable patterns
+      /^def\s+\w+\s*\(/m,             // Python
+      /^pub(lic)?\s+fn\s+\w+/m,      // Rust
+      /^func\s+\w+/m,                // Go
+      /^#include\s*[<"]/m,           // C/C++
+    ],
+    weak: [
+      /[{};]/, /=>/, /===/, /!==/, /\?\?/,
+      /\b(if|while|for|switch|try|catch|throw)\b/,
+      /^\s*\/\/.+$/m,                // single line comment
+      /^\s*\/\*[\s\S]*?\*\//m,       // block comment
+    ],
+    // Code penalties: only fire on things that are NEVER in code files
+    // Do NOT penalize for markdown headings (READMEs embedded in code comments)
+    // Do NOT penalize for quoted keys (valid JS object literal syntax)
+    penalty: [
+      /^diff --git\s/m,              // unmistakably a diff
+      /^@@\s+-\d+,\d+\s+\+\d+,\d+ @@/m,  // diff hunk
+    ],
+  },
 
-// HTML patterns
-const HTML_DOCTYPE_PATTERN    = /^\s*<!doctype\s+html/i;
-const HTML_TAG_PATTERN        = /<html[\s>]/i;
-const HTML_HEAD_PATTERN       = /<head[\s>]/i;
-const HTML_BODY_PATTERN       = /<body[\s>]/i;
-const HTML_STRUCTURAL_PATTERN = /<(div|span|script|style|link|meta|nav|header|footer|aside|article|section|main)[\s>]/gi;
+  log: {
+    strong: [
+      // ISO timestamp — strong signal but only if NOT in a comment
+      // Require it at line start or after common log prefixes
+      /^[\d\-T:Z.]+\s+(INFO|WARN|ERROR|DEBUG|TRACE)/m,
+      /^\[[\d\-T:Z.]+\]\s+/m,        // [timestamp] prefix
+      // Log level bracket ONLY at line start (not inside comments or strings)
+      /^\[(INFO|WARN(?:ING)?|ERROR|DEBUG|TRACE|FATAL|CRITICAL)\]/m,
+      // Structured log format: level=INFO or "level":"INFO"
+      /\blevel[=:]["']?(INFO|WARN|ERROR|DEBUG|TRACE|FATAL)/i,
+    ],
+    weak: [
+      /^\d{2}:\d{2}:\d{2}/m,
+      /\b(exception|stacktrace)\b/i,
+      /^\s*at\s+\w+[\w.]+\s*\(/m,    // stack frame
+      /^\s*\[\d+\]\s+/m,             // PID prefix
+    ],
+    // Penalize hard when the content is clearly source code
+    penalty: [
+      /^(import|export)\s+/m,
+      /^(const|let|var|function|class)\s+/m,
+      /^def\s+\w+\s*\(/m,
+      /^pub(lic)?\s+fn\s+/m,
+    ],
+  },
 
-// Code patterns per language
-const CODE_PATTERNS = {
-  python: [
-    /^\s*(def|class|import|from|async def)\s+\w+/m,
-    /^\s*@\w+/m,
-    /^\s*"""/m,
-    /^\s*if __name__\s*==/m,
-  ],
-  javascript: [
-    /^\s*(function|const|let|var|class|import|export)\s+/m,
-    /^\s*(async\s+function|=>\s*\{)/m,
-    /^\s*module\.exports/m,
-    /^\s*require\(/m,
-  ],
-  typescript: [
-    /^\s*(interface|type|enum|namespace)\s+\w+/m,
-    /:\s*(string|number|boolean|any|void)\b/,
-    /^\s*(abstract|readonly)\s+/m,
-  ],
-  go: [
-    /^\s*(func|type|package|import)\s+/m,
-    /^\s*func\s+\([^)]+\)\s+\w+/m,
-    /:=\s*/,
-  ],
-  rust: [
-    /^\s*(fn|struct|enum|impl|mod|use|pub)\s+/m,
-    /^\s*#\[/m,
-    /\blet\s+mut\b/,
-  ],
-  java: [
-    /^\s*(public|private|protected)\s+(class|interface|enum)/m,
-    /^\s*@\w+/m,
-    /^\s*package\s+[\w.]+;/m,
-  ],
+  diff: {
+    strong: [
+      /^diff --git\s/m,
+      /^@@\s+-\d+,\d+\s+\+\d+,\d+ @@/m,
+      /^--- a\/.+\n\+\+\+ b\/.+/m,
+    ],
+    weak: [
+      /^\+(?!\+\+)[^\n]/m,           // added line (not +++)
+      /^-(?!--)[^\n]/m,              // removed line (not ---)
+      /^@@\s+/m,
+    ],
+    penalty: [
+      /^#{1,6} /m,
+      /^(import|export|const)\s+/m,
+    ],
+  },
+
+  markdown: {
+    strong: [
+      /^#{1,6} \w/m,                 // ATX heading
+      /^```\w*\s*$/m,                // fenced code block
+      /^\[.{1,80}\]\(https?:\/\//m,  // hyperlink
+      /^---\s*$/m,                   // frontmatter or HR
+    ],
+    weak: [
+      /^[-*+] \w/m,                  // unordered list
+      /^\d+\. \w/m,                  // ordered list
+      /\*\*\w+.*?\*\*/,              // bold
+      /`[^`]+`/,                     // inline code
+    ],
+    penalty: [
+      /^(import|export|const|let|var)\s+/m,
+      /^diff --git/m,
+      /^[\s\n]*\{\s*"\w+":/,         // JSON object
+    ],
+  },
 };
 
-// Log/build output patterns
-const LOG_PATTERNS = [
-  /\b(ERROR|FAIL|FAILED|FATAL|CRITICAL)\b/i,
-  /\b(WARN|WARNING)\b/i,
-  /\b(INFO|DEBUG|TRACE)\b/i,
-  /^\s*\d{4}-\d{2}-\d{2}/m,
-  /^\s*\[\d{2}:\d{2}:\d{2}\]/m,
-  /^={3,}|^-{3,}/m,
-  /^\s*(PASSED|FAILED|SKIPPED)\b/m,
-  /^npm ERR!|^yarn error|^cargo error/m,
-  /Traceback \(most recent call last\)/,
-  /^\w*(Error|Exception):/m,
-  /^\s*at\s+[\w.$]+\(/m,
-  // ContextForge additions — patterns your classifier missed
-  /^\s*error\s+TS\d+:/m,           // TypeScript compiler
-  /\berror\[E\d+\]/,               // Rust compiler
-  /^\s*✓|^\s*✗|^\s*×/m,          // test runners (vitest, jest)
-  /\bexited with code [^0]/i,      // shell exit codes
-  /^vite|^webpack|^rollup|^esbuild/m,
-  /\d+:\d+\s+(error|warning)/m,   // generic linter format
-];
-
 // ─────────────────────────────────────────────
-// Main detector
+// Sampling — SEPARATE windows, not concatenated
+//
+// Why separate: anchored regexes like /^import/m match start-of-line.
+// If we concatenate "head\n---SPLIT---\nmid", the split marker itself
+// becomes a line boundary and /^{/ matches "---SPLIT---\n{" incorrectly.
 // ─────────────────────────────────────────────
 
-/**
- * Detect content type with confidence scoring.
- *
- * @param {string} content
- * @returns {{ contentType: string, confidence: number, metadata: object }}
- */
-export function detectContentType(content) {
-  if (!content || !content.trim()) {
-    return { contentType: ContentType.PLAIN_TEXT, confidence: 0.0, metadata: {} };
+function getSamples(text) {
+  if (text.length <= SAMPLE_SIZE * 3) {
+    return [text]; // small file — use in full, no need to slice
   }
 
-  // 1. JSON (highest priority)
-  const jsonResult = tryDetectJson(content);
-  if (jsonResult) return jsonResult;
+  const head = text.slice(0, SAMPLE_SIZE);
+  const mid  = text.slice(
+    Math.floor(text.length / 2) - Math.floor(SAMPLE_SIZE / 2),
+    Math.floor(text.length / 2) + Math.floor(SAMPLE_SIZE / 2),
+  );
+  const tail = text.slice(-SAMPLE_SIZE);
 
-  // 2. Git diff (very distinctive)
-  const diffResult = tryDetectDiff(content);
-  if (diffResult && diffResult.confidence >= 0.7) return diffResult;
-
-  // 3. HTML
-  const htmlResult = tryDetectHtml(content);
-  if (htmlResult && htmlResult.confidence >= 0.7) return htmlResult;
-
-  // 4. Search results
-  const searchResult = tryDetectSearch(content);
-  if (searchResult && searchResult.confidence >= 0.6) return searchResult;
-
-  // 5. Build/log output
-  const logResult = tryDetectLog(content);
-  if (logResult && logResult.confidence >= 0.5) return logResult;
-
-  // 6. Source code
-  const codeResult = tryDetectCode(content);
-  if (codeResult && codeResult.confidence >= 0.5) return codeResult;
-
-  // 7. Fallback
-  return { contentType: ContentType.PLAIN_TEXT, confidence: 0.5, metadata: {} };
+  return [head, mid, tail]; // SEPARATE — caller tests each independently
 }
 
 // ─────────────────────────────────────────────
-// Individual detectors
+// Score calculation — tests each sample window separately
 // ─────────────────────────────────────────────
 
-function tryDetectJson(content) {
-  const trimmed = content.trimStart();
+function calculateScore(samples, type) {
+  const signals = SIGNALS[type];
+  let score = 0;
 
-  // JSON array
-  if (trimmed.startsWith("[")) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) {
-        const isDictArray = parsed.length > 0 &&
-          parsed.every((item) => typeof item === "object" && item !== null && !Array.isArray(item));
-        return {
-          contentType: ContentType.JSON_ARRAY,
-          confidence: 1.0,
-          metadata: { itemCount: parsed.length, isDictArray },
-        };
-      }
-    } catch (_) {}
-  }
-
-  // JSON object (non-array)
-  if (trimmed.startsWith("{")) {
-    try {
-      JSON.parse(trimmed);
-      return {
-        contentType: ContentType.JSON_OBJECT,
-        confidence: 0.95,
-        metadata: {},
-      };
-    } catch (_) {}
-  }
-
-  // NDJSON — multiple JSON objects, one per line
-  if (trimmed.includes("\n")) {
-    const lines = trimmed.split("\n").filter((l) => l.trim());
-    const jsonLines = lines.filter((l) => {
-      try { JSON.parse(l); return true; } catch (_) { return false; }
-    });
-    if (jsonLines.length > 2 && jsonLines.length / lines.length > 0.7) {
-      return {
-        contentType: ContentType.JSON_ARRAY,
-        confidence: 0.85,
-        metadata: { itemCount: jsonLines.length, isDictArray: false, isNDJSON: true },
-      };
-    }
-  }
-
-  return null;
-}
-
-function tryDetectDiff(content) {
-  // Scan up to 500 lines (handles git log -p preambles)
-  const lines = content.split("\n").slice(0, 500);
-
-  let headerMatches = 0;
-  let changeMatches = 0;
-
-  for (const line of lines) {
-    if (DIFF_HEADER_PATTERN.test(line)) headerMatches++;
-    if (DIFF_CHANGE_PATTERN.test(line)) changeMatches++;
-  }
-
-  if (headerMatches === 0) return null;
-
-  const confidence = Math.min(1.0, 0.5 + headerMatches * 0.2 + changeMatches * 0.05);
-
-  return {
-    contentType: ContentType.GIT_DIFF,
-    confidence,
-    metadata: { headerMatches, changeLines: changeMatches },
-  };
-}
-
-function tryDetectHtml(content) {
-  const sample = content.slice(0, 3000);
-
-  const hasDoctype  = HTML_DOCTYPE_PATTERN.test(sample);
-  const hasHtmlTag  = HTML_TAG_PATTERN.test(sample);
-  const hasHead     = HTML_HEAD_PATTERN.test(sample);
-  const hasBody     = HTML_BODY_PATTERN.test(sample);
-  const structuralCount = (sample.match(HTML_STRUCTURAL_PATTERN) || []).length;
-
-  if (!hasDoctype && !hasHtmlTag && structuralCount < 3) return null;
-
-  let confidence = 0;
-  if (hasDoctype)  confidence += 0.5;
-  if (hasHtmlTag)  confidence += 0.3;
-  if (hasHead)     confidence += 0.1;
-  if (hasBody)     confidence += 0.1;
-  confidence += Math.min(0.3, structuralCount * 0.03);
-  confidence = Math.min(1.0, confidence);
-
-  if (confidence < 0.5) return null;
-
-  return {
-    contentType: ContentType.HTML,
-    confidence,
-    metadata: { hasDoctype, hasHtmlTag, structuralTags: structuralCount },
-  };
-}
-
-function tryDetectSearch(content) {
-  const lines = content.split("\n").slice(0, 100);
-  if (!lines.length) return null;
-
-  let matchingLines = 0;
-  for (const line of lines) {
-    if (line.trim() && SEARCH_RESULT_PATTERN.test(line)) matchingLines++;
-  }
-
-  if (matchingLines === 0) return null;
-
-  const nonEmpty = lines.filter((l) => l.trim()).length;
-  if (!nonEmpty) return null;
-
-  const ratio = matchingLines / nonEmpty;
-  if (ratio < 0.3) return null;
-
-  const confidence = Math.min(1.0, 0.4 + ratio * 0.6);
-  return {
-    contentType: ContentType.SEARCH_RESULTS,
-    confidence,
-    metadata: { matchingLines, totalLines: nonEmpty },
-  };
-}
-
-function tryDetectLog(content) {
-  const lines = content.split("\n").slice(0, 200);
-  if (!lines.length) return null;
-
-  let patternMatches = 0;
-  let errorMatches = 0;
-
-  for (const line of lines) {
-    for (let i = 0; i < LOG_PATTERNS.length; i++) {
-      if (LOG_PATTERNS[i].test(line)) {
-        patternMatches++;
-        if (i < 2) errorMatches++; // ERROR or WARN patterns
-        break;
+  // Strong signals: test against ALL samples, award once per pattern
+  // (prevents a single sample dominating by matching the same pattern 3x)
+  for (const reg of signals.strong) {
+    for (const sample of samples) {
+      if (reg.test(sample)) {
+        score += 0.5;
+        break; // count this pattern once regardless of how many samples match
       }
     }
   }
 
-  if (patternMatches === 0) return null;
+  // Weak signals: incremental, capped at 0.4 total
+  let weakCount = 0;
+  for (const reg of signals.weak) {
+    for (const sample of samples) {
+      if (reg.test(sample)) {
+        weakCount++;
+        break; // count once per pattern
+      }
+    }
+  }
+  score += Math.min(weakCount * 0.1, 0.4);
 
-  const nonEmpty = lines.filter((l) => l.trim()).length;
-  if (!nonEmpty) return null;
-
-  const ratio = patternMatches / nonEmpty;
-  if (ratio < 0.1) return null;
-
-  const confidence = Math.min(1.0, 0.3 + ratio * 0.5 + errorMatches * 0.05);
-  return {
-    contentType: ContentType.BUILD_OUTPUT,
-    confidence,
-    metadata: { patternMatches, errorMatches, totalLines: nonEmpty },
-  };
-}
-
-function tryDetectCode(content) {
-  const lines = content.split("\n").slice(0, 100);
-  if (!lines.length) return null;
-
-  const languageScores = {};
-
-  for (const line of lines) {
-    for (const [lang, patterns] of Object.entries(CODE_PATTERNS)) {
-      for (const pattern of patterns) {
-        if (pattern.test(line)) {
-          languageScores[lang] = (languageScores[lang] || 0) + 1;
-          break;
-        }
+  // Penalties: demote score for conflicting signals
+  // Reduced weight (0.4 not 0.7) — penalty should demote, not eliminate
+  for (const reg of signals.penalty) {
+    for (const sample of samples) {
+      if (reg.test(sample)) {
+        score -= PENALTY_WEIGHT;
+        break; // count once per pattern
       }
     }
   }
 
-  if (Object.keys(languageScores).length === 0) return null;
-
-  const bestLang = Object.entries(languageScores)
-    .sort(([, a], [, b]) => b - a)[0];
-  const [lang, score] = bestLang;
-
-  // Need at least 3 pattern matches (their threshold — much stricter than yours)
-  if (score < 3) return null;
-
-  const nonEmpty = lines.filter((l) => l.trim()).length;
-  const ratio = score / Math.max(nonEmpty, 1);
-  const confidence = Math.min(1.0, 0.4 + ratio * 0.4 + score * 0.02);
-
-  return {
-    contentType: ContentType.SOURCE_CODE,
-    confidence,
-    metadata: { language: lang, patternMatches: score },
-  };
+  return Math.max(0, Math.min(1, score));
 }
 
 // ─────────────────────────────────────────────
-// Drop-in replacement for helper.js classifyContent
-// Maps new ContentType values to your existing pipeline's type strings
+// JSON fast-path validation
+//
+// The JSON strong signals match opening brackets, but we also
+// need to verify the content actually closes correctly.
+// This prevents truncated JSON from beating valid code files.
 // ─────────────────────────────────────────────
 
-/**
- * Drop-in replacement for classifyContent() in helper.js.
- * Returns the same string values your pipeline already uses.
- */
+function _looksLikeCompleteJson(text) {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  const first = trimmed[0];
+  const last  = trimmed[trimmed.length - 1];
+  return (first === "{" && last === "}") || (first === "[" && last === "]");
+}
+
+// ─────────────────────────────────────────────
+// Code override
+//
+// If ANY code strong signal fires, code cannot lose to log or text.
+// This prevents the "JS file with date comment classified as log" bug.
+// Code can still lose to diff (diff > code is correct) and json (if valid).
+// ─────────────────────────────────────────────
+
+function _hasStrongCodeSignal(samples) {
+  for (const reg of SIGNALS.code.strong) {
+    for (const sample of samples) {
+      if (reg.test(sample)) return true;
+    }
+  }
+  return false;
+}
+
+// ─────────────────────────────────────────────
+// Main classifier
+// ─────────────────────────────────────────────
+
+function _classify(text) {
+  const samples = getSamples(text);
+
+  // ── JSON fast-path ──
+  // Check structure before running full scoring
+  // Prevents JS object literals from scoring as JSON
+  const firstSample = samples[0];
+  const trimmedHead = firstSample.trim();
+  if (
+    (trimmedHead.startsWith("{") || trimmedHead.startsWith("[")) &&
+    _looksLikeCompleteJson(text)
+  ) {
+    // Still run scoring to catch JSON with embedded code (JS-in-JSON edge case)
+    const jsonScore = calculateScore(samples, "json");
+    const codeScore = calculateScore(samples, "code");
+    if (jsonScore > codeScore) return "json";
+  }
+
+  // ── Full scoring ──
+  const scores = {};
+  for (const type of Object.keys(SIGNALS)) {
+    scores[type] = calculateScore(samples, type);
+  }
+
+  // ── Code override ──
+  // A file with module-level import/export/function/class is always code.
+  // log and text cannot beat it even with timestamps or level brackets.
+  if (_hasStrongCodeSignal(samples)) {
+    const codeScore = scores.code;
+    // Only diff and json can beat code (and only if they score significantly higher)
+    if (scores.diff > codeScore + 0.3) return "diff";
+    if (scores.json > codeScore + 0.3) return "json";
+    return "code";
+  }
+
+  // ── Winner selection ──
+  let bestType  = "text";
+  let bestScore = 0;
+
+  for (const [type, score] of Object.entries(scores)) {
+    if (score > bestScore) {
+      bestScore = score;
+      bestType  = type;
+    }
+  }
+
+  return bestScore >= CONFIDENCE_THRESHOLD ? bestType : "text";
+}
+
+// ─────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────
+
+function _cacheKey(text) {
+  return crypto
+    .createHash("md5")
+    .update(text.slice(0, 512))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+export async function initMagika() {
+  console.log("[Classifier] ✅ Production Weighted-Evidence Engine ready");
+}
+
 export function classifyContent(text) {
-  const result = detectContentType(text);
+  if (typeof text !== "string" || text.length === 0) return "text";
 
-  switch (result.contentType) {
-    case ContentType.JSON_ARRAY:
-    case ContentType.JSON_OBJECT:
-      return "json";
-    case ContentType.SOURCE_CODE:
-      return "code";
-    case ContentType.GIT_DIFF:
-      return "diff";
-    case ContentType.BUILD_OUTPUT:
-      return "log";
-    case ContentType.SEARCH_RESULTS:
-      return "search"; // new type — add a search compressor handler
-    case ContentType.HTML:
-      return "html";   // new type — route to text compressor for now
-    default:
-      return "text";
+  const key = _cacheKey(text);
+  if (_cache.has(key)) {
+    _stats.cacheHit++;
+    return _cache.get(key);
   }
+
+  const result = _classify(text);
+
+  _stats.totalClassified++;
+  _stats.byType[result] = (_stats.byType[result] || 0) + 1;
+
+  if (_cache.size >= CACHE_MAX) {
+    _cache.delete(_cache.keys().next().value);
+  }
+  _cache.set(key, result);
+
+  return result;
 }
 
-/**
- * Full detection result with confidence and metadata.
- * Use this when you need more than just the type string.
- */
-export function detectWithConfidence(text) {
-  return detectContentType(text);
+export function classifyContentAsync(text) {
+  return Promise.resolve(classifyContent(text));
+}
+
+export function getClassifierStats() {
+  return { ..._stats, cacheSize: _cache.size };
 }

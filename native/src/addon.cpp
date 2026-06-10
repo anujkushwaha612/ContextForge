@@ -7,6 +7,7 @@
 #include "ast_compressor.h"
 #include "persistent_memory.h"
 #include "onnx_embedder.h"
+#include "anomaly_scorer.h"
 
 Napi::Number NativeCosineSimilarity(const Napi::CallbackInfo &info)
 {
@@ -80,6 +81,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports)
 
     contextforge::OnnxEmbedderNAPI::Init(env, exports);
 
+    contextforge::InitAnomalyScorer(env, exports);  // ← ADD THIS
     return exports;
 }
 NODE_API_MODULE(contextforge_native, Init)
