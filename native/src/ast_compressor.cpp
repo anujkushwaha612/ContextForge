@@ -378,6 +378,59 @@ bool ASTCompressor::shouldCompressBody(const ASTNode& node) {
 }
 
 // ─────────────────────────────────────────────
+// findBodyNode
+//
+// Recursively searches immediate children (and
+// one level deeper for wrapped declarations) for
+// a node that represents a function/class body.
+//
+// Handles:
+//   function_declaration        → direct "body" field
+//   arrow_function              → direct "body" field
+//   lexical_declaration         → variable_declarator → arrow_function → body
+//   export_statement            → class_declaration / function_declaration → body
+//   method_definition           → direct "body" field
+// ─────────────────────────────────────────────
+
+TSNode ASTCompressor::findBodyNode(TSNode node) {
+  // ── Try direct "body" field first (fastest path) ──
+  TSNode direct = ts_node_child_by_field_name(node, "body", 4);
+  if (!ts_node_is_null(direct)) return direct;
+
+  // ── Walk immediate named children ──
+  // Covers: lexical_declaration → variable_declarator → arrow_function
+  //         export_statement → function_declaration / class_declaration
+  uint32_t child_count = ts_node_named_child_count(node);
+  for (uint32_t i = 0; i < child_count; i++) {
+    TSNode child = ts_node_named_child(node, i);
+    std::string child_type = ts_node_type(child);
+
+    // If child itself has a body field — recurse one level
+    TSNode child_body = ts_node_child_by_field_name(child, "body", 4);
+    if (!ts_node_is_null(child_body)) return child_body;
+
+    // variable_declarator → value field (the arrow_function / function_expression)
+    TSNode value = ts_node_child_by_field_name(child, "value", 5);
+    if (!ts_node_is_null(value)) {
+      TSNode value_body = ts_node_child_by_field_name(value, "body", 4);
+      if (!ts_node_is_null(value_body)) return value_body;
+    }
+
+    // export_statement wraps: check the declaration child
+    if (child_type == "export_statement") {
+      TSNode decl = ts_node_child_by_field_name(child, "declaration", 11);
+      if (!ts_node_is_null(decl)) {
+        TSNode decl_body = ts_node_child_by_field_name(decl, "body", 4);
+        if (!ts_node_is_null(decl_body)) return decl_body;
+      }
+    }
+  }
+
+  // Nothing found
+  return {}; // returns null node
+}
+
+// ─────────────────────────────────────────────
 // walkNode — recursive AST traversal
 // ─────────────────────────────────────────────
 
@@ -390,74 +443,75 @@ void ASTCompressor::walkNode(
 ) {
   if (ts_node_is_null(node)) return;
 
+  // Safety net against pathological inputs — raised from 4 to 12
+  if (depth > 12) return;
+
   std::string ntype = ts_node_type(node);
 
-  // Only record nodes at reasonable depth to avoid micro-expressions
-  if (depth <= 4 && isSignatureNode(ntype, language)) {
+  if (isSignatureNode(ntype, language)) {
     ASTNode anode;
-    anode.type       = ntype;
-    anode.depth      = depth;
-    anode.is_exported = false;
-    anode.is_async   = false;
+    anode.type            = ntype;
+    anode.depth           = depth;
+    anode.is_exported     = false;
+    anode.is_async        = false;
     anode.has_error_handler = false;
-    anode.complexity = 1;
+    anode.complexity      = 1;
 
-    // Start/end lines (0-based from tree-sitter)
     anode.start_line = ts_node_start_point(node).row;
     anode.end_line   = ts_node_end_point(node).row;
 
-    // Extract name
-    anode.name = extractName(node, source);
+    // ── Only record nodes with meaningful size ──
+    // Filters out single-line const declarations, tiny expressions, etc.
+    // that would never qualify for body compression anyway.
+    int node_lines = (int)(anode.end_line - anode.start_line);
+    if (node_lines >= 2) {
 
-    // Detect body node for JS/TS functions
-    TSNode body = ts_node_child_by_field_name(node, "body", 4);
-    if (!ts_node_is_null(body)) {
-      anode.body_start_line = ts_node_start_point(body).row;
-      anode.body_end_line   = ts_node_end_point(body).row;
-    } else {
-      anode.body_start_line = anode.start_line;
-      anode.body_end_line   = anode.end_line;
-    }
+      anode.name = extractName(node, source);
 
-    // Check for export parent
-    if (depth > 0) {
-      // Walk up — simplified: check if type contains "export"
+      TSNode body = findBodyNode(node);
+        if (!ts_node_is_null(body)) {
+          anode.body_start_line = ts_node_start_point(body).row;
+          anode.body_end_line   = ts_node_end_point(body).row;
+        } else {
+          anode.body_start_line = anode.start_line;
+          anode.body_end_line   = anode.end_line;
+        }
+
       if (ntype.find("export") != std::string::npos) {
         anode.is_exported = true;
       }
-    }
 
-    // Check for async
-    std::string node_text = getNodeText(node, source);
-    if (node_text.find("async ") != std::string::npos) {
-      anode.is_async = true;
-    }
-
-    // Check for error handlers in body
-    std::function<bool(TSNode)> hasErrorHandler = [&](TSNode n) -> bool {
-      std::string t = ts_node_type(n);
-      if (t == "try_statement" || t == "catch_clause" ||
-          t == "try_expression") return true;
-      uint32_t c = ts_node_named_child_count(n);
-      for (uint32_t i = 0; i < c; i++) {
-        if (hasErrorHandler(ts_node_named_child(n, i))) return true;
+      std::string node_text = getNodeText(node, source);
+      if (node_text.find("async ") != std::string::npos) {
+        anode.is_async = true;
       }
-      return false;
-    };
 
-    if (!ts_node_is_null(body)) {
-      anode.has_error_handler = hasErrorHandler(body);
+      std::function<bool(TSNode)> hasErrorHandler = [&](TSNode n) -> bool {
+        std::string t = ts_node_type(n);
+        if (t == "try_statement" || t == "catch_clause" ||
+            t == "try_expression") return true;
+        uint32_t c = ts_node_named_child_count(n);
+        for (uint32_t i = 0; i < c; i++) {
+          if (hasErrorHandler(ts_node_named_child(n, i))) return true;
+        }
+        return false;
+      };
+
+      if (!ts_node_is_null(body)) {
+        anode.has_error_handler = hasErrorHandler(body);
+      }
+
+      if (config_.extract_complexity && !ts_node_is_null(body)) {
+        anode.complexity = computeComplexity(body, source);
+      }
+
+      out_nodes.push_back(anode);
     }
-
-    // Cyclomatic complexity
-    if (config_.extract_complexity && !ts_node_is_null(body)) {
-      anode.complexity = computeComplexity(body, source);
-    }
-
-    out_nodes.push_back(anode);
+    // ── Even if this node is too small to record, still recurse ──
+    // A tiny arrow function wrapper may contain a large inner function
   }
 
-  // Recurse into children
+  // Always recurse — depth gate above handles termination
   uint32_t child_count = ts_node_named_child_count(node);
   for (uint32_t i = 0; i < child_count; i++) {
     walkNode(ts_node_named_child(node, i), source, language, depth + 1, out_nodes);
@@ -804,11 +858,86 @@ Napi::Value ASTCompressorNAPI::DetectLanguage(const Napi::CallbackInfo& info) {
   return Napi::String::New(env, compressor_.detectLanguage(source, hint));
 }
 
+Napi::Object ASTCompressorNAPI::NodeToJS(Napi::Env env, const ASTNode& node) {
+  Napi::Object obj = Napi::Object::New(env);
+
+  obj.Set("type",           Napi::String::New(env, node.type));
+  obj.Set("name",           Napi::String::New(env, node.name));
+  obj.Set("start_line",     Napi::Number::New(env, node.start_line));
+  obj.Set("end_line",       Napi::Number::New(env, node.end_line));
+  obj.Set("body_start_line",Napi::Number::New(env, node.body_start_line));
+  obj.Set("body_end_line",  Napi::Number::New(env, node.body_end_line));
+  obj.Set("is_exported",    Napi::Boolean::New(env, node.is_exported));
+  obj.Set("is_async",       Napi::Boolean::New(env, node.is_async));
+  obj.Set("complexity",     Napi::Number::New(env, node.complexity));
+  obj.Set("depth",          Napi::Number::New(env, node.depth));
+  obj.Set("has_error_handler", Napi::Boolean::New(env, node.has_error_handler));
+
+  return obj;
+}
+
 Napi::Value ASTCompressorNAPI::ExtractNodes(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  // Returns raw node list for inspection/debugging
-  Napi::Array arr = Napi::Array::New(env, 0);
-  return arr; // stub — full impl omitted for brevity
+
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "extractNodes(source: string, languageHint?: string)")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  std::string source    = info[0].As<Napi::String>().Utf8Value();
+  std::string lang_hint = (info.Length() > 1 && info[1].IsString())
+                          ? info[1].As<Napi::String>().Utf8Value()
+                          : "";
+
+  if (source.empty()) {
+    return Napi::Array::New(env, 0);
+  }
+
+  try {
+    // ── Detect language ──
+    std::string language = lang_hint.empty()
+      ? compressor_.detectLanguage(source)
+      : lang_hint;
+
+    // ── Find grammar ──
+    // We need to parse — reuse the internal parser via compress()
+    // but we only want the node list, not the compressed output.
+    // Simplest approach: call compress() and return all nodes
+    // (preserved + compressed) from the result.
+    CompressionResult result = compressor_.compress(source, language);
+
+    // ── Merge preserved + compressed nodes ──
+    std::vector<ASTNode> all_nodes;
+    all_nodes.reserve(
+      result.preserved_nodes.size() + result.compressed_nodes.size()
+    );
+    for (const auto& n : result.preserved_nodes) {
+      all_nodes.push_back(n);
+    }
+    for (const auto& n : result.compressed_nodes) {
+      all_nodes.push_back(n);
+    }
+
+    // ── Sort by start_line so JS receives them in source order ──
+    std::sort(all_nodes.begin(), all_nodes.end(),
+      [](const ASTNode& a, const ASTNode& b) {
+        return a.start_line < b.start_line;
+      }
+    );
+
+    // ── Build JS array ──
+    Napi::Array arr = Napi::Array::New(env, all_nodes.size());
+    for (size_t i = 0; i < all_nodes.size(); i++) {
+      arr.Set((uint32_t)i, NodeToJS(env, all_nodes[i]));
+    }
+
+    return arr;
+
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
 }
 
 // ─────────────────────────────────────────────

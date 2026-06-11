@@ -137,6 +137,7 @@ namespace contextforge
         const std::string &language,
         int depth,
         std::vector<ASTNode> &out_nodes);
+    TSNode findBodyNode(TSNode node);
 
     // Extract identifier name from a node
     std::string extractName(TSNode node, const std::string &source);

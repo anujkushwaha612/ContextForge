@@ -27,6 +27,7 @@ import {
   sliceJsonToolResults,
   applyPredictiveInjection,
   deduplicateSystemMessages,
+  createTranslationContext,
   // validateAndRepairMessages,
 } from "./helper.js";
 
@@ -286,6 +287,11 @@ const server = http.createServer((req, res) => {
     const startTime = performance.now();
     const timer = new StageTimer();
 
+    // ── Per-request translation context ──
+    // Isolated from other concurrent requests.
+    // Prefix cache still works within a single request's pipeline.
+    const translationCtx = createTranslationContext();
+
     // ── Parse body ──
     let payload;
     try {
@@ -316,158 +322,161 @@ const server = http.createServer((req, res) => {
     // Defined before the gate so both passthrough
     // and compression branches can call it.
     // ─────────────────────────────────────────────
-    async function executeUpstreamRequest(
-      currentPayload,
-      retryCount = 0,
-      isInitialHop = true,
-    ) {
-      // // ── Validate and repair message sequence ──
-      // if (currentPayload.messages) {
-      //   const { messages, valid, issues } = validateAndRepairMessages(
-      //     currentPayload.messages,
-      //   );
-      //   if (!valid) {
-      //     console.warn(
-      //       `[MsgValidator] Repaired ${issues.length} issue(s) before transmit`,
-      //     );
-      //     currentPayload = { ...currentPayload, messages };
-      //   }
-      // }
+    async function executeUpstreamRequest(currentPayload, retryCount = 0) {
+      return new Promise((resolve, reject) => {
+        // ── Model override ──
+        currentPayload = { ...currentPayload, model: "minimax-m3:cloud" };
+        delete currentPayload.max_completion_tokens;
+        delete currentPayload.max_output_tokens;
 
-      // ── Model override — done here, not before the pipeline ──
-      // Keeps the original model name available to getPolicyForModel above
-      currentPayload = { ...currentPayload, model: "minimax-m3:cloud" };
-      delete currentPayload.max_completion_tokens;
-      delete currentPayload.max_output_tokens;
+        // ── Debug payload dump ──
+        if (process.env.CF_DEBUG_PAYLOAD === "1") {
+          writeFileSync(
+            path.join(__dirname, "../debug_payload.json"),
+            JSON.stringify(currentPayload, null, 2),
+            "utf-8",
+          );
+          console.log("[Debug] Payload dumped to debug_payload.json");
+        }
 
-      // ── Debug payload dump ──
-      if (process.env.CF_DEBUG_PAYLOAD === "1") {
-        writeFileSync(
-          path.join(__dirname, "../debug_payload.json"),
-          JSON.stringify(currentPayload, null, 2),
-          "utf-8",
-        );
-        console.log("[Debug] Payload dumped to debug_payload.json");
-      }
+        try {
+          const finalTokenCount = countTokens(currentPayload);
+          console.log(
+            `\n[Wire Inspector] Transmitting ${finalTokenCount} tokens to LLM (Retry: ${retryCount})`,
+          );
+        } catch {
+          console.log(`\n[Wire Inspector] Transmitting payload...`);
+        }
 
-      try {
-        const finalTokenCount = countTokens(currentPayload);
-        console.log(
-          `\n[Wire Inspector] Transmitting ${finalTokenCount} tokens to LLM (Retry: ${retryCount})`,
-        );
-      } catch {
-        console.log(`\n[Wire Inspector] Transmitting payload...`);
-      }
+        const outboundBody = JSON.stringify(currentPayload);
+        const outboundHeaders = adapter.transformHeaders(req.headers);
 
-      const outboundBody = JSON.stringify(currentPayload);
-      const outboundHeaders = adapter.transformHeaders(req.headers);
+        delete outboundHeaders["x-api-key"];
+        delete outboundHeaders["anthropic-version"];
+        delete outboundHeaders["anthropic-beta"];
 
-      delete outboundHeaders["x-api-key"];
-      delete outboundHeaders["anthropic-version"];
-      delete outboundHeaders["anthropic-beta"];
+        if (process.env.NEMOTRON_CLOUD_API_KEY) {
+          outboundHeaders["authorization"] =
+            `Bearer ${process.env.NEMOTRON_CLOUD_API_KEY}`;
+        }
 
-      if (process.env.NEMOTRON_CLOUD_API_KEY) {
-        outboundHeaders["authorization"] =
-          `Bearer ${process.env.NEMOTRON_CLOUD_API_KEY}`;
-      }
+        outboundHeaders["content-length"] = Buffer.byteLength(outboundBody);
+        delete outboundHeaders["accept-encoding"];
 
-      outboundHeaders["content-length"] = Buffer.byteLength(outboundBody);
-      delete outboundHeaders["accept-encoding"];
-
-      const outboundPath = "/v1/chat/completions";
-      const requestOptions = {
-        hostname: adapter.hostname,
-        port: adapter.port,
-        path: outboundPath,
-        method: req.method,
-        headers: outboundHeaders,
-      };
-
-      const requestModule =
-        requestOptions.port === 80 || requestOptions.port === 11434
-          ? http
-          : https;
-
-      if (retryCount === 0) {
-        console.log(
-          `\n[Route] ${req.url} -> ${adapter.hostname}${outboundPath}`,
-        );
-      } else {
-        console.log(
-          `\n[Ghost Interceptor] Retry #${retryCount} -> ${adapter.hostname}${outboundPath}`,
-        );
-      }
-
-      const isStreamRequest = currentPayload.stream === true;
-
-      const proxyReq = requestModule.request(requestOptions, (proxyRes) => {
-        let sseBuffer = "";
-        const responseChunks = [];
-
-        let toolState = {
-          inToolCall: false,
-          inTextBlock: false,
-          toolIndex: 0,
-          nextBlockIndex: undefined,
-          textBlockIndex: -1,
-          currentToolIndex: -1,
+        const outboundPath = "/v1/chat/completions";
+        const requestOptions = {
+          hostname: adapter.hostname,
+          port: adapter.port,
+          path: outboundPath,
+          method: req.method,
+          headers: outboundHeaders,
         };
 
-        let messageId =
-          "msg_forge_" + Math.random().toString(36).substring(2, 15);
-        let isFirstChunk = isInitialHop;
+        const requestModule =
+          requestOptions.port === 80 || requestOptions.port === 11434
+            ? http
+            : https;
 
-        let fullStreamedText = "";
-        let detectedToolName = "";
-        let detectedToolId = "";
-        let detectedToolArgs = "";
+        if (retryCount === 0) {
+          console.log(
+            `\n[Route] ${req.url} -> ${adapter.hostname}${outboundPath}`,
+          );
+        } else {
+          console.log(
+            `\n[Ghost Interceptor] Retry #${retryCount} -> ${adapter.hostname}${outboundPath}`,
+          );
+        }
 
-        let heldEvents = [];
-        let hasSeenToolCall = false;
-        let hasSeenTextContent = false;
+        const isStreamRequest = currentPayload.stream === true;
 
-        // ── Data handler ──
-        proxyRes.on("data", (chunk) => {
-          responseChunks.push(chunk);
+        const proxyReq = requestModule.request(requestOptions, (proxyRes) => {
+          let sseBuffer = "";
+          const responseChunks = [];
 
-          if (isStreamRequest) {
-            const rawSseText = chunk.toString("utf-8");
-            sseBuffer += rawSseText;
+          let toolState = {
+            inToolCall: false,
+            inTextBlock: false,
+            toolIndex: 0,
+            nextBlockIndex: undefined,
+            textBlockIndex: -1,
+            currentToolIndex: -1,
+          };
 
-            if (isAnthropic) {
-              const lines = rawSseText.split("\n");
+          let messageId =
+            "msg_forge_" + Math.random().toString(36).substring(2, 15);
+          let isFirstChunk = true;
 
-              for (const line of lines) {
-                if (!line.startsWith("data: ")) continue;
-                const openAiData = line.substring(6).trim();
-                if (!openAiData) continue;
+          let fullStreamedText = "";
+          let detectedToolName = "";
+          let detectedToolId = "";
+          let detectedToolArgs = "";
 
-                try {
-                  if (openAiData !== "[DONE]") {
-                    const parsedChunk = JSON.parse(openAiData);
-                    const delta = parsedChunk.choices?.[0]?.delta;
+          let heldEvents = [];
+          let hasSeenToolCall = false;
 
-                    if (delta?.reasoning || delta?.content) {
-                      fullStreamedText +=
-                        (delta.reasoning || "") + (delta.content || "");
-                      hasSeenTextContent = true;
+          // ── Data handler ──
+          proxyRes.on("data", (chunk) => {
+            responseChunks.push(chunk);
+
+            if (isStreamRequest) {
+              const rawSseText = chunk.toString("utf-8");
+              sseBuffer += rawSseText;
+
+              if (isAnthropic) {
+                const lines = rawSseText.split("\n");
+
+                for (const line of lines) {
+                  if (!line.startsWith("data: ")) continue;
+                  const openAiData = line.substring(6).trim();
+                  if (!openAiData) continue;
+
+                  try {
+                    if (openAiData !== "[DONE]") {
+                      const parsedChunk = JSON.parse(openAiData);
+                      const delta = parsedChunk.choices?.[0]?.delta;
+
+                      if (delta?.reasoning || delta?.content) {
+                        fullStreamedText +=
+                          (delta.reasoning || "") + (delta.content || "");
+                      }
+
+                      if (delta?.tool_calls?.[0]) {
+                        hasSeenToolCall = true;
+                        const tc = delta.tool_calls[0];
+                        if (tc.id) detectedToolId = tc.id;
+                        if (tc.function?.name)
+                          detectedToolName += tc.function.name;
+                        if (tc.function?.arguments)
+                          detectedToolArgs += tc.function.arguments;
+                      }
                     }
-
-                    if (delta?.tool_calls?.[0]) {
-                      hasSeenToolCall = true;
-                      const tc = delta.tool_calls[0];
-                      if (tc.id) detectedToolId = tc.id;
-                      if (tc.function?.name)
-                        detectedToolName += tc.function.name;
-                      if (tc.function?.arguments)
-                        detectedToolArgs += tc.function.arguments;
-                    }
+                  } catch {
+                    // ignore malformed partial chunks
                   }
-                } catch {
-                  // ignore malformed partial chunks
-                }
 
-                if (hasSeenToolCall) {
+                  if (hasSeenToolCall) {
+                    const anthropicEvents = translateOpenAISSEToAnthropic(
+                      openAiData,
+                      messageId,
+                      isFirstChunk,
+                      toolState,
+                    );
+                    if (anthropicEvents.length > 0) {
+                      isFirstChunk = false;
+                      heldEvents.push(...anthropicEvents);
+                    }
+                    continue;
+                  }
+
+                  if (!res.headersSent) {
+                    res.writeHead(proxyRes.statusCode, {
+                      "Content-Type": "text/event-stream",
+                      "Cache-Control": "no-cache",
+                      Connection: "keep-alive",
+                      "Access-Control-Allow-Origin": "*",
+                    });
+                  }
+
                   const anthropicEvents = translateOpenAISSEToAnthropic(
                     openAiData,
                     messageId,
@@ -476,13 +485,31 @@ const server = http.createServer((req, res) => {
                   );
                   if (anthropicEvents.length > 0) {
                     isFirstChunk = false;
-                    heldEvents.push(...anthropicEvents);
+                    for (const event of anthropicEvents) res.write(event);
                   }
-                  continue;
                 }
+              } else {
+                if (!res.headersSent) {
+                  res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                }
+                res.write(chunk);
+              }
+            }
+          });
+
+          // ── End handler ──
+          proxyRes.on("end", async () => {
+            const hopEndTime = performance.now();
+
+            try {
+              // ── Silent rate limit (empty SSE stream) ──
+              if (isStreamRequest && sseBuffer.length === 0) {
+                const resetSeconds =
+                  parseFloat(proxyRes.headers["x-ratelimit-reset-tokens"]) ||
+                  60;
 
                 if (!res.headersSent) {
-                  res.writeHead(proxyRes.statusCode, {
+                  res.writeHead(200, {
                     "Content-Type": "text/event-stream",
                     "Cache-Control": "no-cache",
                     Connection: "keep-alive",
@@ -490,542 +517,576 @@ const server = http.createServer((req, res) => {
                   });
                 }
 
-                const anthropicEvents = translateOpenAISSEToAnthropic(
-                  openAiData,
-                  messageId,
-                  isFirstChunk,
-                  toolState,
+                const errorMsgId = `msg_forge_ratelimit_${Date.now()}`;
+                res.write(
+                  `event: message_start\ndata: ${JSON.stringify({
+                    type: "message_start",
+                    message: {
+                      id: errorMsgId,
+                      type: "message",
+                      role: "assistant",
+                      content: [],
+                      model: "contextforge",
+                      stop_reason: null,
+                      stop_sequence: null,
+                      usage: { input_tokens: 0, output_tokens: 1 },
+                    },
+                  })}\n\n`,
                 );
-                if (anthropicEvents.length > 0) {
-                  isFirstChunk = false;
-                  for (const event of anthropicEvents) res.write(event);
-                }
-              }
-            } else {
-              if (!res.headersSent) {
-                res.writeHead(proxyRes.statusCode, proxyRes.headers);
-              }
-              res.write(chunk);
-            }
-          }
-        });
-
-        // ── End handler ──
-        proxyRes.on("end", async () => {
-          // ── Silent rate limit (empty SSE stream) ──
-          if (isStreamRequest && sseBuffer.length === 0) {
-            const resetSeconds =
-              parseFloat(proxyRes.headers["x-ratelimit-reset-tokens"]) || 60;
-
-            if (!res.headersSent) {
-              res.writeHead(200, {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                Connection: "keep-alive",
-                "Access-Control-Allow-Origin": "*",
-              });
-            }
-
-            const errorMsgId = `msg_forge_ratelimit_${Date.now()}`;
-            res.write(
-              `event: message_start\ndata: ${JSON.stringify({
-                type: "message_start",
-                message: {
-                  id: errorMsgId,
-                  type: "message",
-                  role: "assistant",
-                  content: [],
-                  model: "contextforge",
-                  stop_reason: null,
-                  stop_sequence: null,
-                  usage: { input_tokens: 0, output_tokens: 1 },
-                },
-              })}\n\n`,
-            );
-            res.write(
-              `event: content_block_start\ndata: ${JSON.stringify({
-                type: "content_block_start",
-                index: 0,
-                content_block: { type: "text", text: "" },
-              })}\n\n`,
-            );
-            res.write(
-              `event: content_block_delta\ndata: ${JSON.stringify({
-                type: "content_block_delta",
-                index: 0,
-                delta: {
-                  type: "text_delta",
-                  text: `⚠️ Rate limit reached. Resets in ${Math.ceil(resetSeconds)}s. Please wait and retry.`,
-                },
-              })}\n\n`,
-            );
-            res.write(
-              `event: content_block_stop\ndata: ${JSON.stringify({
-                type: "content_block_stop",
-                index: 0,
-              })}\n\n`,
-            );
-            res.write(
-              `event: message_delta\ndata: ${JSON.stringify({
-                type: "message_delta",
-                delta: { stop_reason: "end_turn", stop_sequence: null },
-                usage: { output_tokens: 1 },
-              })}\n\n`,
-            );
-            res.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
-            res.end();
-            return;
-          }
-
-          // ── Streaming: Ghost Interceptor decision point ──
-          if (isStreamRequest) {
-            const dummyMessage = {
-              tool_calls: [
-                {
-                  id: detectedToolId || `call_cf_${Date.now()}`,
-                  type: "function",
-                  function: {
-                    name: detectedToolName,
-                    arguments: detectedToolArgs,
-                  },
-                },
-              ],
-            };
-
-            const normalizedToolName = normalizeGraphToolName(detectedToolName);
-            const isGraphTool = isGraphToolCall(detectedToolName);
-            const isRetrieveTool = normalizedToolName.includes(
-              "contextforge_retrieve",
-            );
-            const isMemoryTool =
-              normalizedToolName && hasMemoryToolCalls(dummyMessage);
-
-            if (
-              (isRetrieveTool || isMemoryTool || isGraphTool) &&
-              retryCount < 2
-            ) {
-              // ← MODIFY
-              console.log(
-                `\n[Ghost Interceptor] 🔍 Intercepted background tool: ` +
-                  `${detectedToolName} (swallowing ${heldEvents.length} buffered events)`,
-              );
-
-              // ── Graph query ──                                      ← ADD ENTIRE BLOCK
-              if (isGraphTool) {
-                console.log(
-                  `\n[Ghost Interceptor] 🗺️  Graph query intercepted: ${detectedToolName}` +
-                    (normalizedToolName !== detectedToolName
-                      ? ` (normalized from MCP: ${detectedToolName})`
-                      : ``),
+                res.write(
+                  `event: content_block_start\ndata: ${JSON.stringify({
+                    type: "content_block_start",
+                    index: 0,
+                    content_block: { type: "text", text: "" },
+                  })}\n\n`,
                 );
+                res.write(
+                  `event: content_block_delta\ndata: ${JSON.stringify({
+                    type: "content_block_delta",
+                    index: 0,
+                    delta: {
+                      type: "text_delta",
+                      text: `⚠️ Rate limit reached. Resets in ${Math.ceil(resetSeconds)}s. Please wait and retry.`,
+                    },
+                  })}\n\n`,
+                );
+                res.write(
+                  `event: content_block_stop\ndata: ${JSON.stringify({
+                    type: "content_block_stop",
+                    index: 0,
+                  })}\n\n`,
+                );
+                res.write(
+                  `event: message_delta\ndata: ${JSON.stringify({
+                    type: "message_delta",
+                    delta: { stop_reason: "end_turn", stop_sequence: null },
+                    usage: { output_tokens: 1 },
+                  })}\n\n`,
+                );
+                res.write(
+                  `event: message_stop\ndata: {"type":"message_stop"}\n\n`,
+                );
+                res.end();
+                resolve({ hopEndTime });
+                return;
+              }
 
-                let args = null;
-                try {
-                  args = JSON.parse(detectedToolArgs);
-                } catch {
-                  console.error(`[Ghost Interceptor] ⚠️ Graph args malformed`);
-                }
+              // ── Streaming: Ghost Interceptor decision point ──
+              if (isStreamRequest) {
+                const dummyMessage = {
+                  tool_calls: [
+                    {
+                      id: detectedToolId || `call_cf_${Date.now()}`,
+                      type: "function",
+                      function: {
+                        name: detectedToolName,
+                        arguments: detectedToolArgs,
+                      },
+                    },
+                  ],
+                };
 
-                if (args?.query_type && args?.target) {
-                  const result = executeGraphQuery(
-                    args.query_type,
-                    args.target,
-                  );
+                const normalizedToolName =
+                  normalizeGraphToolName(detectedToolName);
+                const isGraphTool = isGraphToolCall(detectedToolName);
+                const isRetrieveTool = normalizedToolName.includes(
+                  "contextforge_retrieve",
+                );
+                const isMemoryTool =
+                  !isRetrieveTool &&
+                  !isGraphTool &&
+                  normalizedToolName &&
+                  hasMemoryToolCalls(dummyMessage);
 
+                if (
+                  (isRetrieveTool || isMemoryTool || isGraphTool) &&
+                  retryCount < 2
+                ) {
                   console.log(
-                    `[Ghost Interceptor] ✅ Graph: ${args.query_type}("${args.target}") ` +
-                      `→ ${result.length} chars`,
+                    `\n[Ghost Interceptor] 🔍 Intercepted background tool: ` +
+                      `${detectedToolName} (swallowing ${heldEvents.length} buffered events)`,
                   );
 
+                  // ── Graph query ──
+                  if (isGraphTool) {
+                    console.log(
+                      `\n[Ghost Interceptor] 🗺️  Graph query intercepted: ${detectedToolName}` +
+                        (normalizedToolName !== detectedToolName
+                          ? ` (normalized from MCP: ${detectedToolName})`
+                          : ``),
+                    );
+
+                    let args = null;
+                    try {
+                      args = JSON.parse(detectedToolArgs);
+                    } catch {
+                      console.error(
+                        `[Ghost Interceptor] ⚠️ Graph args malformed`,
+                      );
+                    }
+
+                    if (args?.query_type && args?.target) {
+                      const result = executeGraphQuery(
+                        args.query_type,
+                        args.target,
+                      );
+
+                      console.log(
+                        `[Ghost Interceptor] ✅ Graph: ${args.query_type}("${args.target}") ` +
+                          `→ ${result.length} chars`,
+                      );
+
+                      currentPayload.messages.push({
+                        role: "assistant",
+                        content: null,
+                        tool_calls: dummyMessage.tool_calls,
+                      });
+                      currentPayload.messages.push({
+                        role: "tool",
+                        tool_call_id: dummyMessage.tool_calls[0].id,
+                        name: GRAPH_TOOL_NAME,
+                        content: result,
+                      });
+
+                      currentPayload.tool_choice = "none";
+                      executeUpstreamRequest(
+                        currentPayload,
+                        retryCount + 1,
+                        false,
+                      )
+                        .then(resolve)
+                        .catch(reject);
+                      return;
+                    }
+
+                    console.warn(
+                      `[Ghost Interceptor] ⚠️ Graph args missing query_type/target — falling through`,
+                    );
+                  }
+
+                  // ── Vault retrieval ──
+                  if (isRetrieveTool) {
+                    let args = null;
+                    try {
+                      args = JSON.parse(detectedToolArgs);
+                    } catch {
+                      console.error(
+                        `[Ghost Interceptor] ⚠️ Args JSON malformed: "${detectedToolArgs.slice(0, 120)}"`,
+                      );
+                    }
+
+                    if (args) {
+                      // ── Graph-first shortcut ──
+                      // If the search_query looks like a symbol name, try find_symbol
+                      // on the graph first. This returns only the function body (~100 lines)
+                      // instead of opening the full vault (potentially 76k+ chars).
+                      let vaultedText = null;
+                      const sq = (args.search_query || "").trim();
+                      if (sq && /^[\w$]+$/.test(sq)) {
+                        try {
+                          const graphHits = executeGraphQuery("find_symbol", sq);
+                          const parsed = JSON.parse(graphHits);
+                          if (
+                            parsed.definitions?.length > 0 &&
+                            parsed.definitions[0].body
+                          ) {
+                            const hit = parsed.definitions[0];
+                            vaultedText =
+                              `[Graph result for '${sq}' from ${hit.file} ` +
+                              `lines ${hit.start_line}–${hit.end_line}]\n\n` +
+                              hit.body;
+                            console.log(
+                              `[Ghost Interceptor] 🗺️  Graph shortcut hit for '${sq}' ` +
+                                `(${vaultedText.length} chars — skipped vault)`,
+                            );
+                          }
+                        } catch (graphErr) {
+                          // Graph lookup failed — fall through to vault
+                        }
+                      }
+
+                      if (!vaultedText) {
+                        try {
+                          vaultedText = await retrieveFromVault(
+                            args.vault_id,
+                            args.search_query || null,
+                            currentPayload.messages,
+                            semanticCache,
+                            hybridRetriever,
+                          );
+                        } catch (retrieveErr) {
+                          console.error(
+                            `[Ghost Interceptor] ⚠️ Vault retrieval failed: ${retrieveErr.message}`,
+                          );
+                        }
+                      }
+
+                      if (vaultedText) {
+                        recordCCRSuccess(currentPayload, args.vault_id);
+                        console.log(
+                          `[Ghost Interceptor] ✅ Vault ${args.vault_id} opened (${vaultedText.length} chars)`,
+                        );
+                        currentPayload.messages.push({
+                          role: "assistant",
+                          content: null,
+                          tool_calls: dummyMessage.tool_calls,
+                        });
+                        currentPayload.messages.push({
+                          role: "tool",
+                          tool_call_id: dummyMessage.tool_calls[0].id,
+                          name: "contextforge_retrieve",
+                          content: vaultedText,
+                        });
+                        currentPayload.tool_choice = "none";
+                        executeUpstreamRequest(
+                          currentPayload,
+                          retryCount + 1,
+                          false,
+                        )
+                          .then(resolve)
+                          .catch(reject);
+                        return;
+                      } else {
+                        console.warn(
+                          `[Ghost Interceptor] ⚠️ Vault ${args.vault_id} returned empty — replaying as real tool`,
+                        );
+                      }
+                    }
+                  }
+
+                  // ── Memory tools ──
+                  if (isMemoryTool) {
+                    const userId =
+                      req.headers["x-contextforge-user-id"] ?? "anonymous";
+                    const workspace =
+                      req.headers["x-contextforge-workspace"] ?? "";
+
+                    const toolResults = await executeMemoryToolCalls(
+                      dummyMessage,
+                      memoryHandler,
+                      { userId, workspace },
+                    );
+
+                    if (toolResults.length > 0) {
+                      console.log(
+                        `[Ghost Interceptor] 🧠 Memory tool executed successfully`,
+                      );
+                      currentPayload.messages.push({
+                        role: "assistant",
+                        content: null,
+                        tool_calls: dummyMessage.tool_calls,
+                      });
+                      currentPayload.messages.push(...toolResults);
+                      currentPayload.tool_choice = "none";
+                      executeUpstreamRequest(
+                        currentPayload,
+                        retryCount + 1,
+                        false,
+                      )
+                        .then(resolve)
+                        .catch(reject);
+                      return;
+                    }
+
+                    console.warn(
+                      `[Ghost Interceptor] ⚠️ Memory tool returned no results — replaying as real tool`,
+                    );
+                  }
+                }
+
+                // ── Replay: real tool call ──
+                if (heldEvents.length > 0) {
+                  if (!res.headersSent) {
+                    res.writeHead(proxyRes.statusCode, {
+                      "Content-Type": "text/event-stream",
+                      "Cache-Control": "no-cache",
+                      Connection: "keep-alive",
+                      "Access-Control-Allow-Origin": "*",
+                    });
+                  }
+                  for (const event of heldEvents) res.write(event);
+                }
+
+                // ── RAG indexing (fire-and-forget) ──
+                if (
+                  !isRetrieveTool &&
+                  !isMemoryTool &&
+                  fullStreamedText.trim().length > 0
+                ) {
+                  (async () => {
+                    try {
+                      const tokenCount = Math.floor(
+                        fullStreamedText.length / 4,
+                      );
+                      if (tokenCount >= 50) {
+                        const indexId = "IDX_" + crypto.randomUUID();
+                        const embedding =
+                          await onnxEmbedder.embed(fullStreamedText);
+                        hybridRetriever.addDocumentWithEmbedding(
+                          indexId,
+                          fullStreamedText,
+                          embedding,
+                        );
+                        console.log(
+                          `[RAG Index] Indexed ${tokenCount} tokens (BM25 + HNSW, dim=384)`,
+                        );
+                      }
+                    } catch (err) {
+                      console.error(
+                        "[RAG Index] Indexing failed:",
+                        err.message,
+                      );
+                    }
+                  })();
+                }
+
+                res.end();
+                resolve({ hopEndTime });
+                return;
+              }
+
+              // ── Non-streaming: JSON response ──
+              const fullResponseBuf = Buffer.concat(responseChunks);
+              let jsonResponse;
+
+              try {
+                jsonResponse = JSON.parse(fullResponseBuf.toString("utf-8"));
+              } catch {
+                if (!res.headersSent) {
+                  res.writeHead(proxyRes.statusCode, {
+                    ...proxyRes.headers,
+                    "Access-Control-Allow-Origin": "*",
+                  });
+                }
+                res.write(fullResponseBuf);
+                res.end();
+                resolve({ hopEndTime });
+                return;
+              }
+
+              // ── Upstream error translation ──
+              if (proxyRes.statusCode >= 400) {
+                console.error(
+                  `\n[Upstream Error] Status ${proxyRes.statusCode}:`,
+                  jsonResponse?.error?.message || "Unknown error",
+                );
+                if (!res.headersSent) {
+                  res.writeHead(proxyRes.statusCode, {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*",
+                  });
+                }
+                res.end(
+                  JSON.stringify({
+                    type: "error",
+                    error: {
+                      type:
+                        proxyRes.statusCode === 429
+                          ? "rate_limit_error"
+                          : proxyRes.statusCode === 529
+                            ? "overloaded_error"
+                            : "api_error",
+                      message:
+                        jsonResponse?.error?.message ||
+                        `Upstream error: ${proxyRes.statusCode}`,
+                    },
+                  }),
+                );
+                resolve({ hopEndTime });
+                return;
+              }
+
+              const message = jsonResponse.choices?.[0]?.message;
+
+              // ── Memory tool interceptor (non-streaming) ──
+              if (message?.tool_calls && hasMemoryToolCalls(message)) {
+                const userId =
+                  req.headers["x-contextforge-user-id"] ?? "anonymous";
+                const workspace = req.headers["x-contextforge-workspace"] ?? "";
+
+                const toolResults = await executeMemoryToolCalls(
+                  message,
+                  memoryHandler,
+                  { userId, workspace },
+                );
+
+                if (toolResults.length > 0) {
                   currentPayload.messages.push({
                     role: "assistant",
-                    content: null,
-                    tool_calls: dummyMessage.tool_calls,
+                    content: message.content ?? null,
+                    tool_calls: message.tool_calls,
                   });
-                  currentPayload.messages.push({
-                    role: "tool",
-                    tool_call_id: dummyMessage.tool_calls[0].id,
-                    name: GRAPH_TOOL_NAME, // ← always use canonical name, never the MCP variant
-                    content: result,
-                  });
-
-                  delete currentPayload.tools;
-                  delete currentPayload.tool_choice;
-                  return executeUpstreamRequest(
-                    currentPayload,
-                    retryCount + 1,
-                    false,
-                  );
+                  currentPayload.messages.push(...toolResults);
+                  currentPayload.tool_choice = "none";
+                  executeUpstreamRequest(currentPayload, retryCount + 1, false)
+                    .then(resolve)
+                    .catch(reject);
+                  return;
                 }
-
-                // Args malformed — fall through to replay as real tool
-                console.warn(
-                  `[Ghost Interceptor] ⚠️ Graph args missing query_type/target — falling through`,
-                );
               }
 
-              // ── Vault retrieval ──
-              if (isRetrieveTool) {
-                let args = null;
-                try {
-                  args = JSON.parse(detectedToolArgs);
-                } catch {
-                  console.error(
-                    `[Ghost Interceptor] ⚠️ Args JSON malformed: "${detectedToolArgs.slice(0, 120)}"`,
+              // ── Ghost interceptor (non-streaming) ──
+              if (message?.tool_calls?.length > 0) {
+                const toolCall = message.tool_calls[0];
+                if (
+                  toolCall.function.name === "contextforge_retrieve" &&
+                  retryCount < 2
+                ) {
+                  console.log(
+                    `\n[Ghost Interceptor] Non-streaming contextforge_retrieve`,
                   );
-                }
-
-                if (args) {
-                  let vaultedText = null;
                   try {
-                    vaultedText = await retrieveFromVault(
+                    const args = JSON.parse(toolCall.function.arguments);
+                    const vaultedText = await retrieveFromVault(
                       args.vault_id,
                       args.search_query || null,
                       currentPayload.messages,
                       semanticCache,
                       hybridRetriever,
                     );
-                  } catch (retrieveErr) {
-                    console.error(
-                      `[Ghost Interceptor] ⚠️ Vault retrieval failed: ${retrieveErr.message}`,
-                    );
-                  }
-
-                  if (vaultedText) {
-                    recordCCRSuccess(currentPayload, args.vault_id);
-                    console.log(
-                      `[Ghost Interceptor] ✅ Vault ${args.vault_id} opened (${vaultedText.length} chars)`,
-                    );
-                    currentPayload.messages.push({
-                      role: "assistant",
-                      content: null,
-                      tool_calls: dummyMessage.tool_calls,
-                    });
-                    currentPayload.messages.push({
-                      role: "tool",
-                      tool_call_id: dummyMessage.tool_calls[0].id,
-                      name: "contextforge_retrieve",
-                      content: vaultedText,
-                    });
-                    delete currentPayload.tools;
-                    delete currentPayload.tool_choice;
-                    return executeUpstreamRequest(
-                      currentPayload,
-                      retryCount + 1,
-                      false,
-                    );
-                  } else {
-                    console.warn(
-                      `[Ghost Interceptor] ⚠️ Vault ${args.vault_id} returned empty — replaying as real tool`,
-                    );
+                    if (vaultedText) {
+                      currentPayload.messages.push({
+                        role: "assistant",
+                        content: message.content ?? null,
+                        tool_calls: message.tool_calls,
+                      });
+                      currentPayload.messages.push({
+                        role: "tool",
+                        tool_call_id: toolCall.id,
+                        name: toolCall.function.name,
+                        content: vaultedText,
+                      });
+                      currentPayload.tool_choice = "none";
+                      executeUpstreamRequest(
+                        currentPayload,
+                        retryCount + 1,
+                        false,
+                      )
+                        .then(resolve)
+                        .catch(reject);
+                      return;
+                    }
+                  } catch (err) {
+                    console.error("[Ghost Interceptor] Failed:", err.message);
                   }
                 }
               }
 
-              // ── Memory tools ──
-              if (isMemoryTool) {
-                const userId =
-                  req.headers["x-contextforge-user-id"] ?? "anonymous";
-                const workspace = req.headers["x-contextforge-workspace"] ?? "";
+              // ── Translate response to Anthropic format ──
+              if (isAnthropic) {
+                const anthropicResponse = {
+                  id: jsonResponse.id || `msg_${Date.now()}`,
+                  type: "message",
+                  role: "assistant",
+                  content: [],
+                  model: jsonResponse.model || "contextforge",
+                  stop_reason: "end_turn",
+                  stop_sequence: null,
+                  usage: {
+                    input_tokens: jsonResponse.usage?.prompt_tokens || 0,
+                    output_tokens: jsonResponse.usage?.completion_tokens || 0,
+                  },
+                };
 
-                const toolResults = await executeMemoryToolCalls(
-                  dummyMessage,
-                  memoryHandler,
-                  { userId, workspace },
-                );
-
-                if (toolResults.length > 0) {
-                  console.log(
-                    `[Ghost Interceptor] 🧠 Memory tool executed successfully`,
-                  );
-                  currentPayload.messages.push({
-                    role: "assistant",
-                    content: null,
-                    tool_calls: dummyMessage.tool_calls,
+                if (message?.content) {
+                  anthropicResponse.content.push({
+                    type: "text",
+                    text: message.content,
                   });
-                  currentPayload.messages.push(...toolResults);
-                  delete currentPayload.tools;
-                  delete currentPayload.tool_choice;
-                  return executeUpstreamRequest(
-                    currentPayload,
-                    retryCount + 1,
-                    false,
-                  );
                 }
 
-                console.warn(
-                  `[Ghost Interceptor] ⚠️ Memory tool returned no results — replaying as real tool`,
-                );
-              }
-            }
+                if (message?.tool_calls) {
+                  anthropicResponse.stop_reason = "tool_use";
+                  for (const tc of message.tool_calls) {
+                    anthropicResponse.content.push({
+                      type: "tool_use",
+                      id: tc.id,
+                      name: tc.function.name,
+                      input: JSON.parse(tc.function.arguments || "{}"),
+                    });
+                  }
+                }
 
-            // ── Replay: real tool call ──
-            if (heldEvents.length > 0) {
+                if (!res.headersSent) {
+                  res.writeHead(proxyRes.statusCode, {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*",
+                  });
+                }
+                res.write(JSON.stringify(anthropicResponse));
+                res.end();
+                resolve({ hopEndTime });
+                return;
+              }
+
+              // ── Non-Anthropic passthrough ──
               if (!res.headersSent) {
                 res.writeHead(proxyRes.statusCode, {
-                  "Content-Type": "text/event-stream",
-                  "Cache-Control": "no-cache",
-                  Connection: "keep-alive",
+                  ...proxyRes.headers,
                   "Access-Control-Allow-Origin": "*",
                 });
               }
-              for (const event of heldEvents) res.write(event);
-            }
+              res.write(fullResponseBuf);
+              res.end();
 
-            // ── RAG indexing (fire-and-forget) ──
-            if (
-              !isRetrieveTool &&
-              !isMemoryTool &&
-              fullStreamedText.trim().length > 0
-            ) {
-              (async () => {
-                try {
-                  const tokenCount = Math.floor(fullStreamedText.length / 4);
-                  if (tokenCount >= 50) {
-                    const indexId = "IDX_" + crypto.randomUUID();
-                    const embedding =
-                      await onnxEmbedder.embed(fullStreamedText);
-                    hybridRetriever.addDocumentWithEmbedding(
-                      indexId,
-                      fullStreamedText,
-                      embedding,
-                    );
-                    console.log(
-                      `[RAG Index] Indexed ${tokenCount} tokens (BM25 + HNSW, dim=384)`,
-                    );
+              // ── RAG indexing for non-streaming responses (fire-and-forget) ──
+              if (
+                proxyRes.statusCode === 200 &&
+                message?.content?.trim().length > 0
+              ) {
+                (async () => {
+                  try {
+                    const tokenCount = Math.floor(message.content.length / 4);
+                    if (tokenCount >= 50) {
+                      const indexId = "IDX_" + crypto.randomUUID();
+                      const embedding = await onnxEmbedder.embed(
+                        message.content,
+                      );
+                      hybridRetriever.addDocumentWithEmbedding(
+                        indexId,
+                        message.content,
+                        embedding,
+                      );
+                      console.log(
+                        `[RAG Index] Indexed ${tokenCount} tokens (BM25 + HNSW, dim=384)`,
+                      );
+                    }
+                  } catch (e) {
+                    console.error("[RAG Index] Indexing failed:", e.message);
                   }
-                } catch (err) {
-                  console.error("[RAG Index] Indexing failed:", err.message);
-                }
-              })();
-            }
+                })();
+              }
 
-            res.end();
-            return;
-          }
-
-          // ── Non-streaming: JSON response ──
-          const fullResponseBuf = Buffer.concat(responseChunks);
-          let jsonResponse;
-
-          try {
-            jsonResponse = JSON.parse(fullResponseBuf.toString("utf-8"));
-          } catch {
-            if (!res.headersSent) {
-              res.writeHead(proxyRes.statusCode, {
-                ...proxyRes.headers,
-                "Access-Control-Allow-Origin": "*",
-              });
-            }
-            res.write(fullResponseBuf);
-            return res.end();
-          }
-
-          // ── Upstream error translation ──
-          if (proxyRes.statusCode >= 400) {
-            console.error(
-              `\n[Upstream Error] Status ${proxyRes.statusCode}:`,
-              jsonResponse?.error?.message || "Unknown error",
-            );
-            if (!res.headersSent) {
-              res.writeHead(proxyRes.statusCode, {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-              });
-            }
-            return res.end(
-              JSON.stringify({
-                type: "error",
-                error: {
-                  type:
-                    proxyRes.statusCode === 429
-                      ? "rate_limit_error"
-                      : proxyRes.statusCode === 529
-                        ? "overloaded_error"
-                        : "api_error",
-                  message:
-                    jsonResponse?.error?.message ||
-                    `Upstream error: ${proxyRes.statusCode}`,
-                },
-              }),
-            );
-          }
-
-          const message = jsonResponse.choices?.[0]?.message;
-
-          // ── Memory tool interceptor (non-streaming) ──
-          if (message?.tool_calls && hasMemoryToolCalls(message)) {
-            const userId = req.headers["x-contextforge-user-id"] ?? "anonymous";
-            const workspace = req.headers["x-contextforge-workspace"] ?? "";
-
-            const toolResults = await executeMemoryToolCalls(
-              message,
-              memoryHandler,
-              { userId, workspace },
-            );
-
-            if (toolResults.length > 0) {
-              currentPayload.messages.push({
-                role: "assistant",
-                content: message.content ?? null,
-                tool_calls: message.tool_calls,
-              });
-              currentPayload.messages.push(...toolResults);
-              delete currentPayload.tools;
-              delete currentPayload.tool_choice;
-              return executeUpstreamRequest(
-                currentPayload,
-                retryCount + 1,
-                false,
+              resolve({ hopEndTime });
+            } catch (handlerErr) {
+              // ── Catch any unhandled async error inside end handler ──
+              console.error(
+                "[ProxyRes End] Unhandled error:",
+                handlerErr.message,
               );
+              reject(handlerErr);
             }
-          }
-
-          // ── Ghost interceptor (non-streaming) ──
-          if (message?.tool_calls?.length > 0) {
-            const toolCall = message.tool_calls[0];
-            if (
-              toolCall.function.name === "contextforge_retrieve" &&
-              retryCount < 2
-            ) {
-              console.log(
-                `\n[Ghost Interceptor] Non-streaming contextforge_retrieve`,
-              );
-              try {
-                const args = JSON.parse(toolCall.function.arguments);
-                const vaultedText = await retrieveFromVault(
-                  args.vault_id,
-                  args.search_query || null,
-                  currentPayload.messages,
-                  semanticCache,
-                  hybridRetriever,
-                );
-                if (vaultedText) {
-                  currentPayload.messages.push({
-                    role: "assistant",
-                    content: message.content ?? null,
-                    tool_calls: message.tool_calls,
-                  });
-                  currentPayload.messages.push({
-                    role: "tool",
-                    tool_call_id: toolCall.id,
-                    name: toolCall.function.name,
-                    content: vaultedText,
-                  });
-                  delete currentPayload.tools;
-                  delete currentPayload.tool_choice;
-                  return executeUpstreamRequest(
-                    currentPayload,
-                    retryCount + 1,
-                    false,
-                  );
-                }
-              } catch (err) {
-                console.error("[Ghost Interceptor] Failed:", err.message);
-              }
-            }
-          }
-
-          // ── Translate response to Anthropic format ──
-          if (isAnthropic) {
-            const anthropicResponse = {
-              id: jsonResponse.id || `msg_${Date.now()}`,
-              type: "message",
-              role: "assistant",
-              content: [],
-              model: jsonResponse.model || "contextforge",
-              stop_reason: "end_turn",
-              stop_sequence: null,
-              usage: {
-                input_tokens: jsonResponse.usage?.prompt_tokens || 0,
-                output_tokens: jsonResponse.usage?.completion_tokens || 0,
-              },
-            };
-
-            if (message?.content) {
-              anthropicResponse.content.push({
-                type: "text",
-                text: message.content,
-              });
-            }
-
-            if (message?.tool_calls) {
-              anthropicResponse.stop_reason = "tool_use";
-              for (const tc of message.tool_calls) {
-                anthropicResponse.content.push({
-                  type: "tool_use",
-                  id: tc.id,
-                  name: tc.function.name,
-                  input: JSON.parse(tc.function.arguments || "{}"),
-                });
-              }
-            }
-
-            if (!res.headersSent) {
-              res.writeHead(proxyRes.statusCode, {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-              });
-            }
-            res.write(JSON.stringify(anthropicResponse));
-            return res.end();
-          }
-
-          // ── Non-Anthropic passthrough ──
-          if (!res.headersSent) {
-            res.writeHead(proxyRes.statusCode, {
-              ...proxyRes.headers,
-              "Access-Control-Allow-Origin": "*",
-            });
-          }
-          res.write(fullResponseBuf);
-          res.end();
-
-          // ── RAG indexing for non-streaming responses ──
-          if (
-            proxyRes.statusCode === 200 &&
-            message?.content?.trim().length > 0
-          ) {
-            (async () => {
-              try {
-                const tokenCount = Math.floor(message.content.length / 4);
-                if (tokenCount >= 50) {
-                  const indexId = "IDX_" + crypto.randomUUID();
-                  const embedding = await onnxEmbedder.embed(message.content);
-                  hybridRetriever.addDocumentWithEmbedding(
-                    indexId,
-                    message.content,
-                    embedding,
-                  );
-                  console.log(
-                    `[RAG Index] Indexed ${tokenCount} tokens (BM25 + HNSW, dim=384)`,
-                  );
-                }
-              } catch (e) {
-                console.error("[RAG Index] Indexing failed:", e.message);
-              }
-            })();
-          }
+          });
         });
-      });
 
-      proxyReq.on("error", (err) => {
-        if (!res.headersSent) {
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({ error: "Bad Gateway", details: err.message }),
-          );
-        }
-      });
+        // ── Network error ──
+        proxyReq.on("error", (err) => {
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({ error: "Bad Gateway", details: err.message }),
+            );
+          }
+          reject(err); // ← was missing, Promise would hang forever
+        });
 
-      proxyReq.write(outboundBody);
-      proxyReq.end();
+        proxyReq.write(outboundBody);
+        proxyReq.end();
+      });
     }
 
     // ─────────────────────────────────────────────
     // GATE: Decision before any transformation
-    // Runs on raw Anthropic payload so token
-    // counter sees the correct message format
     // ─────────────────────────────────────────────
     const decision = CompressionDecision.decide({
       headers: req.headers,
@@ -1036,12 +1097,14 @@ const server = http.createServer((req, res) => {
 
     if (!decision.shouldCompress) {
       console.log(`[Pipeline] Passthrough: ${decision.passthroughReason}`);
-      // Translate even on passthrough — strips $schema poison
-      // and converts to OpenAI format before hitting Nemotron
       if (isAnthropic) {
-        payload = translateAnthropicToOpenAI(payload);
+        payload = translateAnthropicToOpenAI(payload, translationCtx);
       }
-      executeUpstreamRequest(payload);
+      await executeUpstreamRequest(payload);
+      const totalLatencyMs = performance.now() - startTime;
+      console.log(
+        `[Metrics] Total E2E Latency: ${totalLatencyMs.toFixed(2)}ms`,
+      );
       return;
     }
 
@@ -1049,8 +1112,6 @@ const server = http.createServer((req, res) => {
     // COMPRESSION PIPELINE (Anthropic branch only)
     // ─────────────────────────────────────────────
     if (isAnthropic) {
-      // Attach policy before pipeline stages
-      // Uses original payload.model before executeUpstreamRequest overrides it
       const policy = getPolicyForModel(payload.model || "");
       Object.defineProperty(payload, "__policy", {
         value: policy,
@@ -1061,7 +1122,7 @@ const server = http.createServer((req, res) => {
 
       // Stage: Translation (baseline token count taken here)
       const baselineTokens = timer.time(STAGES.TRANSLATION, () => {
-        payload = translateAnthropicToOpenAI(payload);
+        payload = translateAnthropicToOpenAI(payload, translationCtx);
         return countTokens(payload);
       });
 
@@ -1089,8 +1150,8 @@ const server = http.createServer((req, res) => {
         payload = sliceJsonToolResults(payload);
       });
 
-      timer.time(STAGES.CODE_COMPRESS, () => {
-        payload = compressCodeToolResults(payload);
+      await timer.timeAsync(STAGES.CODE_COMPRESS, async () => {
+        payload = await compressCodeToolResults(payload);
       });
 
       timer.time(STAGES.PREDICTIVE, () => {
@@ -1151,45 +1212,21 @@ const server = http.createServer((req, res) => {
         payload = deduplicateSystemMessages(payload);
       });
 
-      // ── Graph tool injection ──           ← ADD THIS BLOCK
       timer.time(STAGES.GRAPH_INJECT, () => {
         payload.tools = injectGraphTool(payload.tools);
       });
 
-      // NEW — must be LAST before transmission
+      // Must be LAST before transmission
       timer.time(STAGES.CACHE_ALIGN, () => {
         payload = alignCachePrefix(payload);
       });
 
-      // ── Pipeline report ──
+      // ── Capture pipeline-only latency before upstream ──
+      const pipelineLatencyMs = performance.now() - startTime;
       const finalTokens = countTokens(payload);
       const tokensSaved = baselineTokens - finalTokens;
-      const totalLatencyMs = performance.now() - startTime;
 
-      savingsTracker.recordRequest({
-        model: payload.model || "unknown",
-        inputTokens: finalTokens,
-        tokensSaved,
-      });
-
-      console.log("\n=== ContextForge Pipeline Report ===");
-      console.log(`[Metrics] Baseline Tokens:  ${baselineTokens}`);
-      console.log(`[Metrics] Final Tokens:     ${finalTokens}`);
-      console.log(`[Metrics] Total Saved:      ${tokensSaved}`);
-      if (baselineTokens > 0) {
-        console.log(
-          `[Metrics] Compression:      ${((tokensSaved / baselineTokens) * 100).toFixed(1)}%`,
-        );
-      }
-      console.log(`[Metrics] Latency Added:    ${totalLatencyMs.toFixed(2)}ms`);
-      console.log(`[Decision] ${decision}`);
-
-      const stages = timer.summary();
-      for (const [stage, ms] of Object.entries(stages)) {
-        if (ms > 1) console.log(`[Stage] ${stage}: ${ms.toFixed(1)}ms`);
-      }
-
-      // ── Mutation detection ──
+      // ── Mutation detection (before upstream, no cost) ──
       const payloadStr = JSON.stringify(payload);
       const { isMutation, mutatedFile } = detectMutation(payloadStr);
       if (isMutation && mutatedFile) {
@@ -1203,11 +1240,47 @@ const server = http.createServer((req, res) => {
         }
       }
 
-      executeUpstreamRequest(payload);
+      // ── Upstream call (awaited — totalLatencyMs is accurate) ──
+      await executeUpstreamRequest(payload);
+      const totalLatencyMs = performance.now() - startTime;
+
+      // ── Record savings only after successful upstream ──
+      savingsTracker.recordRequest({
+        model: payload.model || "unknown",
+        inputTokens: finalTokens,
+        tokensSaved,
+      });
+
+      // ── Full pipeline report printed after everything completes ──
+      console.log("\n=== ContextForge Pipeline Report ===");
+      console.log(`[Metrics] Baseline Tokens:    ${baselineTokens}`);
+      console.log(`[Metrics] Final Tokens:       ${finalTokens}`);
+      console.log(`[Metrics] Total Saved:        ${tokensSaved}`);
+      if (baselineTokens > 0) {
+        console.log(
+          `[Metrics] Compression:        ${((tokensSaved / baselineTokens) * 100).toFixed(1)}%`,
+        );
+      }
+      console.log(
+        `[Metrics] Pipeline Latency:   ${pipelineLatencyMs.toFixed(2)}ms`,
+      );
+      console.log(
+        `[Metrics] Total E2E Latency:  ${totalLatencyMs.toFixed(2)}ms`,
+      );
+      console.log(`[Decision] ${decision}`);
+
+      const stages = timer.summary();
+      for (const [stage, ms] of Object.entries(stages)) {
+        if (ms > 1) console.log(`[Stage] ${stage}: ${ms.toFixed(1)}ms`);
+      }
     } else {
       // Non-Anthropic: passthrough unmodified
       console.log("[Pipeline] Non-Anthropic request, forwarding unmodified");
-      executeUpstreamRequest(payload);
+      await executeUpstreamRequest(payload);
+      const totalLatencyMs = performance.now() - startTime;
+      console.log(
+        `[Metrics] Total E2E Latency: ${totalLatencyMs.toFixed(2)}ms`,
+      );
     }
   });
 
@@ -1232,3 +1305,4 @@ process.on("SIGINT", () => {
 
   process.exit(0);
 });
+

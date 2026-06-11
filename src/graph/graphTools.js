@@ -61,10 +61,13 @@ export function getGraphToolDefinition() {
       name: GRAPH_TOOL_NAME,
       description:
         "Query the ContextForge code knowledge graph. " +
-        "Use this instead of reading entire files when you need to know: " +
-        "which files import a function, what a file exports, or where a " +
-        "symbol is defined. Returns a compact JSON answer — much cheaper " +
-        "than reading files.",
+        "ALWAYS use this tool INSTEAD of grep, find, bash search, or reading files " +
+        "when you need to locate a symbol, find imports, or check exports. " +
+        "This is pre-indexed and returns results instantly at zero token cost. " +
+        "Use find_symbol to locate any function, class, or variable by name. " +
+        "Use who_imports_this to find all files that use a symbol. " +
+        "Use what_does_this_export to list a file's exports without reading it. " +
+        "Always try this before reading any file.",
       parameters: {
         type: "object",
         properties: {
@@ -192,6 +195,7 @@ export function executeGraphQuery(queryType, target) {
               start_line: r.start_line,
               end_line: r.end_line,
               complexity: r.complexity,
+              body: r.body_text || null, // ← full function body
             })),
             count: rows.length,
           },

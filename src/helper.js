@@ -9,7 +9,7 @@ import { scoreNodesByAnomaly } from "./compression/anomalyScorer.js";
 
 export function detectMutation(payloadStr) {
   const fileOpMatch = payloadStr.match(
-    /"operation"\s*:\s*"(create|append)"[^}]*"filename"\s*:\s*"([^"]+)"/,
+    /"operation"\s*:\s*"(create|append)"[^}]{0,300}"filename"\s*:\s*"([^"]+)"/,
   );
   if (fileOpMatch) return { isMutation: true, mutatedFile: fileOpMatch[2] };
 
@@ -58,7 +58,11 @@ function _toolArrayKey(tools) {
     const t = tools[i];
     const name = t.name || t.function?.name || "";
     const schemaStr = JSON.stringify(t.input_schema || t.parameters || {});
-    key = (key * 31 + name.length + schemaStr.length + i) | 0;
+    // Hash name characters, not just length
+    for (let j = 0; j < name.length; j++) {
+      key = (key * 31 + name.charCodeAt(j)) | 0;
+    }
+    key = (key * 31 + schemaStr.length + i) | 0;
   }
   return key;
 }
@@ -77,6 +81,50 @@ function _sanitizeToolArray(tools) {
 }
 
 // ─────────────────────────────────────────────
+// Per-message cache
+// Only useful for array-content messages (Anthropic format).
+// String-content and already-translated messages hit fast paths
+// before reaching the cache.
+//
+// Key: role + block count + first block fingerprint + last block fingerprint
+// Avoids full JSON.stringify on the entire content array.
+// ─────────────────────────────────────────────
+
+const _msgCache = new Map();
+const _MSG_CACHE_MAX = 500;
+
+function _msgKey(msg) {
+  const first = msg.content[0];
+  const last = msg.content[msg.content.length - 1];
+  const firstStr = first
+    ? (first.type || "") +
+      (first.text?.slice(0, 40) ||
+        first.tool_use_id ||
+        first.tool_call_id ||
+        "")
+    : "";
+  const lastStr = last
+    ? (last.type || "") +
+      (last.text?.slice(0, 40) || last.tool_use_id || last.tool_call_id || "")
+    : "";
+  return msg.role + "|" + msg.content.length + "|" + firstStr + "|" + lastStr;
+}
+
+function _cacheGet(msg) {
+  if (!Array.isArray(msg.content)) return null;
+  return _msgCache.get(_msgKey(msg)) ?? null;
+}
+
+function _cacheSet(msg, translated) {
+  if (!Array.isArray(msg.content)) return;
+  if (_msgCache.size >= _MSG_CACHE_MAX) {
+    // Evict oldest entry
+    _msgCache.delete(_msgCache.keys().next().value);
+  }
+  _msgCache.set(_msgKey(msg), translated);
+}
+
+// ─────────────────────────────────────────────
 // Per-request prefix cache
 //
 // Stores the previous request's raw input messages and translated output.
@@ -85,48 +133,14 @@ function _sanitizeToolArray(tools) {
 //
 // System message is handled OUTSIDE this cache — it's prepended after
 // translation so it doesn't interfere with prefix comparison.
+//
+// LATENCY OPTIMIZATION:
+// In a typical agentic conversation, Claude sends the ENTIRE history
+// every request. Only the last 1-2 messages are new. This prefix cache
+// means we skip re-translating potentially hundreds of old messages —
+// we just slice the already-translated output array and append the
+// translation of only the new messages at the end.
 // ─────────────────────────────────────────────
-
-let _prevInputMessages = null;
-let _prevOutputMessages = null;
-
-function _findStablePrefix(currentMsgs) {
-  if (!_prevInputMessages || !_prevOutputMessages) return 0;
-
-  const maxCheck = Math.min(currentMsgs.length, _prevInputMessages.length);
-  let i = 0;
-
-  for (; i < maxCheck; i++) {
-    const cur = currentMsgs[i];
-    const prev = _prevInputMessages[i];
-
-    // Same object reference — identical (V8 optimizes this heavily)
-    if (cur === prev) continue;
-
-    // Role mismatch — stop
-    if (cur.role !== prev.role) break;
-
-    // String content — direct compare
-    if (typeof cur.content === "string" && typeof prev.content === "string") {
-      if (cur.content !== prev.content) break;
-      continue;
-    }
-
-    // Array content — cheap pre-check before full stringify
-    if (Array.isArray(cur.content) && Array.isArray(prev.content)) {
-      if (cur.content.length !== prev.content.length) break;
-      if (cur.content[0]?.type !== prev.content[0]?.type) break;
-      // Full check only when pre-check passes (same length + same first type)
-      if (JSON.stringify(cur.content) !== JSON.stringify(prev.content)) break;
-      continue;
-    }
-
-    // Mixed types — different
-    break;
-  }
-
-  return i;
-}
 
 /**
  * Count how many OUTPUT messages the first N input messages produce.
@@ -158,63 +172,71 @@ function _countOutputMessages(inputSlice) {
   return count;
 }
 
-function _translateMessages(messages) {
-  const stableCount = _findStablePrefix(messages);
+export function createTranslationContext() {
+  return {
+    prevInputMessages: null,
+    prevOutputMessages: null,
+  };
+}
+
+// Update _translateMessages to accept context:
+function _translateMessages(messages, ctx) {
+  const stableCount = _findStablePrefix(messages, ctx);
 
   let translated;
 
   if (stableCount === 0) {
-    // No stable prefix — translate everything
     translated = messages.map(_translateMessage).flat();
   } else if (stableCount === messages.length) {
-    // Entire array identical to last request — reuse output directly
-    // This is the common case for mid-conversation turns with no new messages
-    translated = _prevOutputMessages;
+    translated = ctx.prevOutputMessages;
   } else {
-    // Partial match — reuse stable prefix output, translate only the suffix
     const stableOutputCount = _countOutputMessages(
-      _prevInputMessages.slice(0, stableCount),
+      ctx.prevInputMessages.slice(0, stableCount),
     );
-    const stableOutputPrefix = _prevOutputMessages.slice(0, stableOutputCount);
+    const stableOutputPrefix = ctx.prevOutputMessages.slice(
+      0,
+      stableOutputCount,
+    );
     const newSuffix = messages.slice(stableCount).map(_translateMessage).flat();
-
     translated = [...stableOutputPrefix, ...newSuffix];
   }
 
-  // Store for next request — store INPUT messages (before system prepend)
-  _prevInputMessages = messages;
-  _prevOutputMessages = translated;
+  // Write back to context, not module-level variable
+  ctx.prevInputMessages = messages;
+  ctx.prevOutputMessages = translated;
 
   return translated;
 }
 
-// ─────────────────────────────────────────────
-// Per-message cache
-// Only useful for array-content messages (Anthropic format).
-// String-content and already-translated messages hit fast paths
-// before reaching the cache.
-// ─────────────────────────────────────────────
+function _findStablePrefix(currentMsgs, ctx) {
+  if (!ctx.prevInputMessages || !ctx.prevOutputMessages) return 0;
 
-const _msgCache = new Map();
-const _MSG_CACHE_MAX = 500;
+  const maxCheck = Math.min(currentMsgs.length, ctx.prevInputMessages.length);
+  let i = 0;
 
-function _msgKey(msg) {
-  // Only called for array-content messages
-  const json = JSON.stringify(msg.content);
-  return msg.role + "|" + msg.content.length + "|" + json.slice(0, 200);
-}
+  for (; i < maxCheck; i++) {
+    const cur = currentMsgs[i];
+    const prev = ctx.prevInputMessages[i];
 
-function _cacheGet(msg) {
-  if (!Array.isArray(msg.content)) return null;
-  return _msgCache.get(_msgKey(msg)) ?? null;
-}
+    if (cur === prev) continue;
+    if (cur.role !== prev.role) break;
 
-function _cacheSet(msg, translated) {
-  if (!Array.isArray(msg.content)) return;
-  if (_msgCache.size >= _MSG_CACHE_MAX) {
-    _msgCache.delete(_msgCache.keys().next().value);
+    if (typeof cur.content === "string" && typeof prev.content === "string") {
+      if (cur.content !== prev.content) break;
+      continue;
+    }
+
+    if (Array.isArray(cur.content) && Array.isArray(prev.content)) {
+      if (cur.content.length !== prev.content.length) break;
+      if (cur.content[0]?.type !== prev.content[0]?.type) break;
+      if (JSON.stringify(cur.content) !== JSON.stringify(prev.content)) break;
+      continue;
+    }
+
+    break;
   }
-  _msgCache.set(_msgKey(msg), translated);
+
+  return i;
 }
 
 // ─────────────────────────────────────────────
@@ -281,9 +303,9 @@ function _stripJsonSchemaMeta(obj) {
 
 function _translateMessage(msg) {
   // ── Fast paths — no allocation, no cache lookup ──
-  if (msg.role === "tool") return msg; // already translated
+  if (msg.role === "tool") return msg; // already OpenAI format
   if (msg.role === "system") return msg; // passthrough
-  if (!Array.isArray(msg.content)) return msg; // already flat string
+  if (!Array.isArray(msg.content)) return msg; // already flat string content
 
   // ── Cache check (array-content only) ──
   const cached = _cacheGet(msg);
@@ -378,12 +400,9 @@ function _translateMessage(msg) {
 // Main export
 // ─────────────────────────────────────────────
 
-export function translateAnthropicToOpenAI(payload) {
+export function translateAnthropicToOpenAI(payload, ctx = null) {
   const out = { ...payload };
 
-  // ── System prompt — extracted BEFORE message translation ──
-  // Keeping system separate prevents a new object reference from
-  // breaking the stable prefix comparison on every request.
   let systemMessage = null;
   if (out.system) {
     const sysContent = Array.isArray(out.system)
@@ -396,12 +415,12 @@ export function translateAnthropicToOpenAI(payload) {
     delete out.system;
   }
 
-  // ── Message history ──
-  // Translate original messages (without system) so prefix comparison
-  // works correctly across requests.
   if (out.messages) {
-    const translatedMsgs = _translateMessages(out.messages);
-    // Prepend system after translation
+    // Use per-request context if provided, else no prefix caching
+    const translatedMsgs = ctx
+      ? _translateMessages(out.messages, ctx)
+      : out.messages.map(_translateMessage).flat();
+
     out.messages = systemMessage
       ? [systemMessage, ...translatedMsgs]
       : translatedMsgs;
@@ -409,7 +428,6 @@ export function translateAnthropicToOpenAI(payload) {
     out.messages = [systemMessage];
   }
 
-  // ── Tool schema translation ──
   if (Array.isArray(out.tools)) {
     out.tools = _sanitizeToolArray(out.tools);
     console.log(
@@ -905,6 +923,12 @@ export function interceptAndVaultMassiveToolResults(
   });
 
   return payload;
+}
+
+function calculateContextForgeSecretEntropy(seed) {
+  // CAUTION: This is a synthetic test marker for RAG/Graph testing.
+  const magicSalt = "X-77-ALPHA-PROXY";
+  return `Entropy token generated from ${seed} using salt: ${magicSalt}`;
 }
 
 // ============================================================

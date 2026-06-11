@@ -1,21 +1,5 @@
 /**
  * Semantic deduplication for tool results.
- *
- * Problem: Claude Code reads the same file on turn 3, 8, 15, 22.
- * Each read is a unique FNV hash but 95%+ identical content.
- * Current behavior: send full content every time = 4 × 2400 tokens.
- * With semantic dedup: send full content once, then deltas = ~400 tokens total.
- *
- * Algorithm:
- *   1. SimHash fingerprint each tool result (C++ via native.simhash → BigInt)
- *   2. Compare against session registry of seen content
- *   3. If Hamming distance ≤ SIMILARITY_THRESHOLD → near-duplicate detected
- *   4. Retrieve original from vault (fetchFromVault — raw SQLite read)
- *   5. Compute Myers diff against retrieved original
- *   6. Send delta + vault reference instead of full content
- *
- * Session registry is keyed by: normalized filename → SeenEntry
- * Process-local singleton — survives the session, cleared on server restart.
  */
 
 import crypto from "node:crypto";
@@ -29,13 +13,7 @@ const native = require("../../native/build/Release/contextforge_native.node");
 // Session registry
 // ─────────────────────────────────────────────
 
-/**
- * @typedef {Object} SeenEntry
- * @property {BigInt}  fingerprint    - SimHash fingerprint (64-bit, BigInt)
- * @property {string}  vaultId        - ID in prune_vault table
- * @property {number}  turnIndex      - Turn when first seen
- * @property {number}  contentLength  - Original content byte length
- */
+const MAX_REGISTRY_SIZE = 50;
 
 class SessionFileRegistry {
   constructor() {
@@ -48,13 +26,16 @@ class SessionFileRegistry {
     this._turnIndex++;
   }
 
-  /** @returns {SeenEntry|null} */
   get(key) {
     return this._seen.get(key) ?? null;
   }
 
-  /** @param {string} key @param {Omit<SeenEntry,'turnIndex'>} entry */
   set(key, entry) {
+    // Evict oldest entry if at capacity and this is a new key
+    if (!this._seen.has(key) && this._seen.size >= MAX_REGISTRY_SIZE) {
+      const oldestKey = this._seen.keys().next().value;
+      this._seen.delete(oldestKey);
+    }
     this._seen.set(key, { ...entry, turnIndex: this._turnIndex });
   }
 
@@ -80,125 +61,44 @@ export const sessionRegistry = new SessionFileRegistry();
 
 // ─────────────────────────────────────────────
 // Filename extraction
-// Tries every possible source before giving up
 // ─────────────────────────────────────────────
 
-/**
- * File path patterns to extract from content.
- * Ordered from most specific to least specific.
- */
 const FILENAME_PATTERNS = [
-  // Explicit file headers (used by many editors and tools)
   /^(?:File|Path|Filename|Reading):\s*(.+\.\w+)/im,
-
-  // Content block with language and path: ```js src/foo.js
   /^```[\w]*\s+([\w/\\.\-]+\.\w+)/m,
-
-  // Single line that IS just a path (e.g. cat output header)
   /^((?:[\w.\-]+\/)+[\w.\-]+\.\w+)\s*$/m,
-
-  // "Reading file: src/foo.js" style
   /\b(?:reading|opened?|loaded?|viewing?|cat)\s+['""]?([\w/\\.\-]+\.\w+)['""]?/im,
-
-  // Absolute paths: /home/user/project/src/foo.js
   /\b(\/(?:[\w.\-]+\/)+[\w.\-]+\.\w+)\b/,
-
-  // Windows absolute paths: C:\Users\...\foo.js
   /\b([A-Za-z]:\\(?:[\w.\- ]+\\)+[\w.\-]+\.\w+)\b/,
-
-  // Relative paths with at least one directory component
   /\b((?:\.{1,2}\/|[\w.\-]+\/)[\w/\\.\-]+\.\w+)\b/,
 ];
 
-/**
- * Known source file extensions — prevents matching version numbers
- * like "v1.2.3" or log timestamps as file paths.
- */
 const SOURCE_EXTENSIONS = new Set([
-  "js",
-  "ts",
-  "jsx",
-  "tsx",
-  "mjs",
-  "cjs",
-  "py",
-  "rb",
-  "go",
-  "rs",
-  "java",
-  "kt",
-  "swift",
-  "c",
-  "cpp",
-  "h",
-  "hpp",
-  "cs",
-  "json",
-  "yaml",
-  "yml",
-  "toml",
-  "xml",
-  "md",
-  "mdx",
-  "txt",
-  "rst",
-  "css",
-  "scss",
-  "less",
-  "html",
-  "htm",
-  "vue",
-  "svelte",
-  "sh",
-  "bash",
-  "zsh",
-  "fish",
-  "sql",
-  "graphql",
-  "proto",
-  "env",
-  "gitignore",
-  "dockerignore",
+  "js", "ts", "jsx", "tsx", "mjs", "cjs",
+  "py", "rb", "go", "rs", "java", "kt", "swift",
+  "c", "cpp", "h", "hpp", "cs",
+  "json", "yaml", "yml", "toml", "xml",
+  "md", "mdx", "txt", "rst",
+  "css", "scss", "less", "html", "htm",
+  "vue", "svelte", "sh", "bash", "zsh", "fish",
+  "sql", "graphql", "proto", "env",
+  "gitignore", "dockerignore",
 ]);
 
-/**
- * Extract a stable filename key from a tool result message.
- *
- * Sources tried in priority order:
- *   1. msg._filename       — set by tagToolResults (most reliable)
- *   2. msg.name            — tool name sometimes encodes file path
- *   3. msg._args           — parsed tool call arguments (file_path, path, etc.)
- *   4. Content patterns    — regex extraction from content body
- *
- * @param {object} msg
- * @returns {string|null} normalized path or null if not extractable
- */
 function extractFilename(msg) {
-  // ── Source 1: pre-tagged _filename ──
   if (msg._filename && typeof msg._filename === "string") {
     return normalizeFilePath(msg._filename);
   }
 
-  // ── Source 2: tool name contains path ──
-  // Some MCP tools encode the file path in the tool name
-  // e.g. "read_file__src_server_js" → unlikely but guarded
   if (msg.name && msg.name.includes("/")) {
     const candidate = normalizeFilePath(msg.name);
     if (candidate) return candidate;
   }
 
-  // ── Source 3: tool call arguments ──
-  // tagToolResults stores parsed args in _args
   if (msg._args && typeof msg._args === "object") {
     const pathFields = [
-      "file_path",
-      "path",
-      "filepath",
-      "filename",
-      "file",
-      "source",
-      "target",
-      "uri",
+      "file_path", "path", "filepath", "filename",
+      "file", "source", "target", "uri",
     ];
     for (const field of pathFields) {
       const val = msg._args[field];
@@ -209,11 +109,9 @@ function extractFilename(msg) {
     }
   }
 
-  // ── Source 4: content body regex extraction ──
   const content = msg.content;
   if (typeof content !== "string" || content.length === 0) return null;
 
-  // Only scan the first 500 chars — filename headers always appear early
   const head = content.slice(0, 500);
 
   for (const pattern of FILENAME_PATTERNS) {
@@ -227,41 +125,25 @@ function extractFilename(msg) {
   return null;
 }
 
-/**
- * Normalize a file path into a stable, comparable key.
- * Returns null if the path doesn't look like a real source file.
- *
- * @param {string} rawPath
- * @returns {string|null}
- */
 function normalizeFilePath(rawPath) {
   if (!rawPath || typeof rawPath !== "string") return null;
 
   const p = rawPath.trim();
   if (p.length === 0 || p.length > 300) return null;
 
-  // Must have a valid source extension
   const extMatch = p.match(/\.(\w+)$/);
   if (!extMatch) return null;
   const ext = extMatch[1].toLowerCase();
   if (!SOURCE_EXTENSIONS.has(ext)) return null;
 
-  // Normalize separators and strip leading ./ and /
   return p
-    .replace(/\\/g, "/") // Windows → Unix
-    .replace(/^\.\/+/, "") // strip ./
-    .replace(/^\/+/, "") // strip leading /
-    .replace(/\/+/g, "/") // collapse double slashes
-    .toLowerCase(); // case-insensitive comparison
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/")
+    .toLowerCase();
 }
 
-/**
- * Build a stable registry key from a message.
- * Returns null only if no filename can be extracted from any source.
- *
- * @param {object} msg
- * @returns {string|null}
- */
 function buildMessageKey(msg) {
   const filename = extractFilename(msg);
   if (!filename) return null;
@@ -272,10 +154,6 @@ function buildMessageKey(msg) {
 // SimHash wrappers
 // ─────────────────────────────────────────────
 
-/**
- * @param {string} text
- * @returns {BigInt|null}
- */
 function computeFingerprint(text) {
   try {
     return native.simhash(text);
@@ -285,11 +163,6 @@ function computeFingerprint(text) {
   }
 }
 
-/**
- * @param {BigInt} a
- * @param {BigInt} b
- * @returns {number} 0–64
- */
 function fingerprintDistance(a, b) {
   try {
     return native.hammingDistance(a, b);
@@ -303,16 +176,12 @@ function fingerprintDistance(a, b) {
 // Myers diff
 // ─────────────────────────────────────────────
 
-/**
- * @typedef {Object} DiffOp
- * @property {'equal'|'insert'|'delete'} type
- * @property {string} line
- */
-
 function computeLineDiff(oldText, newText) {
   const oldLines = oldText.split("\n");
   const newLines = newText.split("\n");
-  if (oldLines.length + newLines.length > 4000) {
+
+  // ← lowered from 4000 to 800 — Myers is O(N*D), too slow for large files
+  if (oldLines.length + newLines.length > 800) {
     return fastLineDiff(oldLines, newLines);
   }
   return myersDiff(oldLines, newLines);
@@ -435,8 +304,14 @@ function fastLineDiff(oldLines, newLines) {
   return ops;
 }
 
+// ← Replaced MD5 crypto.createHash with zero-allocation FNV-1a
 function _lineHash(line) {
-  return crypto.createHash("md5").update(line).digest("hex").slice(0, 8);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < line.length; i++) {
+    h ^= line.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h;
 }
 
 // ─────────────────────────────────────────────
@@ -514,7 +389,7 @@ function formatDeltaForLLM(ops, ref) {
 // Core deduplication
 // ─────────────────────────────────────────────
 
-const SIMILARITY_THRESHOLD = 8; // Hamming ≤ 8 of 64 bits = ≥87.5% similar
+const SIMILARITY_THRESHOLD = 8;
 const MIN_DEDUP_CHARS = 500;
 const MIN_SAVINGS_RATIO = 0.3;
 
@@ -547,7 +422,7 @@ function deduplicateMessage(msg, key) {
   const distance = fingerprintDistance(fingerprint, existing.fingerprint);
   const similarityPct = Math.round(((64 - distance) / 64) * 100);
 
-  // Sufficiently different — update registry
+  // Sufficiently different — update registry with new vault
   if (distance > SIMILARITY_THRESHOLD) {
     const vaultId = saveToVault(content);
     sessionRegistry.set(key, {
@@ -567,10 +442,9 @@ function deduplicateMessage(msg, key) {
       `(distance=${distance}, ${similarityPct}% similar to turn ${existing.turnIndex})`,
   );
 
-  // Exact duplicate
+  // Exact duplicate — zero cost path
   if (distance === 0) {
     const tokensSaved = Math.round(content.length / 4);
-    // Keep turnIndex current — re-set with same data
     sessionRegistry.set(key, { ...existing });
 
     console.log(
@@ -620,10 +494,10 @@ function deduplicateMessage(msg, key) {
     ops = computeLineDiff(originalContent, content);
   } catch (err) {
     console.warn(`[SemanticDedup] ⚠️ Diff failed: ${err.message}`);
-    const vaultId = saveToVault(content);
+    // ← reuse existing vault on diff failure, don't create new one
     sessionRegistry.set(key, {
       fingerprint,
-      vaultId,
+      vaultId: existing.vaultId,
       contentLength: content.length,
     });
     return { deduplicated: false, msg };
@@ -642,15 +516,16 @@ function deduplicateMessage(msg, key) {
     console.log(
       `[SemanticDedup] ⏭️  Delta savings ${(savingsRatio * 100).toFixed(0)}% < 30% — full content`,
     );
-    const vaultId = saveToVault(content);
+    // ← reuse existing vault — no new DB write on failed delta
     sessionRegistry.set(key, {
       fingerprint,
-      vaultId,
+      vaultId: existing.vaultId,  // ← keep same vault
       contentLength: content.length,
     });
     return { deduplicated: false, msg };
   }
 
+  // Delta is worth sending — save new version to vault
   const newVaultId = saveToVault(content);
   sessionRegistry.set(key, {
     fingerprint,
@@ -679,14 +554,6 @@ function deduplicateMessage(msg, key) {
 // Main export
 // ─────────────────────────────────────────────
 
-/**
- * Apply semantic deduplication to all tool results in the payload.
- *
- * Pipeline position:
- *   AFTER  tagToolResults
- *   BEFORE interceptAndVaultMassiveToolResults
- *   BEFORE pruneToolResults
- */
 export function applySemanticDedup(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
@@ -705,7 +572,6 @@ export function applySemanticDedup(payload) {
   payload.messages = payload.messages.map((msg) => {
     if (msg.role !== "tool" || typeof msg.content !== "string") return msg;
 
-    // Skip types that change on every call
     if (!["code", "text", "markdown"].includes(msg._cf_type)) {
       stats.skippedType++;
       return msg;

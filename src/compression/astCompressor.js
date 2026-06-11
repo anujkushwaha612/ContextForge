@@ -3,6 +3,19 @@ import { saveToVault } from "../logging/cacheDb.js";
 
 const require = createRequire(import.meta.url);
 
+const EXT_TO_LANG = {
+  js: "javascript",
+  mjs: "javascript",
+  cjs: "javascript",
+  jsx: "javascript",
+  ts: "typescript",
+  tsx: "tsx",
+  py: "python",
+  go: "go",
+  rs: "rust",
+  java: "java",
+};
+
 // ─────────────────────────────────────────────
 // Load native ASTCompressor — fallback to
 // regex stub if native isn't built yet
@@ -18,7 +31,7 @@ try {
 } catch (err) {
   console.warn(
     `[AST Compressor] ⚠️  Native engine unavailable (${err.message}). ` +
-    `Run: bash scripts/vendor-grammars.sh && cd native && node-gyp rebuild`
+      `Run: bash scripts/vendor-grammars.sh && cd native && node-gyp rebuild`,
   );
 }
 
@@ -42,24 +55,22 @@ function getCompressor(policy = null) {
 
   if (!_compressorCache.has(key)) {
     const opts = {
-      preserveImports:          true,
-      preserveSignatures:       true,
-      preserveTypeAnnotations:  true,
-      preserveDecorators:       true,
-      vaultOnCompress:          true,
-      docstringMode:            1,       // FIRST_LINE
+      preserveImports: true,
+      preserveSignatures: true,
+      preserveTypeAnnotations: true,
+      preserveDecorators: true,
+      vaultOnCompress: true,
+      docstringMode: 1, // FIRST_LINE
 
       // Policy-driven values — fall back to safe defaults
-      preserveErrorHandlers:    policy?.preserveErrorHandlers ?? true,
-      maxBodyLines:             policy?.maxBodyLines          ?? 4,
-      minTokensToCompress:      policy?.minTokensToCompress   ?? 80,
+      preserveErrorHandlers: policy?.preserveErrorHandlers ?? true,
+      maxBodyLines: policy?.maxBodyLines ?? 4,
+      minTokensToCompress: policy?.minTokensToCompress ?? 80,
     };
 
     _compressorCache.set(key, new NativeASTCompressor(opts));
 
-    console.log(
-      `[AST Compressor] Created compressor instance [${key}]`
-    );
+    console.log(`[AST Compressor] Created compressor instance [${key}]`);
   }
 
   return _compressorCache.get(key);
@@ -76,8 +87,8 @@ export function compressCodeOutput(text, languageHint = "", policy = null) {
   const lineCount = text.split("\n").length;
   console.log(
     `[AST Compressor] 🔍 Analyzing ${lineCount} line file` +
-    (languageHint ? ` (${languageHint})` : " (auto-detect)") +
-    (policy ? ` [mode=${policy.mode}]` : "")
+      (languageHint ? ` (${languageHint})` : " (auto-detect)") +
+      (policy ? ` [mode=${policy.mode}]` : ""),
   );
 
   // ── Path A: Native tree-sitter ──────────────
@@ -88,17 +99,17 @@ export function compressCodeOutput(text, languageHint = "", policy = null) {
 
       console.log(
         `[AST Compressor] Lang: ${result.languageDetected} | ` +
-        `Nodes: ${result.nodesFound} found, ${result.nodesCompressed} compressed | ` +
-        `Lines: ${result.originalLines} → ${result.compressedLines} ` +
-        `(${(result.compressionRatio * 100).toFixed(1)}%)`
+          `Nodes: ${result.nodesFound} found, ${result.nodesCompressed} compressed | ` +
+          `Lines: ${result.originalLines} → ${result.compressedLines} ` +
+          `(${(result.compressionRatio * 100).toFixed(1)}%)`,
       );
 
       if (result.highComplexityNodes && result.highComplexityNodes.length > 0) {
         console.log(
           `[AST Compressor] ⚠️  High-complexity functions detected:`,
           result.highComplexityNodes
-            .map(n => `${n.name}(cc=${n.complexity})`)
-            .join(", ")
+            .map((n) => `${n.name}(cc=${n.complexity})`)
+            .join(", "),
         );
       }
 
@@ -107,34 +118,55 @@ export function compressCodeOutput(text, languageHint = "", policy = null) {
       if (reductionRatio < 0.2 || result.nodesCompressed === 0) {
         console.log(
           `[AST Compressor] ⏭️  Insufficient reduction ` +
-          `(${(reductionRatio * 100).toFixed(1)}% < 20% or no bodies compressed)`
+            `(${(reductionRatio * 100).toFixed(1)}% < 20% or no bodies compressed)`,
         );
         return { kept: text, vaulted: false };
       }
 
       const vaultId = saveToVault(text);
 
+      // ── Inject vault ID into every compressed marker ──
+      // C++ emits: "// ↓ N lines compressed (name) · vault_retrieve to expand"
+      // We replace the generic hint with the actual callable vault ID
+      // so Claude knows exactly what to pass to contextforge_retrieve()
+      const keptWithVaultId = result.compressedSource.replace(
+        /· vault_retrieve to expand/g,
+        `· call contextforge_retrieve(vault_id:"${vaultId}") to expand`,
+      );
+
+      // ── File-level header ──
+      // Appears at the very top of what Claude receives.
+      // Gives Claude the vault ID upfront before it reads any code,
+      // and explicitly tells it not to proceed on the skeleton alone.
+      const compressionHeader = [
+        `[CF_COMPRESSED_FILE vault_id:"${vaultId}"]`,
+        `⚠️  This is an AST skeleton — ${result.originalLines} lines compressed to ${result.compressedLines}.`,
+        `You MUST call contextforge_retrieve(vault_id:"${vaultId}") before writing docs or modifying code.`,
+        ``,
+      ].join("\n");
+
+      const finalKept = compressionHeader + keptWithVaultId;
+
       console.log(
         `[AST Compressor] ✅ Compressed: ${result.originalLines} → ` +
-        `${result.compressedLines} lines ` +
-        `(${(reductionRatio * 100).toFixed(0)}% reduction) → Vault ${vaultId}`
+          `${result.compressedLines} lines ` +
+          `(${(reductionRatio * 100).toFixed(0)}% reduction) → Vault ${vaultId}`,
       );
 
       return {
-        kept:             result.compressedSource,
-        vaulted:          true,
+        kept: finalKept, // ← now has header + vault IDs in markers
+        vaulted: true,
         vaultId,
-        originalText:     text,
-        removedChars:     text.length - result.compressedSource.length,
-        originalLines:    result.originalLines,
-        compressedLines:  result.compressedLines,
-        language:         result.languageDetected,
-        nodesFound:       result.nodesFound,
-        nodesCompressed:  result.nodesCompressed,
-        syntaxValid:      result.syntaxValid,
+        originalText: text,
+        removedChars: text.length - finalKept.length,
+        originalLines: result.originalLines,
+        compressedLines: result.compressedLines,
+        language: result.languageDetected,
+        nodesFound: result.nodesFound,
+        nodesCompressed: result.nodesCompressed,
+        syntaxValid: result.syntaxValid,
         highComplexityNodes: result.highComplexityNodes || [],
       };
-
     } catch (err) {
       console.error(`[AST Compressor] ❌ Native error: ${err.message}`);
       // Fall through to regex fallback
@@ -143,9 +175,17 @@ export function compressCodeOutput(text, languageHint = "", policy = null) {
 
   // ── Path B: Regex fallback ──────────────────
   console.warn(
-    "[AST Compressor] Using regex fallback — build native for best results"
+    "[AST Compressor] Using regex fallback — build native for best results",
   );
   return regexFallbackCompress(text);
+}
+
+async function compressCodeOutputAsync(text, languageHint = "", policy = null) {
+  return new Promise((resolve) => {
+    setImmediate(() => {
+      resolve(compressCodeOutput(text, languageHint, policy));
+    });
+  });
 }
 
 // ─────────────────────────────────────────────
@@ -166,7 +206,10 @@ function regexFallbackCompress(text) {
   const linesToKeep = new Set();
 
   const patterns = [
-    IMPORT_PATTERN, EXPORT_PATTERN, FUNCTION_SIGNATURE, CLASS_PATTERN,
+    IMPORT_PATTERN,
+    EXPORT_PATTERN,
+    FUNCTION_SIGNATURE,
+    CLASS_PATTERN,
   ];
 
   for (const pattern of patterns) {
@@ -197,7 +240,7 @@ function regexFallbackCompress(text) {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const opens  = (line.match(/\{/g) || []).length;
+    const opens = (line.match(/\{/g) || []).length;
     const closes = (line.match(/\}/g) || []).length;
 
     if (linesToKeep.has(i)) {
@@ -232,10 +275,10 @@ function regexFallbackCompress(text) {
 
   const vaultId = saveToVault(text);
   return {
-    kept:          keptText,
-    vaulted:       true,
+    kept: keptText,
+    vaulted: true,
     vaultId,
-    originalText:  text,
+    originalText: text,
     removedChars,
     originalLines: lines.length,
   };
@@ -244,20 +287,19 @@ function regexFallbackCompress(text) {
 // ─────────────────────────────────────────────
 // compressCodeToolResults — policy-aware
 // ─────────────────────────────────────────────
-export function compressCodeToolResults(payload) {
+export async function compressCodeToolResults(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
-  // Read policy attached by server.js (non-enumerable — won't hit the wire)
   const policy = payload.__policy ?? null;
 
   const codeMessages = payload.messages.filter(
-    (m) => m.role === "tool" && m._cf_type === "code"
+    (m) => m.role === "tool" && m._cf_type === "code",
   ).length;
 
   if (codeMessages > 0) {
     console.log(
       `[AST Compressor] Processing ${codeMessages} code-tagged tool result(s)` +
-      (policy ? ` [mode=${policy.mode}]` : "")
+        (policy ? ` [mode=${policy.mode}]` : ""),
     );
   }
 
@@ -269,7 +311,10 @@ export function compressCodeToolResults(payload) {
     highComplexityFunctions: [],
   };
 
-  payload.messages = payload.messages.map((msg) => {
+  // ── Cannot use .map() with async — use a for loop instead ──
+  const newMessages = [];
+  for (const msg of payload.messages) {
+
     // ── Tool messages (post-translation format) ──
     if (
       msg.role === "tool" &&
@@ -277,13 +322,11 @@ export function compressCodeToolResults(payload) {
       msg._cf_type === "code"
     ) {
       const beforeLen = msg.content.length;
-
       const langHint = msg._filename
-        ? msg._filename.split(".").pop()
+        ? (EXT_TO_LANG[msg._filename.split(".").pop()?.toLowerCase()] ?? "")
         : "";
 
-      // policy flows through to getCompressor() → correct instance
-      const result = compressCodeOutput(msg.content, langHint, policy);
+      const result = await compressCodeOutputAsync(msg.content, langHint, policy); // ← async
 
       if (result.vaulted) {
         stats.compressed++;
@@ -293,71 +336,70 @@ export function compressCodeToolResults(payload) {
         if (result.highComplexityNodes) {
           stats.highComplexityFunctions.push(...result.highComplexityNodes);
         }
-
-        return {
+        newMessages.push({
           ...msg,
-          content:              result.kept,
-          _compressedVaultId:   result.vaultId,
-          _astLanguage:         result.language,
-          _syntaxValid:         result.syntaxValid,
-        };
+          content: result.kept,
+          _compressedVaultId: result.vaultId,
+          _astLanguage: result.language,
+          _syntaxValid: result.syntaxValid,
+        });
+        continue;
       }
-      return msg;
+
+      newMessages.push(msg);
+      continue;
     }
 
     // ── Anthropic content blocks (pre-translation format) ──
     if (msg.role === "user" && Array.isArray(msg.content)) {
-      return {
-        ...msg,
-        content: msg.content.map((block) => {
-          if (
-            block.type === "tool_result" &&
-            typeof block.content === "string" &&
-            block._cf_type === "code"
-          ) {
-            const beforeLen = block.content.length;
+      const newBlocks = [];
+      for (const block of msg.content) {
+        if (
+          block.type === "tool_result" &&
+          typeof block.content === "string" &&
+          block._cf_type === "code"
+        ) {
+          const beforeLen = block.content.length;
+          const result = await compressCodeOutputAsync(block.content, "", policy); // ← async
 
-            const result = compressCodeOutput(
-              block.content,
-              "",
-              policy   // ← policy flows here too
-            );
-
-            if (result.vaulted) {
-              stats.compressed++;
-              stats.charsSaved += beforeLen - result.kept.length;
-              stats.vaults++;
-              return {
-                ...block,
-                content:            result.kept,
-                _compressedVaultId: result.vaultId,
-              };
-            }
-            return block;
+          if (result.vaulted) {
+            stats.compressed++;
+            stats.charsSaved += beforeLen - result.kept.length;
+            stats.vaults++;
+            newBlocks.push({
+              ...block,
+              content: result.kept,
+              _compressedVaultId: result.vaultId,
+            });
+            continue;
           }
-          return block;
-        }),
-      };
+        }
+        newBlocks.push(block);
+      }
+      newMessages.push({ ...msg, content: newBlocks });
+      continue;
     }
 
-    return msg;
-  });
+    newMessages.push(msg);
+  }
+
+  payload.messages = newMessages;
 
   if (stats.compressed > 0) {
     console.log(
       `[AST Compressor Summary] Compressed ${stats.compressed} files | ` +
-      `Chars saved: ${stats.charsSaved} (~${Math.floor(stats.charsSaved / 4)} tokens) | ` +
-      `Vaults: ${stats.vaults}`
+        `Chars saved: ${stats.charsSaved} (~${Math.floor(stats.charsSaved / 4)} tokens) | ` +
+        `Vaults: ${stats.vaults}`,
     );
 
     if (stats.highComplexityFunctions.length > 0) {
       console.log(
         `[AST Compressor] 🧠 High-complexity functions in session: ` +
-        stats.highComplexityFunctions
-          .sort((a, b) => b.complexity - a.complexity)
-          .slice(0, 5)
-          .map(n => `${n.name}(cc=${n.complexity})`)
-          .join(", ")
+          stats.highComplexityFunctions
+            .sort((a, b) => b.complexity - a.complexity)
+            .slice(0, 5)
+            .map((n) => `${n.name}(cc=${n.complexity})`)
+            .join(", "),
       );
     }
   }

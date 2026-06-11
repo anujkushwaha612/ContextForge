@@ -100,6 +100,31 @@ export async function retrieveFromVault(
 
             return contextPieces.join("\n" + "=".repeat(50) + "\n");
           }
+
+          // ── Tier 1b: HNSW hit but DB chunk lookup missed ──
+          // The index found relevant results but fetchChunksByIds came back empty
+          // (chunk IDs in HNSW don't match DB yet — e.g. freshly indexed content).
+          // Return the raw text snippets from the HNSW results directly
+          // instead of falling through to the full-vault Tier 3 dump.
+          if (results.some((r) => r.text)) {
+            const fallbackPieces = results
+              .filter((r) => r.text)
+              .map(
+                (r, i) =>
+                  `[Chunk ${i + 1} (score: ${(r.combinedScore * 100).toFixed(0)}%)]\n${r.text}`,
+              );
+            if (fallbackPieces.length > 0) {
+              console.log(
+                `[Hybrid RAG] ⚡ Tier 1b: returning ${fallbackPieces.length} HNSW text snippets (DB chunk miss)`,
+              );
+              return fallbackPieces.join("\n" + "=".repeat(50) + "\n");
+            }
+          }
+
+          // HNSW results have no text at all — log and fall through
+          console.warn(
+            `[Hybrid RAG] ⚠️ HNSW found ${results.length} chunks but DB+text lookup both missed — skipping to Tier 2`,
+          );
         }
       }
     } catch (err) {

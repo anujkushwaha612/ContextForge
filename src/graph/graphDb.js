@@ -15,8 +15,8 @@
  */
 
 import Database from "better-sqlite3";
-import path     from "node:path";
-import crypto   from "node:crypto";
+import path from "node:path";
+import crypto from "node:crypto";
 
 // ─────────────────────────────────────────────
 // Database initialization
@@ -27,8 +27,7 @@ let _db = null;
 export function getGraphDb(dbPath = null) {
   if (_db) return _db;
 
-  const resolvedPath = dbPath ||
-    path.join(process.cwd(), "graph.db");
+  const resolvedPath = dbPath || path.join(process.cwd(), "graph.db");
 
   _db = new Database(resolvedPath);
 
@@ -60,6 +59,7 @@ export function getGraphDb(dbPath = null) {
       is_exported INTEGER DEFAULT 0,    -- 1 if exported
       is_async    INTEGER DEFAULT 0,
       complexity  INTEGER DEFAULT 0,
+      body_text   TEXT,
       FOREIGN KEY (file_id) REFERENCES files(file_id) ON DELETE CASCADE
     );
 
@@ -119,11 +119,11 @@ function stmts() {
 
     // Node operations
     insertNode: db.prepare(`
-      INSERT OR IGNORE INTO nodes
-        (node_id, file_id, file_path, name, kind, start_line, end_line,
-         is_exported, is_async, complexity)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `),
+  INSERT OR IGNORE INTO nodes
+    (node_id, file_id, file_path, name, kind, start_line, end_line,
+     is_exported, is_async, complexity, body_text)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`),
 
     // Edge operations
     insertEdge: db.prepare(`
@@ -154,11 +154,11 @@ function stmts() {
 
     // Find symbol definition
     findSymbol: db.prepare(`
-      SELECT file_path, name, kind, start_line, end_line, complexity
-      FROM   nodes
-      WHERE  name = ?
-      ORDER BY is_exported DESC, complexity DESC
-    `),
+  SELECT file_path, name, kind, start_line, end_line, complexity, body_text
+  FROM   nodes
+  WHERE  name = ?
+  ORDER BY is_exported DESC, complexity DESC
+`),
 
     // What does file X import?
     whatDoesThisImport: db.prepare(`
@@ -204,7 +204,7 @@ function stmts() {
  */
 export function writeFileGraph(fileData) {
   const db = getGraphDb();
-  const s  = stmts();
+  const s = stmts();
 
   const fileId = crypto
     .createHash("sha256")
@@ -239,8 +239,9 @@ export function writeFileGraph(fileData) {
         node.startLine,
         node.endLine,
         node.isExported ? 1 : 0,
-        node.isAsync    ? 1 : 0,
+        node.isAsync ? 1 : 0,
         node.complexity || 0,
+        node.bodyText || null, // ← pass body if symbolExtractor provides it
       );
     }
 
@@ -249,9 +250,7 @@ export function writeFileGraph(fileData) {
       const edgeId = crypto
         .createHash("sha256")
         .update(
-          fileData.filePath + "|" +
-          edge.targetSymbol + "|" +
-          edge.relation,
+          fileData.filePath + "|" + edge.targetSymbol + "|" + edge.relation,
         )
         .digest("hex")
         .slice(0, 16);
@@ -259,7 +258,7 @@ export function writeFileGraph(fileData) {
       s.insertEdge.run(
         edgeId,
         fileData.filePath,
-        edge.targetFile   || null,
+        edge.targetFile || null,
         edge.sourceSymbol || null,
         edge.targetSymbol,
         edge.relation,
@@ -354,7 +353,7 @@ function normalizeFilePath(filePath) {
 export function closeGraphDb() {
   if (_db) {
     _db.close();
-    _db    = null;
+    _db = null;
     _stmts = null;
   }
 }
