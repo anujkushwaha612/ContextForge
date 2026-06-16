@@ -45,3 +45,5 @@ native/vendor/*
 native/tree-sitter-arc/*
 
 CF-savings/
+
+__pycache__/

@@ -1,7 +1,6 @@
 /**
  * Stage-timing instrumentation for request handlers.
  *
- * Port of headroom/proxy/stage_timer.py
  *
  * Design goals:
  *   1. Durations captured even if measured body throws

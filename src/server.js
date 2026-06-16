@@ -3,7 +3,12 @@ import https from "node:https";
 import { writeFileSync } from "node:fs";
 
 import { ProviderFactory } from "./providers/index.js";
-import { invalidateByFile, resetEntireCache } from "./logging/cacheDb.js";
+import {
+  fetchFromVault,
+  fetchVaultTextConcatenated,
+  invalidateByFile,
+  resetEntireCache,
+} from "./logging/cacheDb.js";
 import { countTokens } from "./compression/compressionHelper.js";
 import { createRequire } from "module";
 import { retrieveFromVault } from "./vaultRetriever.js";
@@ -12,6 +17,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { applySemanticDedup } from "./compression/semanticDedup.js";
+import { statsEmitter } from "./proxy/statsEmitter.js";
+import { readFileSync } from "node:fs";
 
 import {
   detectMutation,
@@ -56,6 +63,12 @@ import {
   normalizeGraphToolName,
 } from "./graph/graphTools.js";
 import { injectGraphTool } from "./graph/graphTools.js";
+import {
+  isPatchToolCall,
+  executePatchToolCall,
+  injectPatchTool,
+  PATCH_TOOL_NAME,
+} from "./graph/patchTools.js";
 import { getGraphStats } from "./graph/graphDb.js";
 
 const require = createRequire(import.meta.url);
@@ -215,6 +228,32 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
+  /// SSE stream
+  if (req.url === "/v1/stats/stream" && req.method === "GET") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+    });
+    res.write(
+      `event: snapshot\ndata: ${JSON.stringify(statsEmitter.getSnapshot("initial"))}\n\n`,
+    );
+    const listener = (snapshot) => {
+      res.write(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
+    };
+    statsEmitter.on("snapshot", listener);
+    req.on("close", () => statsEmitter.off("snapshot", listener));
+    return;
+  }
+
+  // Dashboard HTML
+  if (req.url === "/dashboard" && req.method === "GET") {
+    const html = readFileSync(path.join(__dirname, "dashboard.html"), "utf-8");
+    res.writeHead(200, { "Content-Type": "text/html" });
+    return res.end(html);
+  }
+
   // ── Cache Invalidation ──
   if (req.url.startsWith("/v1/cache/invalidate") && req.method === "POST") {
     let invBody = "";
@@ -256,6 +295,56 @@ const server = http.createServer((req, res) => {
       res.writeHead(500, { "Content-Type": "application/json" });
       return res.end(
         JSON.stringify({ error: "Failed to reset cache", details: e.message }),
+      );
+    }
+  }
+
+  // ── Direct vault read endpoint (regression tests only) ──
+  if (req.url.startsWith("/v1/vault/") && req.method === "GET") {
+    const vaultId = req.url.split("/v1/vault/")[1]?.split("?")[0];
+
+    if (!vaultId || !vaultId.startsWith("cf_vault_")) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Invalid vault ID" }));
+    }
+
+    try {
+      // fetchVaultTextConcatenated and fetchFromVault already imported
+      // at top of server.js from "./logging/cacheDb.js"
+      let content = fetchVaultTextConcatenated(vaultId);
+      if (!content) {
+        content = fetchFromVault(vaultId);
+      }
+
+      if (!content) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            error: "Vault not found",
+            vault_id: vaultId,
+          }),
+        );
+      }
+
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      });
+      return res.end(
+        JSON.stringify({
+          vault_id: vaultId,
+          content: content,
+          chars: content.length,
+          tokens: Math.floor(content.length / 4),
+        }),
+      );
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(
+        JSON.stringify({
+          error: "Vault read failed",
+          details: err.message,
+        }),
       );
     }
   }
@@ -592,14 +681,19 @@ const server = http.createServer((req, res) => {
                 const isRetrieveTool = normalizedToolName.includes(
                   "contextforge_retrieve",
                 );
+                const isPatchTool = isPatchToolCall(detectedToolName); // ← add
                 const isMemoryTool =
                   !isRetrieveTool &&
                   !isGraphTool &&
+                  !isPatchTool && // ← add
                   normalizedToolName &&
                   hasMemoryToolCalls(dummyMessage);
 
                 if (
-                  (isRetrieveTool || isMemoryTool || isGraphTool) &&
+                  (isRetrieveTool ||
+                    isMemoryTool ||
+                    isGraphTool ||
+                    isPatchTool) && // ← add
                   retryCount < 2
                 ) {
                   console.log(
@@ -664,6 +758,40 @@ const server = http.createServer((req, res) => {
                     );
                   }
 
+                  // ── Patch operation ──────────────────────────────────────────────────────
+                  if (isPatchTool) {
+                    console.log(
+                      `\n[Ghost Interceptor] 🩹 Patch tool intercepted: ${detectedToolName}`,
+                    );
+
+                    const patchResult = await executePatchToolCall(
+                      detectedToolArgs,
+                      semanticCache,
+                    );
+
+                    currentPayload.messages.push({
+                      role: "assistant",
+                      content: null,
+                      tool_calls: dummyMessage.tool_calls,
+                    });
+                    currentPayload.messages.push({
+                      role: "tool",
+                      tool_call_id: dummyMessage.tool_calls[0].id,
+                      name: PATCH_TOOL_NAME,
+                      content: patchResult,
+                    });
+
+                    currentPayload.tool_choice = "none";
+                    executeUpstreamRequest(
+                      currentPayload,
+                      retryCount + 1,
+                      false,
+                    )
+                      .then(resolve)
+                      .catch(reject);
+                    return;
+                  }
+
                   // ── Vault retrieval ──
                   if (isRetrieveTool) {
                     let args = null;
@@ -684,7 +812,10 @@ const server = http.createServer((req, res) => {
                       const sq = (args.search_query || "").trim();
                       if (sq && /^[\w$]+$/.test(sq)) {
                         try {
-                          const graphHits = executeGraphQuery("find_symbol", sq);
+                          const graphHits = executeGraphQuery(
+                            "find_symbol",
+                            sq,
+                          );
                           const parsed = JSON.parse(graphHits);
                           if (
                             parsed.definitions?.length > 0 &&
@@ -925,6 +1056,40 @@ const server = http.createServer((req, res) => {
                 }
               }
 
+              // ── Patch operation (non-streaming) ──────────────────────────────────────
+              if (
+                message?.tool_calls?.length > 0 &&
+                isPatchToolCall(message.tool_calls[0].function.name) &&
+                retryCount < 2
+              ) {
+                console.log(
+                  `\n[Ghost Interceptor] 🩹 Non-streaming patch intercepted`,
+                );
+
+                const patchResult = await executePatchToolCall(
+                  message.tool_calls[0].function.arguments,
+                  semanticCache,
+                );
+
+                currentPayload.messages.push({
+                  role: "assistant",
+                  content: message.content ?? null,
+                  tool_calls: message.tool_calls,
+                });
+                currentPayload.messages.push({
+                  role: "tool",
+                  tool_call_id: message.tool_calls[0].id,
+                  name: PATCH_TOOL_NAME,
+                  content: patchResult,
+                });
+
+                currentPayload.tool_choice = "none";
+                executeUpstreamRequest(currentPayload, retryCount + 1, false)
+                  .then(resolve)
+                  .catch(reject);
+                return;
+              }
+
               // ── Ghost interceptor (non-streaming) ──
               if (message?.tool_calls?.length > 0) {
                 const toolCall = message.tool_calls[0];
@@ -1138,8 +1303,8 @@ const server = http.createServer((req, res) => {
         payload = await tagToolResults(payload);
       });
 
-      timer.time(STAGES.SEMANTIC_DEDUP, () => {
-        payload = applySemanticDedup(payload);
+      await timer.timeAsync(STAGES.SEMANTIC_DEDUP, async () => {
+        payload = await applySemanticDedup(payload);
       });
 
       timer.time(STAGES.PRUNE, () => {
@@ -1214,6 +1379,7 @@ const server = http.createServer((req, res) => {
 
       timer.time(STAGES.GRAPH_INJECT, () => {
         payload.tools = injectGraphTool(payload.tools);
+        payload.tools = injectPatchTool(payload.tools); // ← write-side tool
       });
 
       // Must be LAST before transmission
@@ -1225,6 +1391,43 @@ const server = http.createServer((req, res) => {
       const pipelineLatencyMs = performance.now() - startTime;
       const finalTokens = countTokens(payload);
       const tokensSaved = baselineTokens - finalTokens;
+      const stages = timer.summary(); // ← move up here, needed by dry-run
+
+      // ── Dry-run: return pipeline metrics without hitting LLM ──
+      // ── Dry-run: return pipeline metrics without hitting LLM ──
+      if (req.headers["x-cf-dry-run"] === "true") {
+        // Collect all vault IDs created during this pipeline run
+        // by scanning compressed messages for CF_VAULT stubs
+        const vaultIds = [];
+        const vaultPattern = /\[CF_VAULT:\s*(cf_vault_[a-f0-9]+)\]/g;
+        const payloadStr = JSON.stringify(payload);
+        let vaultMatch;
+        while ((vaultMatch = vaultPattern.exec(payloadStr)) !== null) {
+          if (!vaultIds.includes(vaultMatch[1])) {
+            vaultIds.push(vaultMatch[1]);
+          }
+        }
+
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        });
+        return res.end(
+          JSON.stringify({
+            pipeline_ms: pipelineLatencyMs,
+            tokens_before: baselineTokens,
+            tokens_after: finalTokens,
+            tokens_saved: tokensSaved,
+            compression_ratio:
+              baselineTokens > 0
+                ? parseFloat(((tokensSaved / baselineTokens) * 100).toFixed(1))
+                : 0,
+            stages: stages,
+            vault_ids: vaultIds, // ← all vaults created
+            vault_id: vaultIds[0] ?? null, // ← first vault for convenience
+          }),
+        );
+      }
 
       // ── Mutation detection (before upstream, no cost) ──
       const payloadStr = JSON.stringify(payload);
@@ -1240,9 +1443,9 @@ const server = http.createServer((req, res) => {
         }
       }
 
-      // ── Upstream call (awaited — totalLatencyMs is accurate) ──
+      // ── Upstream call ──
       await executeUpstreamRequest(payload);
-      const totalLatencyMs = performance.now() - startTime;
+      const totalLatencyMs = performance.now() - startTime; // ← declared once here
 
       // ── Record savings only after successful upstream ──
       savingsTracker.recordRequest({
@@ -1251,7 +1454,15 @@ const server = http.createServer((req, res) => {
         tokensSaved,
       });
 
-      // ── Full pipeline report printed after everything completes ──
+      // ── Live dashboard metrics ──
+      statsEmitter.recordRequest({
+        baselineTokens,
+        finalTokens,
+        pipelineLatency: pipelineLatencyMs,
+        upstreamLatency: totalLatencyMs - pipelineLatencyMs,
+      });
+
+      // ── Full pipeline report ──
       console.log("\n=== ContextForge Pipeline Report ===");
       console.log(`[Metrics] Baseline Tokens:    ${baselineTokens}`);
       console.log(`[Metrics] Final Tokens:       ${finalTokens}`);
@@ -1269,7 +1480,6 @@ const server = http.createServer((req, res) => {
       );
       console.log(`[Decision] ${decision}`);
 
-      const stages = timer.summary();
       for (const [stage, ms] of Object.entries(stages)) {
         if (ms > 1) console.log(`[Stage] ${stage}: ${ms.toFixed(1)}ms`);
       }
@@ -1305,4 +1515,3 @@ process.on("SIGINT", () => {
 
   process.exit(0);
 });
-

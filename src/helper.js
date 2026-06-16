@@ -208,6 +208,60 @@ function _translateMessages(messages, ctx) {
   return translated;
 }
 
+// ─────────────────────────────────────────────
+// Fast structural fingerprint for array content
+// Avoids JSON.stringify on large tool result arrays.
+// Checks: block count + first block type/id + last block type/id
+// If all match, falls back to full stringify only on the
+// first and last blocks (not the entire array).
+// ─────────────────────────────────────────────
+function _contentArrayEqual(cur, prev) {
+  // Length already checked before this is called
+  const len = cur.length;
+  if (len === 0) return true;
+
+  const first_c = cur[0];
+  const first_p = prev[0];
+  const last_c = cur[len - 1];
+  const last_p = prev[len - 1];
+
+  // ── Cheap structural checks ──
+  // Type mismatch on first block — almost certainly different
+  if (first_c?.type !== first_p?.type) return false;
+  if (last_c?.type !== last_p?.type) return false;
+
+  // Tool result blocks — compare by tool_use_id (unique per call)
+  // If IDs match, content is the same call — no need to serialize content
+  if (first_c?.type === "tool_result") {
+    if (first_c.tool_use_id !== first_p.tool_use_id) return false;
+    if (last_c.tool_use_id !== last_p.tool_use_id) return false;
+
+    // IDs match on both ends — high confidence same array
+    // Only do full check if array is small enough to be cheap
+    if (len <= 4) {
+      for (let i = 1; i < len - 1; i++) {
+        if (cur[i]?.tool_use_id !== prev[i]?.tool_use_id) return false;
+      }
+    }
+    return true;
+  }
+
+  // Text blocks — compare by text length + first 80 chars
+  if (first_c?.type === "text") {
+    if (first_c.text?.length !== first_p.text?.length) return false;
+    if (last_c.text?.length !== last_p.text?.length) return false;
+    if (first_c.text?.slice(0, 80) !== first_p.text?.slice(0, 80)) return false;
+    if (last_c.text?.slice(0, 80) !== last_p.text?.slice(0, 80)) return false;
+    return true;
+  }
+
+  // Unknown block type — fall back to stringify on first+last only
+  // Still avoids serializing the entire middle of the array
+  if (JSON.stringify(first_c) !== JSON.stringify(first_p)) return false;
+  if (JSON.stringify(last_c) !== JSON.stringify(last_p)) return false;
+  return true;
+}
+
 function _findStablePrefix(currentMsgs, ctx) {
   if (!ctx.prevInputMessages || !ctx.prevOutputMessages) return 0;
 
@@ -218,21 +272,26 @@ function _findStablePrefix(currentMsgs, ctx) {
     const cur = currentMsgs[i];
     const prev = ctx.prevInputMessages[i];
 
+    // Same object reference — identical (V8 short-circuits immediately)
     if (cur === prev) continue;
+
+    // Role mismatch — stop
     if (cur.role !== prev.role) break;
 
+    // String content — direct compare, no allocation
     if (typeof cur.content === "string" && typeof prev.content === "string") {
       if (cur.content !== prev.content) break;
       continue;
     }
 
+    // Array content — structural fingerprint first, no full stringify
     if (Array.isArray(cur.content) && Array.isArray(prev.content)) {
       if (cur.content.length !== prev.content.length) break;
-      if (cur.content[0]?.type !== prev.content[0]?.type) break;
-      if (JSON.stringify(cur.content) !== JSON.stringify(prev.content)) break;
+      if (!_contentArrayEqual(cur.content, prev.content)) break;
       continue;
     }
 
+    // Mixed types — bail
     break;
   }
 
@@ -592,14 +651,16 @@ export function translateAnthropicToOpenAI(payload, ctx = null) {
 // 2. STRIP ANTHROPIC NON-STANDARD ROOT PARAMETERS
 // ========================================================
 export function stripAnthropicSpecificFields(payload) {
-  const cleaned = JSON.parse(JSON.stringify(payload));
-  delete cleaned.anthropic_version;
-  delete cleaned.context_management;
-  delete cleaned.metadata;
-  delete cleaned.stop_sequences;
-  delete cleaned.output_config;
-  delete cleaned.thinking;
-  delete cleaned.prompt_cache_key;
+  const {
+    anthropic_version,
+    context_management,
+    metadata,
+    stop_sequences,
+    output_config,
+    thinking,
+    prompt_cache_key,
+    ...cleaned
+  } = payload;
   return cleaned;
 }
 
@@ -894,31 +955,68 @@ export function translateOpenAISSEToAnthropic(
   return events;
 }
 
+// ─────────────────────────────────────────────
+// Thresholds for minified code detection
+// ─────────────────────────────────────────────
+const MINIFIED_AVG_LINE_LENGTH = 500; // chars/line → treat as minified
+const MINIFIED_MIN_CHARS = 5_000; // don't bother for tiny files
+
 export function interceptAndVaultMassiveToolResults(
   payload,
-  charThreshold = 15000, // ← default preserved; server.js now passes policy value
+  charThreshold = 15000,
 ) {
+  console.log("[interceptAndVaultMassiveToolResults] called");
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
   payload.messages = payload.messages.map((msg) => {
-    if (msg.role === "tool" && typeof msg.content === "string") {
-      if (msg.content.length > charThreshold) {
-        const originalLength = msg.content.length;
-        const vaultId = saveToVault(msg.content);
+    if (msg.role !== "tool" || typeof msg.content !== "string") return msg;
 
+    const content = msg.content;
+    const contentLength = content.length;
+
+    // ── Fix 1: Minified code fast-path ──────────────────────────────────────
+    // If ContentRouter tagged this as code AND the average line length
+    // exceeds the minified threshold, vault immediately — regardless of
+    // charThreshold. Minified code is unreadable inline and will never
+    // compress via AST (no multi-line structure to reduce).
+    //
+    // Guard: only fire when the file is large enough to matter (>5k chars).
+    // This prevents single-line config snippets from being needlessly vaulted.
+    if (msg._cf_type === "code" && contentLength > MINIFIED_MIN_CHARS) {
+      const lines = content.split("\n");
+      const avgLine = contentLength / lines.length;
+
+      if (avgLine > MINIFIED_AVG_LINE_LENGTH) {
+        const vaultId = saveToVault(content);
         console.log(
-          `[Fat Catch] 🕸️ Intercepted massive tool result (${originalLength} chars) -> Offloaded to ${vaultId}` +
-            ` [threshold=${charThreshold}]`, // ← now shows which policy threshold fired
+          `[Fat Catch] 🗜️  Minified code detected ` +
+            `(${contentLength} chars, avg line ${Math.round(avgLine)} chars) ` +
+            `-> Vaulted ${vaultId}`,
         );
-
         return {
           ...msg,
           content:
-            `[CF_VAULT:${vaultId}] ${Math.round(originalLength / 4)} tokens compressed. ` +
+            `[CF_VAULT:${vaultId}] ${Math.round(contentLength / 4)} tokens compressed. ` +
             `Call contextforge_retrieve(vault_id:"${vaultId}") to expand.`,
         };
       }
     }
+
+    // ── Standard Fat Catch (unchanged) ──────────────────────────────────────
+    if (contentLength > charThreshold) {
+      const vaultId = saveToVault(content);
+      console.log(
+        `[Fat Catch] 🕸️ Intercepted massive tool result (${contentLength} chars) -> Offloaded to ${vaultId}` +
+          ` [threshold=${charThreshold}]`,
+      );
+      return {
+        ...msg,
+        content:
+          `[CF_VAULT:${vaultId}] ${Math.round(contentLength / 4)} tokens compressed. ` +
+          `Call contextforge_retrieve(vault_id:"${vaultId}") to expand.`,
+      };
+    }
+
     return msg;
   });
 
@@ -1947,10 +2045,7 @@ function robustJsonParse(text) {
   return null; // genuine failure — not JSON at all
 }
 
-/**
- * Core JSON slicing function.
- */
-export function sliceJsonOutput(text, messages = []) {
+export function sliceJsonOutput(text, messages = [], policy = null) {
   if (typeof text !== "string" || text.length === 0) {
     return { kept: text, vaulted: false };
   }
@@ -1994,7 +2089,9 @@ export function sliceJsonOutput(text, messages = []) {
     .sort((a, b) => b.score - a.score);
 
   const itemStrings = nodes.map((n) => `${n.path} ${String(n.value ?? "")}`);
-  const optimalK = computeOptimalK(itemStrings, payload?.__policy ?? null);
+
+  // ── policy now passed in as parameter — no longer references outer payload ──
+  const optimalK = computeOptimalK(itemStrings, policy ?? null);
   const topScored = scoredOnly.slice(0, optimalK);
 
   const keptSet = new Map();
@@ -2026,11 +2123,11 @@ export function sliceJsonOutput(text, messages = []) {
   };
 }
 
-/**
- * Applies JSON slicing to all tool results tagged as "json".
- */
 export function sliceJsonToolResults(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
+
+  // ── Extract policy once here and pass down into sliceJsonOutput ──
+  const policy = payload?.__policy ?? null;
 
   let sliceStats = { sliced: 0, nodesKept: 0, nodesTotal: 0, charsSaved: 0 };
 
@@ -2041,7 +2138,7 @@ export function sliceJsonToolResults(payload) {
       msg._cf_type === "json"
     ) {
       const beforeLen = msg.content.length;
-      const result = sliceJsonOutput(msg.content, payload.messages);
+      const result = sliceJsonOutput(msg.content, payload.messages, policy);
 
       if (result.vaulted) {
         sliceStats.sliced++;
@@ -2069,7 +2166,11 @@ export function sliceJsonToolResults(payload) {
             block._cf_type === "json"
           ) {
             const beforeLen = block.content.length;
-            const result = sliceJsonOutput(block.content, payload.messages);
+            const result = sliceJsonOutput(
+              block.content,
+              payload.messages,
+              policy,
+            );
             if (result.vaulted) {
               sliceStats.sliced++;
               sliceStats.charsSaved += beforeLen - result.kept.length;
@@ -2099,7 +2200,6 @@ export function sliceJsonToolResults(payload) {
 
   return payload;
 }
-
 // ============================================================
 // PHASE 3, FEATURE 7: PREDICTIVE CONTEXT INJECTION
 // ============================================================

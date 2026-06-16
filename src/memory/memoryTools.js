@@ -7,7 +7,6 @@
  * The LLM calls them → the proxy intercepts before forwarding → executes →
  * injects tool result → continues.
  *
- * This is exactly how headroom does it in memory_handler.py handle_memory_tool_calls()
  */
 
 export const MEMORY_TOOL_NAMES = new Set([

@@ -1,7 +1,6 @@
 /**
  * CompressionDecision — canonical "should this request be compressed?" gate.
  *
- * Port of headroom/proxy/compression_decision.py
  *
  * Pre-this-module, compression ran unconditionally on every request.
  * This caused:
@@ -22,7 +21,6 @@
 
 /**
  * Check if the request has an explicit bypass header.
- * Mirrors headroom's _headroom_bypass_enabled helper.
  */
 
 import { countTokens } from "../compression/compressionHelper.js";
@@ -30,14 +28,14 @@ import { countTokens } from "../compression/compressionHelper.js";
 export function isBypassEnabled(headers) {
   // Direct bypass header
   const bypass =
-    headers["x-contextforge-bypass"] || headers["x-headroom-bypass"] || "";
+    headers["x-contextforge-bypass"] || "";
   if (["true", "1", "yes", "on"].includes(bypass.toLowerCase().trim())) {
     return true;
   }
 
   // Mode header
   const mode =
-    headers["x-contextforge-mode"] || headers["x-headroom-mode"] || "";
+    headers["x-contextforge-mode"] || "";
   if (mode.toLowerCase().trim() === "passthrough") {
     return true;
   }

@@ -1,6 +1,5 @@
 // src/mcp/health.js
 // Post-registration health check — verifies the server actually starts
-// Headroom has no equivalent — this is a ContextForge advantage
 
 import { spawn }   from "node:child_process";
 import http        from "node:http";

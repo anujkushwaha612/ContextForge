@@ -1,5 +1,4 @@
 // src/mcp/base.js
-// Abstract base — matches headroom's interface exactly
 
 export const RegisterStatus = Object.freeze({
   REGISTERED:   "registered",

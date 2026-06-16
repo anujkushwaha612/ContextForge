@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ContextForge — Live Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+:root {
+  --bg: #05050f;
+  --bg-soft: #08081a;
+  --surface: rgba(255,255,255,0.035);
+  --surface-hover: rgba(255,255,255,0.065);
+  --line: rgba(255,255,255,0.07);
+  --line-strong: rgba(255,255,255,0.13);
+  --text: #e8eaff;
+  --text-dim: #8287a8;
+  --text-faint: #4a4f68;
+  --primary: #7055ff;
+  --primary-glow: rgba(112,85,255,0.22);
+  --accent: #00d4ff;
+  --accent-glow: rgba(0,212,255,0.18);
+  --green: #00e5a0;
+  --green-glow: rgba(0,229,160,0.18);
+  --amber: #ffb340;
+  --amber-glow: rgba(255,179,64,0.18);
+  --red: #ff5e57;
+  --pink: #ff3cac;
+  --radius: 16px;
+  --radius-sm: 10px;
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+
+html,body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Inter",system-ui,sans-serif;
+  min-height: 100vh;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Animated star-field background ── */
+.starfield {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(ellipse 70% 50% at 15% 5%, rgba(112,85,255,0.18) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 40% at 85% 10%, rgba(0,212,255,0.12) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 50% 95%, rgba(0,229,160,0.08) 0%, transparent 60%);
+}
+
+.particles {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
+}
+.particle {
+  position: absolute;
+  width: 2px; height: 2px;
+  border-radius: 50%;
+  background: var(--primary);
+  animation: drift linear infinite;
+  opacity: 0;
+}
+@keyframes drift {
+  0%   { transform: translateY(100vh) translateX(0); opacity:0; }
+  10%  { opacity: 0.6; }
+  90%  { opacity: 0.3; }
+  100% { transform: translateY(-10vh) translateX(40px); opacity:0; }
+}
+
+.scanline {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background: repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,0,0,0.04) 4px);
+  animation: scanmove 8s linear infinite;
+}
+@keyframes scanmove { to { background-position: 0 40px; } }
+
+.container {
+  position: relative; z-index: 1;
+  max-width: 1360px; margin: 0 auto;
+  padding: 24px 24px 80px;
+}
+
+/* ── Top bar ── */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between; gap:16px;
+  padding: 12px 20px;
+  margin-bottom: 28px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(8,8,26,0.7);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+}
+.brand { display:flex; align-items:center; gap:12px; }
+.brand .logo {
+  width:36px; height:36px; border-radius:11px;
+  display:grid; place-items:center; font-size:18px;
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  box-shadow: 0 0 28px rgba(112,85,255,0.5);
+  animation: logopulse 3s ease-in-out infinite alternate;
+}
+@keyframes logopulse { to { box-shadow: 0 0 44px rgba(112,85,255,0.7); } }
+.brand h1 { font-size:1.05rem; font-weight:700; letter-spacing:0.02em; }
+.brand h1 span {
+  background: linear-gradient(90deg, var(--primary), var(--accent));
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+}
+.brand .tagline { font-size:0.7rem; color:var(--text-dim); letter-spacing:0.2em; text-transform:uppercase; }
+
+.topbar-right { display:flex; align-items:center; gap:12px; }
+.status {
+  display:inline-flex; align-items:center; gap:8px;
+  font-family:var(--mono); font-size:0.7rem; letter-spacing:0.12em;
+  color:var(--green); padding:7px 14px; border-radius:999px;
+  border:1px solid rgba(0,229,160,0.25); background:rgba(0,229,160,0.08);
+}
+.status::before {
+  content:""; width:7px; height:7px; border-radius:50%;
+  background:currentColor; box-shadow:0 0 12px currentColor;
+  animation:pulse 1.8s ease-in-out infinite;
+}
+@keyframes pulse { 50% { opacity:0.25; box-shadow: none; } }
+
+.time-badge {
+  font-family:var(--mono); font-size:0.72rem; color:var(--text-dim);
+  padding:7px 14px; border-radius:999px; border:1px solid var(--line);
+}
+
+/* ── Hero strip ── */
+.hero {
+  display:grid; grid-template-columns: 1fr 1fr 1fr;
+  gap:18px; margin-bottom:22px;
+}
+@media(max-width:900px){ .hero{ grid-template-columns:1fr; } }
+
+.hero-card {
+  position:relative; border:1px solid var(--line);
+  border-radius:var(--radius);
+  background: rgba(255,255,255,0.025);
+  backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
+  padding:26px 26px 22px;
+  overflow:hidden; cursor:default;
+  transition: border-color 0.3s, transform 0.3s;
+}
+.hero-card:hover {
+  border-color: var(--line-strong);
+  transform: translateY(-3px);
+}
+.hero-card::before {
+  content:""; position:absolute; top:0; left:0; right:0; height:1px;
+  background:linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent);
+}
+.hero-card.main {
+  grid-column: span 1;
+  background:
+    radial-gradient(160px 80px at 50% 0%, rgba(112,85,255,0.2), transparent),
+    rgba(255,255,255,0.025);
+  border-color: rgba(112,85,255,0.3);
+}
+.hero-card.main::before {
+  background:linear-gradient(90deg, transparent, rgba(112,85,255,0.7), rgba(0,212,255,0.7), transparent);
+}
+.hero-label {
+  font-size:0.68rem; font-weight:600; letter-spacing:0.22em;
+  text-transform:uppercase; color:var(--text-dim); margin-bottom:14px;
+}
+.hero-value {
+  font-family:var(--mono); font-size:2.6rem; font-weight:600;
+  letter-spacing:-0.025em; line-height:1;
+  background: linear-gradient(135deg, #fff 20%, var(--primary) 60%, var(--accent));
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+}
+.hero-value.green  { background: linear-gradient(135deg, #fff 10%, var(--green)); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+.hero-value.accent { background: linear-gradient(135deg, #fff 10%, var(--accent)); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+.hero-meta { margin-top:10px; font-size:0.78rem; color:var(--text-dim); }
+
+.sparkline-wrap { margin-top:16px; height:48px; position:relative; }
+.sparkline-wrap canvas { width:100% !important; }
+
+/* ── Main grid ── */
+.main-grid {
+  display:grid; grid-template-columns: 2fr 1.2fr;
+  gap:18px; margin-bottom:18px;
+}
+@media(max-width:1000px){ .main-grid{ grid-template-columns:1fr; } }
+
+/* ── Panels ── */
+.panel {
+  border:1px solid var(--line); border-radius:var(--radius);
+  background: rgba(255,255,255,0.025);
+  backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
+  padding:22px;
+  transition: border-color 0.3s;
+}
+.panel:hover { border-color: var(--line-strong); }
+
+.panel-title {
+  display:flex; align-items:center; justify-content:space-between;
+  margin-bottom:18px;
+}
+.panel-title-left {
+  display:flex; align-items:center; gap:10px;
+  font-size:0.68rem; font-weight:700; letter-spacing:0.2em;
+  text-transform:uppercase; color:var(--text-dim);
+}
+.panel-title-left .dot {
+  width:8px; height:8px; border-radius:50%; background:var(--primary);
+  box-shadow: 0 0 12px var(--primary);
+}
+.panel-badge {
+  font-family:var(--mono); font-size:0.68rem; color:var(--accent);
+  padding:4px 10px; border-radius:999px; border:1px solid rgba(0,212,255,0.25);
+  background:rgba(0,212,255,0.08);
+}
+
+/* ── Token flow ring ── */
+.ring-section {
+  display:flex; flex-direction:column; align-items:center;
+  gap:8px; padding:10px 0;
+}
+.ring-wrap {
+  position:relative; width:200px; height:200px;
+  cursor:pointer;
+}
+.ring-wrap canvas { position:absolute; inset:0; }
+.ring-center {
+  position:absolute; inset:0; display:flex;
+  flex-direction:column; align-items:center; justify-content:center;
+  pointer-events:none; gap:4px;
+}
+.ring-big { font-family:var(--mono); font-size:1.9rem; font-weight:500; letter-spacing:-0.02em; }
+.ring-label { font-size:0.68rem; letter-spacing:0.16em; text-transform:uppercase; color:var(--text-dim); }
+
+.ring-legend {
+  display:flex; flex-direction:column; gap:8px; width:100%;
+}
+.legend-row {
+  display:flex; align-items:center; justify-content:space-between;
+  font-size:0.82rem; padding:6px 2px; cursor:pointer;
+  border-radius:8px; transition:background 0.2s;
+}
+.legend-row:hover { background:var(--surface-hover); padding:6px 8px; }
+.legend-row-left { display:flex; align-items:center; gap:10px; }
+.legend-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+.legend-name { color:var(--text-dim); }
+.legend-val { font-family:var(--mono); font-size:0.78rem; color:var(--text); }
+
+/* ── Throughput chart ── */
+.throughput-wrap { height:220px; position:relative; }
+.throughput-wrap canvas { width:100% !important; }
+
+/* ── Stage waterfall ── */
+.waterfall {
+  display:flex; flex-direction:column; gap:2px;
+}
+.stage-row {
+  display:grid; grid-template-columns:140px 1fr 60px;
+  gap:12px; align-items:center; padding:8px 4px;
+  border-radius:8px; cursor:pointer;
+  transition:background 0.2s;
+}
+.stage-row:hover { background:var(--surface-hover); }
+.stage-name { font-size:0.82rem; color:var(--text-dim); font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.stage-bar-wrap { height:8px; border-radius:999px; background:rgba(255,255,255,0.05); overflow:hidden; position:relative; }
+.stage-bar-fill {
+  height:100%; border-radius:inherit;
+  background:linear-gradient(90deg, var(--primary), var(--accent));
+  box-shadow:0 0 8px rgba(112,85,255,0.4);
+  transition:width 0.8s cubic-bezier(0.22,1,0.36,1);
+}
+.stage-bar-fill.slow { background:linear-gradient(90deg, var(--amber), #ff8c00); }
+.stage-bar-fill.danger { background:linear-gradient(90deg, var(--red), var(--pink)); }
+.stage-ms {
+  font-family:var(--mono); font-size:0.78rem;
+  text-align:right; font-variant-numeric:tabular-nums;
+  color:var(--accent);
+}
+.stage-ms.slow { color:var(--amber); }
+.stage-ms.danger { color:var(--red); }
+
+/* ── Cache rings ── */
+.cache-grid {
+  display:grid; grid-template-columns:1fr 1fr;
+  gap:14px;
+}
+.cache-cell {
+  display:flex; flex-direction:column; align-items:center;
+  gap:8px; padding:16px 10px;
+  border:1px solid var(--line); border-radius:var(--radius-sm);
+  background:var(--surface); cursor:pointer;
+  transition:border-color 0.2s, transform 0.2s;
+}
+.cache-cell:hover { border-color:var(--line-strong); transform:scale(1.02); }
+.cache-label { font-size:0.68rem; font-weight:600; letter-spacing:0.14em; text-transform:uppercase; color:var(--text-dim); text-align:center; }
+.mini-ring { position:relative; width:72px; height:72px; }
+.mini-ring canvas { position:absolute; inset:0; }
+.mini-ring-center {
+  position:absolute; inset:0; display:flex;
+  flex-direction:column; align-items:center; justify-content:center;
+}
+.mini-ring-pct { font-family:var(--mono); font-size:1rem; font-weight:600; }
+.cache-streak { font-family:var(--mono); font-size:0.65rem; color:var(--amber); }
+
+/* ── Bottom row ── */
+.bottom-row {
+  display:grid; grid-template-columns:1fr 1fr;
+  gap:18px; margin-bottom:18px;
+}
+@media(max-width:900px){ .bottom-row{ grid-template-columns:1fr; } }
+
+/* ── Latency histogram ── */
+.histogram-wrap { height:180px; position:relative; }
+
+/* ── Graph section ── */
+.graph-section { display:flex; flex-direction:column; gap:12px; }
+.graph-stats { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
+.graph-stat {
+  text-align:center; padding:12px 8px;
+  border:1px solid var(--line); border-radius:var(--radius-sm);
+  background:var(--surface);
+}
+.graph-stat .g-val { font-family:var(--mono); font-size:1.2rem; font-weight:500; }
+.graph-stat .g-lbl { font-size:0.66rem; color:var(--text-dim); letter-spacing:0.12em; text-transform:uppercase; margin-top:4px; }
+
+/* ── Connections visual ── */
+.connections-wrap { height:160px; position:relative; overflow:hidden; }
+.conn-canvas { width:100%; height:100%; }
+
+/* ── Activity feed ── */
+.feed-panel { margin-bottom:0; }
+.feed-tabs {
+  display:flex; gap:4px; padding:4px;
+  background:var(--surface); border-radius:var(--radius-sm);
+  margin-bottom:16px;
+}
+.feed-tab {
+  flex:1; text-align:center; font-size:0.72rem; font-weight:600;
+  letter-spacing:0.1em; text-transform:uppercase;
+  color:var(--text-dim); padding:7px 10px; border-radius:7px;
+  cursor:pointer; transition:all 0.2s; border:none; background:transparent;
+}
+.feed-tab.active {
+  color:var(--text); background:rgba(255,255,255,0.08);
+  box-shadow:0 0 0 1px var(--line);
+}
+.feed-scroll { max-height:320px; overflow-y:auto; margin-right:-4px; padding-right:4px; }
+.feed-row {
+  display:grid; grid-template-columns:80px 18px 1fr auto;
+  gap:12px; align-items:center;
+  padding:11px 6px; font-size:0.83rem;
+  border-bottom:1px solid var(--line); cursor:pointer;
+  transition:background 0.15s;
+  animation:slideIn 0.3s ease;
+}
+.feed-row:last-child { border-bottom:none; }
+.feed-row:hover { background:var(--surface-hover); border-radius:10px; margin:0 -4px; padding-left:10px; padding-right:10px; }
+@keyframes slideIn { from { opacity:0; transform:translateY(-5px); } to { opacity:1; transform:translateY(0); } }
+.feed-time { font-family:var(--mono); font-size:0.72rem; color:var(--text-faint); font-variant-numeric:tabular-nums; }
+.feed-icon { font-size:14px; }
+.feed-desc { color:var(--text); font-weight:500; }
+.feed-meta { font-family:var(--mono); font-size:0.74rem; color:var(--accent); font-variant-numeric:tabular-nums; text-align:right; }
+.feed-meta.red { color:var(--red); }
+.feed-meta.green { color:var(--green); }
+
+/* ── Tooltip ── */
+.tooltip {
+  position:fixed; pointer-events:none; z-index:9999;
+  padding:8px 12px; border-radius:10px; font-size:0.78rem;
+  background:rgba(10,10,30,0.95); border:1px solid var(--line-strong);
+  color:var(--text); font-family:var(--mono); letter-spacing:0.04em;
+  max-width:220px; box-shadow:0 8px 32px rgba(0,0,0,0.5);
+  transition:opacity 0.15s; opacity:0;
+}
+.tooltip.visible { opacity:1; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width:6px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.1); border-radius:999px; }
+::-webkit-scrollbar-thumb:hover { background:rgba(255,255,255,0.2); }
+::selection { background:var(--primary-glow); }
+
+/* ── Animated counter ── */
+.counting { transition:all 0.4s; }
+</style>
+</head>
+<body>
+
+<div class="starfield"></div>
+<div class="particles" id="particles"></div>
+<div class="scanline"></div>
+<div class="tooltip" id="tooltip"></div>
+
+<div class="container">
+
+  <!-- Top bar -->
+  <nav class="topbar">
+    <div class="brand">
+      <div class="logo">⚒️</div>
+      <div>
+        <h1>Context<span>Forge</span></h1>
+        <div class="tagline">Live Telemetry</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="time-badge" id="clock">--:--:--</div>
+      <div class="status" id="status">CONNECTING...</div>
+    </div>
+  </nav>
+
+  <!-- Hero KPIs with sparklines -->
+  <section class="hero">
+    <div class="hero-card main" data-tip="Total tokens removed from the LLM context across all requests this session">
+      <div class="hero-label">Tokens Saved This Session</div>
+      <div class="hero-value" id="tokens-saved">0</div>
+      <div class="hero-meta" id="dollar-saved">$0.000 saved</div>
+      <div class="sparkline-wrap">
+        <canvas id="spark-tokens" height="48" aria-label="Token savings over time sparkline"></canvas>
+      </div>
+    </div>
+    <div class="hero-card" data-tip="Average percentage of tokens removed by the compression pipeline">
+      <div class="hero-label">Avg Compression Ratio</div>
+      <div class="hero-value green" id="compression-ratio">0%</div>
+      <div class="hero-meta" id="total-requests">0 requests processed</div>
+      <div class="sparkline-wrap">
+        <canvas id="spark-compression" height="48" aria-label="Compression ratio over time sparkline"></canvas>
+      </div>
+    </div>
+    <div class="hero-card" data-tip="Total overhead added by ContextForge pipeline vs raw LLM latency">
+      <div class="hero-label">Pipeline Overhead</div>
+      <div class="hero-value accent" id="avg-pipeline">0ms</div>
+      <div class="hero-meta" id="avg-upstream">0ms LLM inference</div>
+      <div class="sparkline-wrap">
+        <canvas id="spark-latency" height="48" aria-label="Pipeline latency over time sparkline"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <!-- Main: throughput + token flow ring -->
+  <div class="main-grid" style="margin-bottom:18px;">
+    <div class="panel">
+      <div class="panel-title">
+        <div class="panel-title-left"><div class="dot"></div>Request Throughput &amp; Token Savings</div>
+        <div class="panel-badge" id="rps-badge">0 req/min</div>
+      </div>
+      <div class="throughput-wrap">
+        <canvas id="chart-throughput" role="img" aria-label="Request throughput and tokens saved over time"></canvas>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">
+        <div class="panel-title-left"><div class="dot" style="background:var(--accent)"></div>Token Distribution</div>
+      </div>
+      <div class="ring-section">
+        <div class="ring-wrap" id="ring-wrap" data-tip="Click to cycle view">
+          <canvas id="chart-ring" role="img" aria-label="Token distribution donut chart" width="200" height="200"></canvas>
+          <div class="ring-center">
+            <div class="ring-big" id="ring-big" style="color:var(--green)">0%</div>
+            <div class="ring-label">saved</div>
+          </div>
+        </div>
+        <div class="ring-legend" id="ring-legend"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pipeline stages + cache hit rates -->
+  <div class="main-grid">
+    <div class="panel">
+      <div class="panel-title">
+        <div class="panel-title-left"><div class="dot" style="background:var(--amber)"></div>Pipeline Stages — Last Run</div>
+        <div class="panel-badge" id="total-time-badge">0ms total</div>
+      </div>
+      <div class="waterfall" id="stages-list"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">
+        <div class="panel-title-left"><div class="dot" style="background:var(--green)"></div>Cache Hit Rates</div>
+      </div>
+      <div class="cache-grid">
+        <div class="cache-cell" data-tip="Semantic deduplication prevents sending near-duplicate content">
+          <div class="cache-label">Semantic Dedup</div>
+          <div class="mini-ring" id="ring-dedup-wrap">
+            <canvas id="ring-dedup" width="72" height="72" aria-label="Semantic dedup hit rate"></canvas>
+            <div class="mini-ring-center"><div class="mini-ring-pct" id="cache-dedup" style="color:var(--green)">0%</div></div>
+          </div>
+        </div>
+        <div class="cache-cell" data-tip="Hybrid RAG retrieval cache hit rate (HNSW + BM25)">
+          <div class="cache-label">Hybrid RAG</div>
+          <div class="mini-ring" id="ring-rag-wrap">
+            <canvas id="ring-rag" width="72" height="72" aria-label="Hybrid RAG hit rate"></canvas>
+            <div class="mini-ring-center"><div class="mini-ring-pct" id="cache-rag" style="color:var(--accent)">0%</div></div>
+          </div>
+        </div>
+        <div class="cache-cell" data-tip="Content type detection cache for routing decisions">
+          <div class="cache-label">Content Detector</div>
+          <div class="mini-ring" id="ring-content-wrap">
+            <canvas id="ring-content" width="72" height="72" aria-label="Content detector hit rate"></canvas>
+            <div class="mini-ring-center"><div class="mini-ring-pct" id="cache-content" style="color:var(--primary)">0%</div></div>
+          </div>
+        </div>
+        <div class="cache-cell" data-tip="Cache aligner ensures semantic consistency between cached responses">
+          <div class="cache-label">Cache Aligner</div>
+          <div class="mini-ring" id="ring-aligner-wrap">
+            <canvas id="ring-aligner" width="72" height="72" aria-label="Cache aligner hit rate"></canvas>
+            <div class="mini-ring-center">
+              <div class="mini-ring-pct" id="cache-aligner" style="color:var(--amber)">0%</div>
+              <div class="cache-streak" id="cache-streak"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom row: latency histogram + graph stats + connections -->
+  <div class="bottom-row" style="margin-bottom:18px;">
+    <div class="panel">
+      <div class="panel-title">
+        <div class="panel-title-left"><div class="dot" style="background:var(--pink)"></div>Latency Distribution</div>
+        <div class="panel-badge" id="p99-badge">p99: 0ms</div>
+      </div>
+      <div class="histogram-wrap">
+        <canvas id="chart-histogram" role="img" aria-label="Latency distribution histogram"></canvas>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">
+        <div class="panel-title-left"><div class="dot" style="background:var(--green)"></div>Knowledge Graph</div>
+        <div class="panel-badge" id="graph-badge">live</div>
+      </div>
+      <div class="graph-section">
+        <div class="graph-stats">
+          <div class="graph-stat" data-tip="Active entity nodes in the knowledge graph">
+            <div class="g-val" style="color:var(--primary)" id="graph-nodes">0</div>
+            <div class="g-lbl">Nodes</div>
+          </div>
+          <div class="graph-stat" data-tip="Semantic relationships between entities">
+            <div class="g-val" style="color:var(--accent)" id="graph-edges">0</div>
+            <div class="g-lbl">Edges</div>
+          </div>
+          <div class="graph-stat" data-tip="Source files indexed into the graph">
+            <div class="g-val" style="color:var(--green)" id="graph-files">0</div>
+            <div class="g-lbl">Files</div>
+          </div>
+        </div>
+        <div class="connections-wrap">
+          <canvas class="conn-canvas" id="conn-canvas" aria-label="Animated knowledge graph node visualization"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Activity feed -->
+  <div class="panel feed-panel">
+    <div class="panel-title">
+      <div class="panel-title-left"><div class="dot"></div>Recent Activity</div>
+      <div class="panel-badge" id="feed-count-badge">0 events</div>
+    </div>
+    <div class="feed-tabs">
+      <button class="feed-tab active" data-filter="all">All</button>
+      <button class="feed-tab" data-filter="request">Requests</button>
+      <button class="feed-tab" data-filter="graph_query">Graph</button>
+      <button class="feed-tab" data-filter="vault_open">Vault</button>
+    </div>
+    <div class="feed-scroll">
+      <div id="events-list"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Constants ──
+const PRICE_PER_1K = 0.005;
+const SPARK_POINTS = 40;
+const THROUGHPUT_POINTS = 20;
+const HIST_BINS = 12;
+
+// ── Histories for sparklines/charts ──
+const H = {
+  tokens: [], compression: [], latency: [], throughput: [],
+  latencyBuckets: new Array(HIST_BINS).fill(0),
+  allEvents: [],
+  currentFilter: 'all'
+};
+
+// ── Tooltip ──
+const TT = document.getElementById('tooltip');
+document.querySelectorAll('[data-tip]').forEach(el => {
+  el.addEventListener('mouseenter', e => {
+    TT.textContent = el.dataset.tip;
+    TT.classList.add('visible');
+  });
+  el.addEventListener('mousemove', e => {
+    TT.style.left = (e.clientX + 14) + 'px';
+    TT.style.top  = (e.clientY - 8) + 'px';
+  });
+  el.addEventListener('mouseleave', () => TT.classList.remove('visible'));
+});
+
+// ── Clock ──
+const clockEl = document.getElementById('clock');
+function tickClock() { clockEl.textContent = new Date().toTimeString().slice(0,8); }
+setInterval(tickClock, 1000); tickClock();
+
+// ── Particle system ──
+const pContainer = document.getElementById('particles');
+for (let i = 0; i < 18; i++) {
+  const p = document.createElement('div');
+  p.className = 'particle';
+  const colors = ['var(--primary)', 'var(--accent)', 'var(--green)', 'var(--pink)'];
+  p.style.cssText = `
+    left: ${Math.random()*100}%;
+    animation-duration: ${12 + Math.random()*20}s;
+    animation-delay: ${Math.random()*20}s;
+    background: ${colors[Math.floor(Math.random()*colors.length)]};
+    width: ${1+Math.random()*2}px; height: ${1+Math.random()*2}px;
+  `;
+  pContainer.appendChild(p);
+}
+
+// ── Sparkline factory ──
+function makeSparkline(canvasId, color, fillColor) {
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: new Array(SPARK_POINTS).fill(''),
+      datasets: [{
+        data: new Array(SPARK_POINTS).fill(0),
+        borderColor: color, borderWidth: 2, pointRadius: 0,
+        tension: 0.45, fill: true,
+        backgroundColor: fillColor,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: { duration: 300 },
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: { x: { display: false }, y: { display: false } },
+      elements: { line: { capBezierPoints: true } }
+    }
+  });
+}
+
+const sparkTokens      = makeSparkline('spark-tokens', '#7055ff', 'rgba(112,85,255,0.12)');
+const sparkCompression = makeSparkline('spark-compression', '#00e5a0', 'rgba(0,229,160,0.1)');
+const sparkLatency     = makeSparkline('spark-latency', '#00d4ff', 'rgba(0,212,255,0.1)');
+
+function pushSparkline(chart, val) {
+  const d = chart.data.datasets[0].data;
+  d.push(val); if (d.length > SPARK_POINTS) d.shift();
+  chart.update('none');
+}
+
+// ── Throughput dual-axis chart ──
+const ctxTp = document.getElementById('chart-throughput').getContext('2d');
+const chartThroughput = new Chart(ctxTp, {
+  data: {
+    labels: new Array(THROUGHPUT_POINTS).fill(''),
+    datasets: [
+      {
+        type: 'bar',
+        label: 'Requests',
+        data: new Array(THROUGHPUT_POINTS).fill(0),
+        backgroundColor: 'rgba(112,85,255,0.25)',
+        borderColor: 'rgba(112,85,255,0.6)',
+        borderWidth: 1, borderRadius: 4,
+        yAxisID: 'yReq'
+      },
+      {
+        type: 'line',
+        label: 'Tokens Saved',
+        data: new Array(THROUGHPUT_POINTS).fill(0),
+        borderColor: '#00e5a0', borderWidth: 2.5,
+        pointRadius: 4, pointBackgroundColor: '#00e5a0',
+        pointHoverRadius: 6, tension: 0.4, fill: false,
+        yAxisID: 'yTok'
+      }
+    ]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    animation: { duration: 500 },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: 'rgba(5,5,20,0.95)',
+        titleColor: '#8287a8', bodyColor: '#e8eaff',
+        borderColor: 'rgba(255,255,255,0.12)', borderWidth: 1,
+        padding: 10, cornerRadius: 8
+      }
+    },
+    scales: {
+      x: { display: false },
+      yReq: {
+        type: 'linear', position: 'left', display: true,
+        ticks: { color: '#8287a8', font: { family: "'JetBrains Mono'", size: 11 }, maxTicksLimit: 5 },
+        grid: { color: 'rgba(255,255,255,0.05)' },
+        border: { display: false }
+      },
+      yTok: {
+        type: 'linear', position: 'right', display: true,
+        ticks: { color: '#00e5a0', font: { family: "'JetBrains Mono'", size: 11 }, maxTicksLimit: 5 },
+        grid: { drawOnChartArea: false },
+        border: { display: false }
+      }
+    }
+  }
+});
+
+// ── Token distribution donut ──
+const ctxRing = document.getElementById('chart-ring').getContext('2d');
+const ringColors = ['#00e5a0', '#7055ff', '#00d4ff', 'rgba(255,255,255,0.1)'];
+const chartRing = new Chart(ctxRing, {
+  type: 'doughnut',
+  data: {
+    labels: ['Saved', 'Sent', 'Overhead', 'Unused budget'],
+    datasets: [{
+      data: [0, 60, 5, 35],
+      backgroundColor: ringColors,
+      borderWidth: 0,
+      hoverOffset: 8
+    }]
+  },
+  options: {
+    responsive: false, cutout: '72%',
+    animation: { animateRotate: true, duration: 800 },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: 'rgba(5,5,20,0.95)',
+        titleColor: '#8287a8', bodyColor: '#e8eaff',
+        borderColor: 'rgba(255,255,255,0.12)', borderWidth: 1,
+        padding: 10, cornerRadius: 8,
+        callbacks: { label: ctx => ` ${ctx.label}: ${ctx.parsed.toFixed(1)}%` }
+      }
+    }
+  }
+});
+
+const ringLegendEl = document.getElementById('ring-legend');
+function updateRingLegend(data) {
+  const names = ['Saved', 'Sent', 'Overhead', 'Budget'];
+  ringLegendEl.innerHTML = names.map((n,i) => `
+    <div class="legend-row" title="${n}: ${data[i].toFixed(1)}%">
+      <div class="legend-row-left">
+        <div class="legend-dot" style="background:${ringColors[i]}"></div>
+        <span class="legend-name">${n}</span>
+      </div>
+      <span class="legend-val">${data[i].toFixed(1)}%</span>
+    </div>
+  `).join('');
+}
+updateRingLegend([0, 60, 5, 35]);
+
+// ── Mini cache donut factory ──
+function makeMiniRing(canvasId, color) {
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  return new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      datasets: [{
+        data: [0, 100],
+        backgroundColor: [color, 'rgba(255,255,255,0.06)'],
+        borderWidth: 0, hoverOffset: 0
+      }]
+    },
+    options: {
+      responsive: false, cutout: '68%',
+      animation: { duration: 600 },
+      plugins: { legend: { display: false }, tooltip: { enabled: false } }
+    }
+  });
+}
+
+const ringDedup   = makeMiniRing('ring-dedup',   '#00e5a0');
+const ringRag     = makeMiniRing('ring-rag',     '#00d4ff');
+const ringContent = makeMiniRing('ring-content', '#7055ff');
+const ringAligner = makeMiniRing('ring-aligner', '#ffb340');
+
+function setMiniRing(chart, pct) {
+  chart.data.datasets[0].data = [pct, Math.max(0, 100-pct)];
+  chart.update('none');
+}
+
+// ── Latency histogram ──
+const ctxHist = document.getElementById('chart-histogram').getContext('2d');
+const HIST_LABELS = ['<5','5-10','10-20','20-30','30-40','40-50','50-70','70-100','100-150','150-200','200-300','>300'];
+const chartHist = new Chart(ctxHist, {
+  type: 'bar',
+  data: {
+    labels: HIST_LABELS,
+    datasets: [{
+      label: 'Requests',
+      data: new Array(HIST_BINS).fill(0),
+      backgroundColor: HIST_LABELS.map((_,i) => {
+        if (i < 5) return 'rgba(0,229,160,0.55)';
+        if (i < 8) return 'rgba(255,179,64,0.55)';
+        return 'rgba(255,94,87,0.55)';
+      }),
+      borderColor: HIST_LABELS.map((_,i) => {
+        if (i < 5) return '#00e5a0';
+        if (i < 8) return '#ffb340';
+        return '#ff5e57';
+      }),
+      borderWidth: 1, borderRadius: 3
+    }]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    animation: { duration: 400 },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: 'rgba(5,5,20,0.95)',
+        titleColor: '#8287a8', bodyColor: '#e8eaff',
+        borderColor: 'rgba(255,255,255,0.12)', borderWidth: 1,
+        padding: 10, cornerRadius: 8,
+        callbacks: { label: ctx => ` ${ctx.parsed.y} requests` }
+      }
+    },
+    scales: {
+      x: {
+        ticks: { color: '#4a4f68', font: { family: "'JetBrains Mono'", size: 10 }, maxRotation: 45 },
+        grid: { display: false }, border: { display: false }
+      },
+      y: {
+        ticks: { color: '#8287a8', font: { family: "'JetBrains Mono'", size: 11 }, maxTicksLimit: 4 },
+        grid: { color: 'rgba(255,255,255,0.05)' }, border: { display: false }
+      }
+    }
+  }
+});
+
+// ── Knowledge graph canvas animation ──
+const connCanvas = document.getElementById('conn-canvas');
+const connCtx = connCanvas.getContext('2d');
+let graphNodes = [];
+
+function initGraphNodes(count) {
+  graphNodes = [];
+  const w = connCanvas.width, h = connCanvas.height;
+  for (let i = 0; i < Math.min(count, 30); i++) {
+    graphNodes.push({
+      x: 20 + Math.random() * (w-40),
+      y: 10 + Math.random() * (h-20),
+      vx: (Math.random()-0.5)*0.4,
+      vy: (Math.random()-0.5)*0.4,
+      r: 2.5 + Math.random()*2.5,
+      color: ['#7055ff','#00d4ff','#00e5a0','#ffb340','#ff3cac'][Math.floor(Math.random()*5)],
+      pulse: Math.random()*Math.PI*2
+    });
+  }
+}
+
+function drawGraph() {
+  const w = connCanvas.width, h = connCanvas.height;
+  connCtx.clearRect(0,0,w,h);
+
+  // Move nodes
+  graphNodes.forEach(n => {
+    n.x += n.vx; n.y += n.vy;
+    n.pulse += 0.04;
+    if (n.x < 10 || n.x > w-10) n.vx *= -1;
+    if (n.y < 5 || n.y > h-5) n.vy *= -1;
+  });
+
+  // Draw edges
+  const LINK_DIST = 80;
+  for (let i = 0; i < graphNodes.length; i++) {
+    for (let j = i+1; j < graphNodes.length; j++) {
+      const a = graphNodes[i], b = graphNodes[j];
+      const dx = a.x-b.x, dy = a.y-b.y;
+      const dist = Math.sqrt(dx*dx+dy*dy);
+      if (dist < LINK_DIST) {
+        connCtx.beginPath();
+        connCtx.moveTo(a.x, a.y);
+        connCtx.lineTo(b.x, b.y);
+        connCtx.strokeStyle = `rgba(112,85,255,${0.4*(1-dist/LINK_DIST)})`;
+        connCtx.lineWidth = 0.8;
+        connCtx.stroke();
+      }
+    }
+  }
+
+  // Draw nodes
+  graphNodes.forEach(n => {
+    const pulse = 0.85 + 0.15*Math.sin(n.pulse);
+    connCtx.beginPath();
+    connCtx.arc(n.x, n.y, n.r * pulse, 0, Math.PI*2);
+    connCtx.fillStyle = n.color;
+    connCtx.shadowColor = n.color;
+    connCtx.shadowBlur = 6;
+    connCtx.fill();
+    connCtx.shadowBlur = 0;
+  });
+
+  requestAnimationFrame(drawGraph);
+}
+
+function resizeConnCanvas() {
+  const parent = connCanvas.parentElement;
+  connCanvas.width = parent.clientWidth;
+  connCanvas.height = parent.clientHeight;
+}
+resizeConnCanvas();
+window.addEventListener('resize', () => { resizeConnCanvas(); });
+initGraphNodes(12);
+drawGraph();
+
+// ── Feed filter tabs ──
+document.querySelectorAll('.feed-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.feed-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    H.currentFilter = tab.dataset.filter;
+    renderFeed();
+  });
+});
+
+function renderFeed() {
+  const eventsEl = document.getElementById('events-list');
+  const events = H.currentFilter === 'all'
+    ? H.allEvents
+    : H.allEvents.filter(e => e.type === H.currentFilter);
+
+  document.getElementById('feed-count-badge').textContent = `${events.length} events`;
+
+  if (!events.length) {
+    eventsEl.innerHTML = `<div style="text-align:center;padding:32px;color:var(--text-faint);font-size:0.82rem;">No events yet</div>`;
+    return;
+  }
+
+  eventsEl.innerHTML = events.slice(0, 50).map(e => {
+    let icon = '⚡', desc = '', meta = '', metaCls = '';
+    if (e.type === 'request') {
+      icon = '⚡';
+      desc = `Request compressed`;
+      meta = `${fmtN(e.tokensSaved)} tok · ${e.compressionRatio.toFixed(0)}%`;
+      metaCls = 'green';
+    } else if (e.type === 'graph_query') {
+      icon = '🗺️';
+      desc = `Graph: ${e.queryType}("${e.target}")`;
+      metaCls = '';
+    } else if (e.type === 'vault_open') {
+      icon = '📦';
+      desc = `Vault opened: ${e.vaultId}`;
+      meta = `${fmtN(e.chars)} chars`;
+      metaCls = 'accent';
+    }
+    return `
+      <div class="feed-row ${e.type}">
+        <span class="feed-time">${fmtTime(e.at)}</span>
+        <span class="feed-icon">${icon}</span>
+        <span class="feed-desc">${desc}</span>
+        <span class="feed-meta ${metaCls}">${meta}</span>
+      </div>
+    `;
+  }).join('');
+}
+
+// ── Helpers ──
+function fmtN(n, d=0) { return Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}); }
+function fmtTime(ts) { return new Date(ts).toTimeString().slice(0,8); }
+
+// ── Smooth counter animation ──
+function animateCounter(el, target, prefix='', suffix='', decimals=0) {
+  const cur = parseFloat(el.dataset.cur || '0');
+  const step = (target - cur) / 12;
+  el.dataset.cur = String(target);
+  let v = cur;
+  let t = 0;
+  const tick = () => {
+    v += step; t++;
+    el.textContent = prefix + fmtN(Math.round(v), decimals) + suffix;
+    if (t < 12) requestAnimationFrame(tick);
+    else el.textContent = prefix + fmtN(target, decimals) + suffix;
+  };
+  requestAnimationFrame(tick);
+}
+
+// ── Latency bucket helper ──
+function latencyBucket(ms) {
+  const thresholds = [5,10,20,30,40,50,70,100,150,200,300];
+  for (let i=0;i<thresholds.length;i++) if (ms < thresholds[i]) return i;
+  return HIST_BINS-1;
+}
+
+// ── Main update function (called from SSE or simulation) ──
+function update(snapshot) {
+  const { session, stages, cache, graph, recentEvents } = snapshot;
+
+  document.getElementById('status').textContent = 'LIVE · STREAMING';
+  document.getElementById('status').style.color = 'var(--green)';
+
+  // Hero
+  animateCounter(document.getElementById('tokens-saved'), session.tokensSaved);
+  document.getElementById('dollar-saved').textContent =
+    '$' + (session.tokensSaved / 1000 * PRICE_PER_1K).toFixed(3) + ' saved';
+  document.getElementById('compression-ratio').textContent =
+    session.avgCompressionRatio.toFixed(1) + '%';
+  document.getElementById('total-requests').textContent =
+    fmtN(session.totalRequests) + ' requests processed';
+  document.getElementById('avg-pipeline').textContent =
+    session.avgPipelineLatency.toFixed(0) + 'ms';
+  document.getElementById('avg-upstream').textContent =
+    session.avgUpstreamLatency.toFixed(0) + 'ms LLM inference';
+
+  // Sparklines
+  pushSparkline(sparkTokens, session.tokensSaved);
+  pushSparkline(sparkCompression, session.avgCompressionRatio);
+  pushSparkline(sparkLatency, session.avgPipelineLatency);
+
+  // Throughput chart — push new bar
+  const tpData0 = chartThroughput.data.datasets[0].data;
+  const tpData1 = chartThroughput.data.datasets[1].data;
+  tpData0.push(session.totalRequests - (H.lastReqCount||0));
+  tpData1.push(session.tokensSaved - (H.lastTokensSaved||0));
+  if (tpData0.length > THROUGHPUT_POINTS) { tpData0.shift(); tpData1.shift(); }
+  H.lastReqCount = session.totalRequests;
+  H.lastTokensSaved = session.tokensSaved;
+  chartThroughput.update('none');
+  document.getElementById('rps-badge').textContent =
+    (tpData0.slice(-6).reduce((a,b)=>a+b,0)/6).toFixed(1) + ' req/min';
+
+  // Ring donut
+  const s = session.avgCompressionRatio;
+  const sent = Math.max(0, 80-s);
+  const overhead = 3;
+  const budget = Math.max(0, 17-overhead);
+  const ringData = [s, sent, overhead, budget];
+  chartRing.data.datasets[0].data = ringData;
+  chartRing.update('none');
+  document.getElementById('ring-big').textContent = s.toFixed(1) + '%';
+  updateRingLegend(ringData);
+
+  // Graph
+  animateCounter(document.getElementById('graph-nodes'), graph.nodes);
+  animateCounter(document.getElementById('graph-edges'), graph.edges);
+  animateCounter(document.getElementById('graph-files'), graph.files);
+  if (graphNodes.length < Math.min(graph.nodes, 30)) {
+    initGraphNodes(Math.min(graph.nodes, 30));
+  }
+
+  // Stages waterfall
+  const stagesEl = document.getElementById('stages-list');
+  const entries = Object.entries(stages)
+    .filter(([,s]) => s.lastMs > 0.3)
+    .sort((a,b) => b[1].lastMs - a[1].lastMs);
+  const maxMs = Math.max(...entries.map(([,s])=>s.lastMs), 1);
+  const totalMs = entries.reduce((a,[,s])=>a+s.lastMs,0);
+  document.getElementById('total-time-badge').textContent = totalMs.toFixed(1) + 'ms total';
+  stagesEl.innerHTML = entries.map(([name,s]) => {
+    const cls = s.lastMs > 50 ? 'danger' : s.lastMs > 20 ? 'slow' : '';
+    const pct = (s.lastMs / maxMs) * 100;
+    return `
+      <div class="stage-row" data-tip="${name}: ${s.lastMs.toFixed(2)}ms">
+        <span class="stage-name">${name}</span>
+        <div class="stage-bar-wrap"><div class="stage-bar-fill ${cls}" style="width:${pct}%"></div></div>
+        <span class="stage-ms ${cls}">${s.lastMs.toFixed(1)}ms</span>
+      </div>
+    `;
+  }).join('');
+
+  // Re-attach tooltip on stage rows
+  document.querySelectorAll('.stage-row[data-tip]').forEach(el => {
+    el.addEventListener('mouseenter', () => { TT.textContent = el.dataset.tip; TT.classList.add('visible'); });
+    el.addEventListener('mousemove', e => { TT.style.left=(e.clientX+14)+'px'; TT.style.top=(e.clientY-8)+'px'; });
+    el.addEventListener('mouseleave', () => TT.classList.remove('visible'));
+  });
+
+  // Cache rings
+  const setCache = (id, ringChart, rate, cls='') => {
+    const el = document.getElementById(id);
+    el.textContent = rate.toFixed(0) + '%';
+    setMiniRing(ringChart, rate);
+  };
+  setCache('cache-dedup',    ringDedup,   cache.semanticDedup.rate);
+  setCache('cache-rag',      ringRag,     cache.ragRetrieval.rate);
+  setCache('cache-content',  ringContent, cache.contentDetector.rate);
+  setCache('cache-aligner',  ringAligner, cache.cacheAligner.rate);
+  const streak = cache.cacheAligner.streak||0;
+  document.getElementById('cache-streak').textContent = streak > 0 ? `×${streak}` : '';
+
+  // Latency histogram
+  if (recentEvents.length) {
+    recentEvents.filter(e=>e.type==='request').forEach(e => {
+      if (e.latencyMs) H.latencyBuckets[latencyBucket(e.latencyMs)]++;
+    });
+    chartHist.data.datasets[0].data = [...H.latencyBuckets];
+    chartHist.update('none');
+    const sorted = H.allEvents
+      .filter(e=>e.type==='request' && e.latencyMs)
+      .map(e=>e.latencyMs).sort((a,b)=>a-b);
+    if (sorted.length) {
+      const p99 = sorted[Math.floor(sorted.length*0.99)] || sorted[sorted.length-1];
+      document.getElementById('p99-badge').textContent = `p99: ${p99.toFixed(0)}ms`;
+    }
+  }
+
+  // Feed
+  H.allEvents = [...recentEvents, ...H.allEvents].slice(0, 200);
+  renderFeed();
+}
+
+// ── Connect to SSE ──
+const es = new EventSource('/v1/stats/stream');
+es.addEventListener('snapshot', e => {
+  update(JSON.parse(e.data));
+});
+es.onerror = () => {
+  document.getElementById('status').textContent = 'DISCONNECTED · RETRYING...';
+  document.getElementById('status').style.color = 'var(--red)';
+};
+
+// ── Simulation (runs only when SSE has no data — demo mode) ──
+let simRunning = false;
+const SIM = {
+  totalRequests: 0, tokensSaved: 0, lastTokens: 0,
+  dedup: 0, rag: 0, content: 0, aligner: 0, streak: 0,
+  nodes: 40, edges: 120, files: 18, rng: () => Math.random()
+};
+
+function simTick() {
+  const r = SIM.rng;
+  const newReqs = Math.floor(1 + r()*3);
+  SIM.totalRequests += newReqs;
+  const tokensBatch = newReqs * (800 + r()*2400);
+  SIM.tokensSaved += tokensBatch * (0.2 + r()*0.5);
+  SIM.dedup    = Math.min(95, SIM.dedup + (r()-0.35)*4);
+  SIM.rag      = Math.min(95, SIM.rag + (r()-0.3)*3);
+  SIM.content  = Math.min(98, SIM.content + (r()-0.25)*2);
+  SIM.aligner  = Math.min(90, SIM.aligner + (r()-0.38)*5);
+  SIM.nodes   += Math.floor(r()*2);
+  SIM.edges   += Math.floor(r()*4);
+  SIM.files   += r() > 0.92 ? 1 : 0;
+  SIM.streak   = r() > 0.7 ? SIM.streak+1 : 0;
+
+  const latencies = { 'Dedup Check':3+r()*8, 'BM25 Sparse':8+r()*18, 'HNSW Dense':12+r()*30, 'TF-IDF Compress':6+r()*14, 'Cache Align':2+r()*6, 'Content Detect':4+r()*10, 'Normalise':1+r()*3, 'SSE Encode':0.5+r()*1.5 };
+  const events = [];
+  for (let i=0;i<newReqs;i++) {
+    const ratio = 20+r()*55;
+    const saved = 500+r()*3000;
+    events.push({ type:'request', at:Date.now()-i*1200, tokensSaved:saved, compressionRatio:ratio, latencyMs: 8+r()*80 });
+  }
+  if (r()>0.6) events.push({ type:'graph_query', at:Date.now(), queryType:['findSimilar','getRelated','expandContext'][Math.floor(r()*3)], target:['auth.ts','index.ts','cache.js','retriever.h'][Math.floor(r()*4)] });
+  if (r()>0.85) events.push({ type:'vault_open', at:Date.now(), vaultId:`vault_${Math.floor(r()*99)}`, chars:1200+Math.floor(r()*8000) });
+
+  update({
+    session: {
+      tokensSaved: Math.round(SIM.tokensSaved),
+      avgCompressionRatio: Math.max(5, Math.min(80, SIM.tokensSaved/Math.max(1,SIM.totalRequests)/20)),
+      totalRequests: SIM.totalRequests,
+      avgPipelineLatency: 18+r()*22,
+      avgUpstreamLatency: 280+r()*400,
+    },
+    stages: Object.fromEntries(Object.entries(latencies).map(([k,v])=>[k,{lastMs:v}])),
+    cache: {
+      semanticDedup:   { rate: Math.max(0,SIM.dedup),   streak:0 },
+      ragRetrieval:    { rate: Math.max(0,SIM.rag),     streak:0 },
+      contentDetector: { rate: Math.max(0,SIM.content), streak:0 },
+      cacheAligner:    { rate: Math.max(0,SIM.aligner), streak:SIM.streak },
+    },
+    graph: { nodes:SIM.nodes, edges:SIM.edges, files:SIM.files },
+    recentEvents: events
+  });
+}
+
+// Wait briefly for SSE, fall back to sim
+setTimeout(() => {
+  if (!simRunning && document.getElementById('status').textContent === 'CONNECTING...') {
+    simRunning = true;
+    simTick();
+    setInterval(simTick, 1800);
+  }
+}, 2000);
+</script>
+</body>
+</html>

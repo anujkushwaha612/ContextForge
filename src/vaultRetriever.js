@@ -7,6 +7,7 @@ import {
   fetchNeighborChunks,
   fetchFromVault,
 } from "./logging/cacheDb.js";
+import { statsEmitter } from "./proxy/statsEmitter.js";
 
 export async function retrieveFromVault(
   vaultId,
@@ -15,29 +16,23 @@ export async function retrieveFromVault(
   semanticCache,
   hybridRetriever,
 ) {
-  // ==========================================
-  // QUERY EXPANSION: Extract context from recent messages
-  // ==========================================
   let expandedQuery = searchQuery || "";
 
   if (messages && Array.isArray(messages) && messages.length > 0) {
-    // Extract last 3 user/assistant messages for context
     const recentContext = messages
       .slice(-3)
       .filter((m) => m.role === "user" || m.role === "assistant")
       .map((m) => (typeof m.content === "string" ? m.content : ""))
       .filter((c) => c.length > 0)
       .join(" ")
-      .slice(0, 200); // Cap at 200 chars
+      .slice(0, 200);
 
     if (recentContext && !expandedQuery.includes(recentContext)) {
       expandedQuery = `${searchQuery || ""} ${recentContext}`.trim();
     }
   }
 
-  // ==========================================
-  // TIER 1: HYBRID SEARCH (Dense + Sparse)
-  // ==========================================
+  // ── TIER 1: HYBRID SEARCH ──
   if (hybridRetriever && expandedQuery) {
     try {
       const queryEmbedding = await getEmbedder().embed(expandedQuery);
@@ -73,7 +68,6 @@ export async function retrieveFromVault(
                   `  - ${result.id}: dense=${result.denseScore.toFixed(3)}, sparse=${result.sparseScore.toFixed(3)}`,
                 );
 
-                // ✅ Use semanticCache for direct HNSW fallback on neighbors
                 let neighborContext = "";
                 if (semanticCache) {
                   const neighbors = await fetchNeighborChunks(
@@ -98,14 +92,14 @@ export async function retrieveFromVault(
               }
             }
 
-            return contextPieces.join("\n" + "=".repeat(50) + "\n");
+            const text = contextPieces.join("\n" + "=".repeat(50) + "\n");
+            // ── Hook: Tier 1 hit ──
+            statsEmitter.recordCacheHit("ragRetrieval", true);
+            statsEmitter.recordVaultRetrieval(vaultId, text.length);
+            return text;
           }
 
           // ── Tier 1b: HNSW hit but DB chunk lookup missed ──
-          // The index found relevant results but fetchChunksByIds came back empty
-          // (chunk IDs in HNSW don't match DB yet — e.g. freshly indexed content).
-          // Return the raw text snippets from the HNSW results directly
-          // instead of falling through to the full-vault Tier 3 dump.
           if (results.some((r) => r.text)) {
             const fallbackPieces = results
               .filter((r) => r.text)
@@ -117,24 +111,29 @@ export async function retrieveFromVault(
               console.log(
                 `[Hybrid RAG] ⚡ Tier 1b: returning ${fallbackPieces.length} HNSW text snippets (DB chunk miss)`,
               );
-              return fallbackPieces.join("\n" + "=".repeat(50) + "\n");
+              const text = fallbackPieces.join("\n" + "=".repeat(50) + "\n");
+              // ── Hook: Tier 1b partial hit ──
+              statsEmitter.recordCacheHit("ragRetrieval", true);
+              statsEmitter.recordVaultRetrieval(vaultId, text.length);
+              return text;
             }
           }
 
-          // HNSW results have no text at all — log and fall through
           console.warn(
             `[Hybrid RAG] ⚠️ HNSW found ${results.length} chunks but DB+text lookup both missed — skipping to Tier 2`,
           );
+        } else {
+          // ── Hook: Tier 1 miss — no results from hybrid search ──
+          statsEmitter.recordCacheHit("ragRetrieval", false);
         }
       }
     } catch (err) {
       console.warn(`[Hybrid RAG] ⚠️ Search failed: ${err.message}`);
+      statsEmitter.recordCacheHit("ragRetrieval", false);
     }
   }
 
-  // ==========================================
-  // TIER 2: DIRECT HNSW SEARCH (fallback)
-  // ==========================================
+  // ── TIER 2: DIRECT HNSW SEARCH ──
   if (semanticCache && searchQuery) {
     try {
       const queryEmbedding = await getEmbedder().embed(searchQuery);
@@ -143,7 +142,12 @@ export async function retrieveFromVault(
         if (directHit) {
           console.log(`[Hybrid RAG] 📦 Direct HNSW hit: ${directHit}`);
           const cachedText = await fetchFromCache(directHit);
-          if (cachedText) return cachedText;
+          if (cachedText) {
+            // ── Hook: Tier 2 hit ──
+            statsEmitter.recordCacheHit("ragRetrieval", true);
+            statsEmitter.recordVaultRetrieval(vaultId, cachedText.length);
+            return cachedText;
+          }
         }
       }
     } catch (e) {
@@ -151,15 +155,17 @@ export async function retrieveFromVault(
     }
   }
 
-  // ==========================================
-  // TIER 3: FULL VAULT RETRIEVAL (no search query)
-  // ==========================================
+  // ── TIER 3: FULL VAULT RETRIEVAL ──
   if (vaultId) {
     try {
       const concatenated = await fetchVaultTextConcatenated(vaultId);
       if (concatenated) {
         console.log(`[Hybrid RAG] 📦 Retrieved full vault: ${vaultId}`);
-        return `[Vault ${vaultId}]\n\n${concatenated}`;
+        const text = `[Vault ${vaultId}]\n\n${concatenated}`;
+        // ── Hook: Tier 3 full vault ──
+        statsEmitter.recordCacheHit("ragRetrieval", false); // not a cache hit — full fallback
+        statsEmitter.recordVaultRetrieval(vaultId, text.length);
+        return text;
       }
     } catch (e) {
       // Fall through
@@ -168,16 +174,25 @@ export async function retrieveFromVault(
     const rawVault = await fetchFromVault(vaultId);
     if (rawVault) {
       console.log(`[Hybrid RAG] 📦 Raw vault: ${vaultId}`);
-      return `[Vault ${vaultId}]\n\n${rawVault}`;
+      const text = `[Vault ${vaultId}]\n\n${rawVault}`;
+      // ── Hook: Tier 3 raw vault ──
+      statsEmitter.recordCacheHit("ragRetrieval", false);
+      statsEmitter.recordVaultRetrieval(vaultId, text.length);
+      return text;
     }
 
     const cachedResponse = await fetchFromCache(vaultId);
     if (cachedResponse) {
       console.log(`[Hybrid RAG] 📦 Cache: ${vaultId}`);
+      // ── Hook: Tier 3 cache fallback ──
+      statsEmitter.recordCacheHit("ragRetrieval", true);
+      statsEmitter.recordVaultRetrieval(vaultId, cachedResponse.length);
       return cachedResponse;
     }
   }
 
   console.log(`[Hybrid RAG] ❌ Vault ${vaultId} not found`);
+  // ── Hook: total miss ──
+  statsEmitter.recordCacheHit("ragRetrieval", false);
   return null;
 }

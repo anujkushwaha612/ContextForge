@@ -8,7 +8,6 @@
  *                                    the loaded GloVe table)
  *   HybridRetriever              → BM25 fallback when no embedding match
  *
- * Headroom analog: memory_handler.py + memory_ranker.py + memory_injection.py
  */
 
 import crypto from "node:crypto";
@@ -20,7 +19,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─────────────────────────────────────────────
 // RecencyBoostRanker
-// Port of headroom/proxy/memory_ranker.py
 // score_final = cosine × exp(-age_days / decay_days)
 // ─────────────────────────────────────────────
 
@@ -267,7 +265,6 @@ export class MemoryHandler {
 
   // ─────────────────────────────────────────────
   // Append context to latest user message tail
-  // Port of headroom's _append_to_latest_user_tail()
   // Invariant: never mutates system prompt / frozen prefix
   // ─────────────────────────────────────────────
 

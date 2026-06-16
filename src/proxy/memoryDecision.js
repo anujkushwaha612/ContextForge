@@ -1,7 +1,6 @@
 /**
  * MemoryDecision — canonical "should we inject memory context?" gate.
  *
- * Port of headroom/proxy/memory_decision.py
  *
  * Decision-only: gates whether the request bytes get mutated
  * (memory context injected). Does NOT gate background memory storage —

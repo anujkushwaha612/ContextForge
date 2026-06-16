@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { statsEmitter } from "../proxy/statsEmitter.js";
 
 // ─────────────────────────────────────────────
 // Dynamic content patterns
@@ -279,6 +280,12 @@ export function alignCachePrefix(payload) {
     `Dynamic: ${dynamicTokens} tokens | ` +
     `Streak: ${_consecutiveHits} | ` +
     `Hit rate: ${hitRate}%`,
+  );
+
+  // ── Dashboard hook ──
+  statsEmitter.recordCacheAlignStreak(
+    _consecutiveHits,
+    parseFloat(hitRate),
   );
 
   return { ...payload, messages: alignedMessages };

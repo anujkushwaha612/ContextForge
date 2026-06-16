@@ -11,8 +11,9 @@
  *   - Ignores: node_modules, .git, build/, dist/, native/build/
  */
 
-import fs   from "node:fs";
+import fs from "node:fs";
 import path from "node:path";
+import { statsEmitter } from "../proxy/statsEmitter.js";
 
 import { extractSymbols, getLanguageForFile } from "./symbolExtractor.js";
 import {
@@ -37,18 +38,18 @@ const IGNORE_DIRS = new Set([
   "coverage",
   "__pycache__",
   ".pytest_cache",
-  "target",          // Rust build output
-  "vendor",          // Go vendor
-  "native/build",    // Your compiled native modules
-  "models",          // ONNX models — binary, not source
+  "target", // Rust build output
+  "vendor", // Go vendor
+  "native/build", // Your compiled native modules
+  "models", // ONNX models — binary, not source
 ]);
 
 const IGNORE_PATTERNS = [
-  /\.min\.(js|css)$/,    // minified files
+  /\.min\.(js|css)$/, // minified files
   /\.bundle\.js$/,
-  /\.d\.ts$/,            // TypeScript declaration files (auto-generated)
-  /\.map$/,              // source maps
-  /\.lock$/,             // lockfiles
+  /\.d\.ts$/, // TypeScript declaration files (auto-generated)
+  /\.map$/, // source maps
+  /\.lock$/, // lockfiles
 ];
 
 // ─────────────────────────────────────────────
@@ -105,7 +106,7 @@ function* walkDirectory(rootDir) {
  */
 function buildIndexedFileMap() {
   const indexed = getAllIndexedFiles();
-  const map     = new Map();
+  const map = new Map();
   for (const row of indexed) {
     map.set(row.file_path, row.last_modified);
   }
@@ -179,7 +180,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
       // Write to graph.db
       writeFileGraph({
         filePath,
-        language:     getLanguageForFile(filePath)?.language || "unknown",
+        language: getLanguageForFile(filePath)?.language || "unknown",
         lastModified: mtime,
         nodes,
         edges,
@@ -190,8 +191,8 @@ export async function indexWorkspace(workspacePath, options = {}) {
       if (onProgress && i % 10 === 0) {
         onProgress({
           current: i + 1,
-          total:   stats.total,
-          file:    path.relative(workspacePath, filePath),
+          total: stats.total,
+          file: path.relative(workspacePath, filePath),
           ...stats,
         });
       }
@@ -200,12 +201,13 @@ export async function indexWorkspace(workspacePath, options = {}) {
       if (i % 5 === 0) {
         await new Promise((resolve) => setImmediate(resolve));
       }
-
     } catch (err) {
       stats.errors++;
       // Don't crash the mapper on individual file errors
       if (process.env.CF_DEBUG_GRAPH === "1") {
-        console.warn(`[GraphMapper] ⚠️ Failed to index ${filePath}: ${err.message}`);
+        console.warn(
+          `[GraphMapper] ⚠️ Failed to index ${filePath}: ${err.message}`,
+        );
       }
     }
   }
@@ -215,9 +217,16 @@ export async function indexWorkspace(workspacePath, options = {}) {
 
   console.log(
     `[GraphMapper] ✅ Index complete in ${elapsed}ms | ` +
-    `Files: ${stats.indexed} indexed, ${stats.skipped} skipped, ${stats.errors} errors | ` +
-    `Graph: ${graphStats.node_count} nodes, ${graphStats.edge_count} edges`,
+      `Files: ${stats.indexed} indexed, ${stats.skipped} skipped, ${stats.errors} errors | ` +
+      `Graph: ${graphStats.node_count} nodes, ${graphStats.edge_count} edges`,
   );
+
+  // ── Dashboard hook ──
+  statsEmitter.updateGraphStats({
+    nodes: graphStats.node_count,
+    edges: graphStats.edge_count,
+    files: stats.indexed + stats.skipped,
+  });
 
   return stats;
 }
@@ -232,7 +241,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
 export function watchWorkspace(workspacePath) {
   // Debounce — collect changes for 500ms before re-indexing
   const pendingFiles = new Set();
-  let debounceTimer  = null;
+  let debounceTimer = null;
 
   const processChanges = async () => {
     const files = [...pendingFiles];
@@ -242,7 +251,7 @@ export function watchWorkspace(workspacePath) {
       if (!getLanguageForFile(filePath)) continue;
 
       try {
-        const stat   = fs.statSync(filePath);
+        const stat = fs.statSync(filePath);
         const source = fs.readFileSync(filePath, "utf-8");
         const { nodes, edges } = extractSymbols(source, filePath);
 
@@ -256,26 +265,41 @@ export function watchWorkspace(workspacePath) {
 
         console.log(
           `[GraphMapper] 🔄 Re-indexed: ${path.relative(workspacePath, filePath)} ` +
-          `(${nodes.length} nodes, ${edges.length} edges)`,
+            `(${nodes.length} nodes, ${edges.length} edges)`,
         );
+        // ── Dashboard hook — update graph stats after each file change ──
+        try {
+          const updated = getGraphStats();
+          statsEmitter.updateGraphStats({
+            nodes: updated.node_count,
+            edges: updated.edge_count,
+            files: updated.file_count,
+          });
+        } catch {
+          // Non-critical — don't crash the watcher
+        }
       } catch {
         // File deleted or permission error — ignore
       }
     }
   };
 
-  const watcher = fs.watch(workspacePath, { recursive: true }, (event, filename) => {
-    if (!filename) return;
-    const fullPath = path.join(workspacePath, filename).replace(/\\/g, "/");
+  const watcher = fs.watch(
+    workspacePath,
+    { recursive: true },
+    (event, filename) => {
+      if (!filename) return;
+      const fullPath = path.join(workspacePath, filename).replace(/\\/g, "/");
 
-    // Skip ignored paths
-    if ([...IGNORE_DIRS].some((d) => fullPath.includes(d))) return;
+      // Skip ignored paths
+      if ([...IGNORE_DIRS].some((d) => fullPath.includes(d))) return;
 
-    pendingFiles.add(fullPath);
+      pendingFiles.add(fullPath);
 
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(processChanges, 500);
-  });
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(processChanges, 500);
+    },
+  );
 
   console.log(`[GraphMapper] 👁️  Watching: ${workspacePath}`);
 

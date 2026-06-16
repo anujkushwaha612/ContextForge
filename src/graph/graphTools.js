@@ -22,6 +22,7 @@ import {
   queryWhoDependsOnFile,
   getGraphStats,
 } from "./graphDb.js";
+import { statsEmitter } from "../proxy/statsEmitter.js";
 
 export const GRAPH_TOOL_NAME = "contextforge_query_graph";
 
@@ -123,19 +124,22 @@ export function executeGraphQuery(queryType, target) {
   const cleanTarget = target.trim();
 
   try {
+    let result;
+
     switch (queryType) {
       case "who_imports_this": {
         const rows = queryWhoImportsThis(cleanTarget);
         if (rows.length === 0) {
-          return JSON.stringify({
+          result = JSON.stringify({
             symbol: cleanTarget,
             result: "not_found",
             message:
               `No files import '${cleanTarget}'. ` +
               `It may be internal-only or not yet indexed.`,
           });
+          break;
         }
-        return JSON.stringify(
+        result = JSON.stringify(
           {
             symbol: cleanTarget,
             imported_by: rows.map((r) => ({
@@ -147,20 +151,22 @@ export function executeGraphQuery(queryType, target) {
           null,
           2,
         );
+        break;
       }
 
       case "what_does_this_export": {
         const rows = queryWhatDoesThisExport(cleanTarget);
         if (rows.length === 0) {
-          return JSON.stringify({
+          result = JSON.stringify({
             file: cleanTarget,
             result: "not_found",
             message:
               `No exports found for '${cleanTarget}'. ` +
               `Check the file path or run a graph re-index.`,
           });
+          break;
         }
-        return JSON.stringify(
+        result = JSON.stringify(
           {
             file: cleanTarget,
             exports: rows.map((r) => ({
@@ -175,18 +181,20 @@ export function executeGraphQuery(queryType, target) {
           null,
           2,
         );
+        break;
       }
 
       case "find_symbol": {
         const rows = queryFindSymbol(cleanTarget);
         if (rows.length === 0) {
-          return JSON.stringify({
+          result = JSON.stringify({
             symbol: cleanTarget,
             result: "not_found",
             message: `Symbol '${cleanTarget}' not found in the graph index.`,
           });
+          break;
         }
-        return JSON.stringify(
+        result = JSON.stringify(
           {
             symbol: cleanTarget,
             definitions: rows.map((r) => ({
@@ -195,25 +203,27 @@ export function executeGraphQuery(queryType, target) {
               start_line: r.start_line,
               end_line: r.end_line,
               complexity: r.complexity,
-              body: r.body_text || null, // ← full function body
+              body: r.body_text || null,
             })),
             count: rows.length,
           },
           null,
           2,
         );
+        break;
       }
 
       case "what_does_this_import": {
         const rows = queryWhatDoesThisImport(cleanTarget);
         if (rows.length === 0) {
-          return JSON.stringify({
+          result = JSON.stringify({
             file: cleanTarget,
             result: "not_found",
             message: `No imports found for '${cleanTarget}'.`,
           });
+          break;
         }
-        return JSON.stringify(
+        result = JSON.stringify(
           {
             file: cleanTarget,
             imports: rows.map((r) => ({
@@ -225,18 +235,20 @@ export function executeGraphQuery(queryType, target) {
           null,
           2,
         );
+        break;
       }
 
       case "who_depends_on_file": {
         const rows = queryWhoDependsOnFile(cleanTarget);
         if (rows.length === 0) {
-          return JSON.stringify({
+          result = JSON.stringify({
             file: cleanTarget,
             result: "no_dependents",
             message: `No files import from '${cleanTarget}'.`,
           });
+          break;
         }
-        return JSON.stringify(
+        result = JSON.stringify(
           {
             file: cleanTarget,
             dependents: rows.map((r) => r.source_file),
@@ -245,10 +257,11 @@ export function executeGraphQuery(queryType, target) {
           null,
           2,
         );
+        break;
       }
 
       default:
-        return JSON.stringify({
+        result = JSON.stringify({
           error: "unknown_query_type",
           query_type: queryType,
           valid_types: [
@@ -260,6 +273,11 @@ export function executeGraphQuery(queryType, target) {
           ],
         });
     }
+
+    // ── Dashboard hook — fires after every successful query ──
+    statsEmitter.recordGraphQuery(queryType, cleanTarget);
+
+    return result;
   } catch (err) {
     console.error(`[GraphQuery] ❌ Query failed: ${err.message}`);
     return JSON.stringify({

@@ -1,7 +1,6 @@
 /**
  * Durable savings tracking with per-model pricing and historical rollups.
  *
- * Port of headroom/proxy/savings_tracker.py
  *
  * Improvements over your current logRequest():
  * - Atomic writes (crash-safe temp file rename)
