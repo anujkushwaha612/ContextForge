@@ -7,17 +7,16 @@
 
 // ==========================================
 // NODE.JS BINDING INITIALIZATION
-// DefineClass MUST live inside Init() where Napi::Env is in scope
 // ==========================================
 Napi::Object HybridRetriever::Init(Napi::Env env, Napi::Object exports)
 {
     Napi::Function func = DefineClass(env, "HybridRetriever", {
-        InstanceMethod("addDocument",             &HybridRetriever::AddDocument),
-        InstanceMethod("addDocumentWithEmbedding",&HybridRetriever::AddDocumentWithEmbedding),
-        InstanceMethod("hybridSearch",            &HybridRetriever::HybridSearch),
-        InstanceMethod("sparseSearch",            &HybridRetriever::SparseSearch),
-        InstanceMethod("removeDocument",          &HybridRetriever::RemoveDocument),
-        InstanceMethod("getStats",                &HybridRetriever::GetStats),
+        InstanceMethod("addDocument",              &HybridRetriever::AddDocument),
+        InstanceMethod("addDocumentWithEmbedding", &HybridRetriever::AddDocumentWithEmbedding),
+        InstanceMethod("hybridSearch",             &HybridRetriever::HybridSearch),
+        InstanceMethod("sparseSearch",             &HybridRetriever::SparseSearch),
+        InstanceMethod("removeDocument",           &HybridRetriever::RemoveDocument),
+        InstanceMethod("getStats",                 &HybridRetriever::GetStats),
     });
 
     exports.Set("HybridRetriever", func);
@@ -42,8 +41,8 @@ HybridRetriever::HybridRetriever(const Napi::CallbackInfo &info)
     Napi::Object cacheObj = info[0].As<Napi::Object>();
     hnswIndex_ = Napi::ObjectWrap<SemanticCache>::Unwrap(cacheObj);
 
-    dim_ = 384;
-    denseWeight_ = 0.7f; // explicit float literal — fixes C4305 truncation warning
+    dim_         = 384;
+    denseWeight_ = 0.7f;
 
     if (info.Length() >= 2 && info[1].IsObject())
     {
@@ -124,7 +123,7 @@ double HybridRetriever::ComputeIDF(const std::string &term)
 // BM25 SCORING
 // ==========================================
 double HybridRetriever::BM25Score(const BM25Doc &doc,
-                                  const std::vector<std::string> &queryTokens)
+                                   const std::vector<std::string> &queryTokens)
 {
     double score = 0.0;
     const double k1 = 1.2;
@@ -214,7 +213,7 @@ std::string HybridRetriever::GenerateBreadcrumb(const std::string &text)
 // INTERNAL: shared BM25 indexing
 // ==========================================
 void HybridRetriever::addDocumentInternal(const std::string &id,
-                                          const std::string &text)
+                                           const std::string &text)
 {
     auto existingIt = docIndex_.find(id);
     if (existingIt != docIndex_.end())
@@ -237,11 +236,11 @@ void HybridRetriever::addDocumentInternal(const std::string &id,
         termFreq[token]++;
 
     BM25Doc doc;
-    doc.id        = id;
-    doc.text      = text;
-    doc.tokens    = tokens;
-    doc.termFreq  = termFreq;
-    doc.docLength = (int)tokens.size();
+    doc.id         = id;
+    doc.text       = text;
+    doc.tokens     = tokens;
+    doc.termFreq   = termFreq;
+    doc.docLength  = (int)tokens.size();
     doc.breadcrumb = GenerateBreadcrumb(text);
 
     documents_.push_back(doc);
@@ -275,10 +274,10 @@ Napi::Value HybridRetriever::AddDocument(const Napi::CallbackInfo &info)
     auto docIt = docIndex_.find(id);
 
     Napi::Object result = Napi::Object::New(env);
-    result.Set("id",        Napi::String::New(env, id));
+    result.Set("id", Napi::String::New(env, id));
     result.Set("breadcrumb", Napi::String::New(env,
         docIt != docIndex_.end() ? documents_[docIt->second].breadcrumb : ""));
-    result.Set("tokens",    Napi::Number::New(env,
+    result.Set("tokens", Napi::Number::New(env,
         docIt != docIndex_.end() ? documents_[docIt->second].docLength : 0));
     return result;
 }
@@ -324,8 +323,17 @@ Napi::Value HybridRetriever::AddDocumentWithEmbedding(const Napi::CallbackInfo &
         {
             size_t label = hnswIndex_->current_label_;
             hnswIndex_->alg_hnsw_->addPoint(normalized.data(), label);
-            hnswIndex_->id_map_[label] = id;
+
+            // ── FIXED: use meta_map_ instead of deleted id_map_ ──
+            VectorMetadata meta;
+            meta.id            = id;
+            meta.namespaceName = "";
+            meta.type          = "document";
+            meta.payload       = "";
+            hnswIndex_->meta_map_[label]  = meta;
+            hnswIndex_->id_to_label_[id]  = label;
             hnswIndex_->current_label_++;
+            hnswIndex_->active_count_++;
         }
         catch (const std::exception &e)
         {
@@ -338,10 +346,10 @@ Napi::Value HybridRetriever::AddDocumentWithEmbedding(const Napi::CallbackInfo &
     auto docIt = docIndex_.find(id);
 
     Napi::Object result = Napi::Object::New(env);
-    result.Set("id",        Napi::String::New(env, id));
+    result.Set("id",      Napi::String::New(env, id));
     result.Set("breadcrumb", Napi::String::New(env,
         docIt != docIndex_.end() ? documents_[docIt->second].breadcrumb : ""));
-    result.Set("indexed",   Napi::Boolean::New(env, true));
+    result.Set("indexed", Napi::Boolean::New(env, true));
     return result;
 }
 
@@ -355,7 +363,8 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
     if (info.Length() < 2 || !info[0].IsTypedArray() || !info[1].IsNumber())
     {
         Napi::TypeError::New(env,
-            "Expected (queryEmbedding: Float32Array, k: number, [threshold: number], [queryText: string])")
+            "Expected (queryEmbedding: Float32Array, k: number, "
+            "[threshold: number], [queryText: string])")
             .ThrowAsJavaScriptException();
         return env.Null();
     }
@@ -372,7 +381,7 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
     // ── Dense: HNSW ──
     if (hnswIndex_ && hnswIndex_->alg_hnsw_ && hnswIndex_->current_label_ > 0)
     {
-        float *queryData  = queryVec.Data();
+        float *queryData   = queryVec.Data();
         auto   hnswResults = hnswIndex_->alg_hnsw_->searchKnn(queryData, k * 3);
 
         while (!hnswResults.empty())
@@ -383,13 +392,14 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
             float similarity = 1.0f - top.first;
             if (similarity >= threshold)
             {
-                auto idIt = hnswIndex_->id_map_.find(top.second);
-                if (idIt != hnswIndex_->id_map_.end())
+                // ── FIXED: use meta_map_ instead of deleted id_map_ ──
+                auto idIt = hnswIndex_->meta_map_.find(top.second);
+                if (idIt != hnswIndex_->meta_map_.end())
                 {
                     ScoredResult r;
-                    r.id           = idIt->second;
-                    r.denseScore   = similarity;
-                    r.sparseScore  = 0.0;
+                    r.id            = idIt->second.id;  // .id from VectorMetadata
+                    r.denseScore    = similarity;
+                    r.sparseScore   = 0.0;
                     r.combinedScore = 0.0;
                     results.push_back(r);
                 }
@@ -419,7 +429,7 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
         return jsResults;
     }
 
-    std::string queryText = info[3].As<Napi::String>().Utf8Value();
+    std::string queryText        = info[3].As<Napi::String>().Utf8Value();
     std::vector<std::string> queryTokens = Tokenize(queryText);
 
     // Score dense hits with BM25
@@ -445,9 +455,9 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
         if (bm25 > 0.0)
         {
             ScoredResult r;
-            r.id           = documents_[i].id;
-            r.denseScore   = 0.0;
-            r.sparseScore  = bm25;
+            r.id            = documents_[i].id;
+            r.denseScore    = 0.0;
+            r.sparseScore   = bm25;
             r.combinedScore = 0.0;
             results.push_back(r);
         }
@@ -465,7 +475,7 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
     {
         double normDense  = maxDense  > 0 ? r.denseScore  / maxDense  : 0.0;
         double normSparse = maxSparse > 0 ? r.sparseScore / maxSparse : 0.0;
-        r.combinedScore = denseWeight_ * normDense + (1.0 - denseWeight_) * normSparse;
+        r.combinedScore   = denseWeight_ * normDense + (1.0 - denseWeight_) * normSparse;
     }
 
     std::sort(results.begin(), results.end(),
@@ -480,10 +490,10 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
     for (size_t i = 0; i < results.size(); i++)
     {
         Napi::Object obj = Napi::Object::New(env);
-        obj.Set("id",           Napi::String::New(env, results[i].id));
-        obj.Set("denseScore",   Napi::Number::New(env, results[i].denseScore));
-        obj.Set("sparseScore",  Napi::Number::New(env, results[i].sparseScore));
-        obj.Set("combinedScore",Napi::Number::New(env, results[i].combinedScore));
+        obj.Set("id",            Napi::String::New(env, results[i].id));
+        obj.Set("denseScore",    Napi::Number::New(env, results[i].denseScore));
+        obj.Set("sparseScore",   Napi::Number::New(env, results[i].sparseScore));
+        obj.Set("combinedScore", Napi::Number::New(env, results[i].combinedScore));
 
         auto docIt = docIndex_.find(results[i].id);
         if (docIt != docIndex_.end())
@@ -541,7 +551,10 @@ Napi::Value HybridRetriever::SparseSearch(const Napi::CallbackInfo &info)
 
     // Min-heap of size k
     using ScoredIdx = std::pair<double, size_t>;
-    std::priority_queue<ScoredIdx, std::vector<ScoredIdx>, std::greater<ScoredIdx>> topK;
+    std::priority_queue<
+        ScoredIdx,
+        std::vector<ScoredIdx>,
+        std::greater<ScoredIdx>> topK;
 
     for (size_t idx : candidateIndices)
     {
@@ -567,24 +580,26 @@ Napi::Value HybridRetriever::SparseSearch(const Napi::CallbackInfo &info)
         topK.pop();
     }
     std::sort(ordered.begin(), ordered.end(),
-        [](const ScoredIdx &a, const ScoredIdx &b){ return a.first > b.first; });
+        [](const ScoredIdx &a, const ScoredIdx &b){
+            return a.first > b.first;
+        });
 
-    Napi::Array jsResults = Napi::Array::New(env, ordered.size());
+    Napi::Array out = Napi::Array::New(env, ordered.size());
     for (size_t i = 0; i < ordered.size(); i++)
     {
         const BM25Doc &doc = documents_[ordered[i].second];
         double score       = ordered[i].first;
 
         Napi::Object obj = Napi::Object::New(env);
-        obj.Set("id",           Napi::String::New(env, doc.id));
-        obj.Set("sparseScore",  Napi::Number::New(env, score));
-        obj.Set("denseScore",   Napi::Number::New(env, 0.0));
-        obj.Set("combinedScore",Napi::Number::New(env, score));
-        obj.Set("breadcrumb",   Napi::String::New(env, doc.breadcrumb));
-        jsResults.Set(i, obj);
+        obj.Set("id",            Napi::String::New(env, doc.id));
+        obj.Set("sparseScore",   Napi::Number::New(env, score));
+        obj.Set("denseScore",    Napi::Number::New(env, 0.0));
+        obj.Set("combinedScore", Napi::Number::New(env, score));
+        obj.Set("breadcrumb",    Napi::String::New(env, doc.breadcrumb));
+        out.Set(i, obj);
     }
 
-    return jsResults;
+    return out;
 }
 
 // ==========================================
@@ -635,9 +650,9 @@ Napi::Value HybridRetriever::GetStats(const Napi::CallbackInfo &info)
     Napi::Env env = info.Env();
 
     Napi::Object stats = Napi::Object::New(env);
-    stats.Set("totalDocuments",   Napi::Number::New(env, totalDocs_));
-    stats.Set("averageDocLength", Napi::Number::New(env, avgDocLen_));
-    stats.Set("denseWeight",      Napi::Number::New(env, denseWeight_));
+    stats.Set("totalDocuments",     Napi::Number::New(env, totalDocs_));
+    stats.Set("averageDocLength",   Napi::Number::New(env, avgDocLen_));
+    stats.Set("denseWeight",        Napi::Number::New(env, denseWeight_));
     stats.Set("embeddingDimension", Napi::Number::New(env, dim_));
     return stats;
 }

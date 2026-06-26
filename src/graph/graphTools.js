@@ -1,46 +1,42 @@
 /**
  * graphTools.js
  *
- * Tool definition and query handler for contextforge_query_graph.
- *
- * Injected into the tools[] array alongside memory tools.
- * Intercepted by the Ghost Interceptor in server.js.
- *
- * Query types:
- *   who_imports_this    → which files import symbol X
- *   what_does_this_export → what symbols does file X export
- *   find_symbol         → where is symbol X defined
- *   what_does_this_import → what does file X import
- *   who_depends_on_file → which files depend on file X
+ * G3 fix: find_symbol caps body_text at 1,500 chars in the response.
+ * G4 fix: find_symbol falls back to LIKE fuzzy match on exact miss.
+ * G5 fix: show_callers "no_callers" guides LLM to who_imports_this.
+ * W-CRLF fix: show_callers code_snippet normalizes line endings.
+ * Log fix: GraphInject only logs on first injection per process.
+ * find_route fix: adds start_line + patch hint to route results.
  */
 
 import {
   queryWhoImportsThis,
   queryWhatDoesThisExport,
   queryFindSymbol,
+  queryFindSymbolFuzzy,
   queryWhatDoesThisImport,
   queryWhoDependsOnFile,
+  queryWhoCallsThis,
+  queryWhatDoesThisCall,
+  querySymbolImpact,
+  querySymbolDependencies,
+  queryFindRoutes,
   getGraphStats,
 } from "./graphDb.js";
 import { statsEmitter } from "../proxy/statsEmitter.js";
+import fs from "node:fs";
+import path from "node:path";
 
 export const GRAPH_TOOL_NAME = "contextforge_query_graph";
 
-// MCP protocol prefixes the tool name — normalize before matching
 const GRAPH_TOOL_ALIASES = new Set([
   GRAPH_TOOL_NAME,
   `mcp__contextforge__${GRAPH_TOOL_NAME}`,
   `contextforge__${GRAPH_TOOL_NAME}`,
 ]);
 
-/**
- * Normalize any variant of the graph tool name back to the canonical name.
- * Handles MCP namespace prefixes transparently.
- */
 export function normalizeGraphToolName(name) {
   if (!name) return name;
-  // Strip any mcp__ or namespace__ prefix patterns
-  // e.g. mcp__contextforge__contextforge_query_graph → contextforge_query_graph
   const match = name.match(
     /(?:mcp__\w+__|[\w]+__)?(contextforge_query_graph)$/,
   );
@@ -48,7 +44,60 @@ export function normalizeGraphToolName(name) {
 }
 
 // ─────────────────────────────────────────────
-// Tool definition (OpenAI format — post-translation)
+// G3 helper: cap body text in find_symbol responses
+// ─────────────────────────────────────────────
+
+const BODY_CHAR_LIMIT = 1500;
+
+function capBodyText(bodyText, symbolName) {
+  if (!bodyText) return null;
+
+  // Normalize CRLF → LF so the body returned matches what
+  // the LLM sees in the actual file (on Windows).
+  const normalized = bodyText.replace(/\r\n/g, "\n");
+
+  if (normalized.length <= BODY_CHAR_LIMIT) return normalized;
+
+  const lines = normalized.split("\n");
+  let charCount = 0;
+  let cutLine = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    charCount += lines[i].length + 1;
+    if (charCount > BODY_CHAR_LIMIT) {
+      cutLine = i;
+      break;
+    }
+  }
+
+  const truncated = lines.slice(0, cutLine).join("\n");
+  const remaining = lines.length - cutLine;
+  const truncNote =
+    `\n// ... ${remaining} more lines truncated ` +
+    `(${normalized.length} chars total). ` +
+    `Use read_file_chunk with the line numbers above to get the full raw text.`;
+
+  return truncated + truncNote;
+}
+
+// ─────────────────────────────────────────────
+// Read file helper — CRLF normalized
+// Used by show_callers to build code_snippet
+// ─────────────────────────────────────────────
+
+function readFileLines(filePath) {
+  try {
+    return fs
+      .readFileSync(filePath, "utf-8")
+      .replace(/\r\n/g, "\n") // normalize Windows CRLF → LF
+      .split("\n");
+  } catch {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────
+// Tool definition
 // ─────────────────────────────────────────────
 
 let _toolDef = null;
@@ -62,13 +111,27 @@ export function getGraphToolDefinition() {
       name: GRAPH_TOOL_NAME,
       description:
         "Query the ContextForge code knowledge graph. " +
-        "ALWAYS use this tool INSTEAD of grep, find, bash search, or reading files " +
-        "when you need to locate a symbol, find imports, or check exports. " +
-        "This is pre-indexed and returns results instantly at zero token cost. " +
-        "Use find_symbol to locate any function, class, or variable by name. " +
-        "Use who_imports_this to find all files that use a symbol. " +
-        "Use what_does_this_export to list a file's exports without reading it. " +
-        "Always try this before reading any file.",
+        "Use this tool INSTEAD of grep, find, or bash search " +
+        "when you need to locate a symbol, find imports, trace call chains, or check exports. " +
+        "Results are pre-indexed and return instantly at zero token cost. " +
+        "\n\nWORKFLOW:" +
+        "\n  1. what_does_this_export('src/path/to/file.js') — list all exported symbols" +
+        "\n  2. find_symbol('specificFunctionName') — get file path, line numbers, and up to 1500 chars of body text" +
+        "\n  3. If the body is truncated, use read_file_chunk with the given start_line/end_line to get the exact raw text" +
+        "\n  4. Use the raw text (from step 2 or 3) to build patches or understand the code" +
+        "\n  NEVER search for class names — always search for function or method names (e.g. 'decide', not 'CompressionDecision')." +
+        "\n\nSpatial queries:" +
+        "\n  find_symbol           — locate any function, class, or variable by name" +
+        "\n  who_imports_this      — find all files that import a symbol" +
+        "\n  what_does_this_export — list a file's exports without reading it" +
+        "\n  what_does_this_import — list everything a file imports" +
+        "\n  who_depends_on_file   — find files that depend on a specific file" +
+        "\n\nRelational queries:" +
+        "\n  show_callers      — find all functions that call function X" +
+        "\n  show_dependencies — find all functions that X calls" +
+        "\n  analyze_impact    — full call-chain impact analysis (2 hops) for safe refactoring" +
+        "\n  find_route        — find HTTP route handlers by path fragment (e.g. '/v1/chat')" +
+        "\n\nAlways try this before reading any file.",
       parameters: {
         type: "object",
         properties: {
@@ -80,19 +143,28 @@ export function getGraphToolDefinition() {
               "find_symbol",
               "what_does_this_import",
               "who_depends_on_file",
+              "show_callers",
+              "show_dependencies",
+              "analyze_impact",
+              "find_route",
             ],
             description:
-              "who_imports_this: find all files that import a symbol. " +
-              "what_does_this_export: list all exports from a file. " +
-              "find_symbol: locate where a symbol is defined. " +
-              "what_does_this_import: list all imports in a file. " +
-              "who_depends_on_file: find files that import from a specific file.",
+              "Spatial: who_imports_this, what_does_this_export, find_symbol, " +
+              "what_does_this_import, who_depends_on_file. " +
+              "Relational: show_callers (who calls X), show_dependencies (what X calls), " +
+              "analyze_impact (full 2-hop call chain for refactoring safety), " +
+              "find_route (HTTP route by path fragment). " +
+              "For file analysis: start with what_does_this_export to get symbol names, " +
+              "then find_symbol for specific functions. Never search by class name.",
           },
           target: {
             type: "string",
             description:
-              "The symbol name (e.g. 'sliceJsonOutput') or file path " +
-              "(e.g. 'src/helper.js') depending on query_type.",
+              "Function or method name (e.g. 'decide', 'sliceJsonOutput') for symbol queries — " +
+              "NOT class names. " +
+              "File path (e.g. 'src/helper.js') for file queries. " +
+              "Route fragment (e.g. '/v1/chat') for find_route. " +
+              "Pass empty string to find_route to list all routes.",
           },
         },
         required: ["query_type", "target"],
@@ -105,37 +177,39 @@ export function getGraphToolDefinition() {
 }
 
 // ─────────────────────────────────────────────
-// Query executor — called by Ghost Interceptor
+// Query executor
 // ─────────────────────────────────────────────
 
-/**
- * Execute a graph query and return a formatted string result.
- * The string is injected as the tool result content.
- *
- * @param {string} queryType
- * @param {string} target
- * @returns {string} JSON result formatted for LLM consumption
- */
 export function executeGraphQuery(queryType, target) {
-  if (!target || typeof target !== "string") {
+  if (target === undefined || target === null) {
     return JSON.stringify({ error: "target is required" });
   }
 
-  const cleanTarget = target.trim();
+  let cleanTarget = String(target).trim();
+
+  // Normalize absolute paths to relative
+  const cwdNormalized = process.cwd().replace(/\\/g, "/").toLowerCase();
+  const targetNormalized = cleanTarget.replace(/\\/g, "/");
+  const targetLower = targetNormalized.toLowerCase();
+  if (targetLower.startsWith(cwdNormalized + "/")) {
+    cleanTarget = targetNormalized.slice(cwdNormalized.length + 1);
+  } else {
+    cleanTarget = targetNormalized.replace(/^[A-Za-z]:\//, "");
+  }
 
   try {
     let result;
 
     switch (queryType) {
+      // ── Spatial queries ──
+
       case "who_imports_this": {
         const rows = queryWhoImportsThis(cleanTarget);
         if (rows.length === 0) {
           result = JSON.stringify({
             symbol: cleanTarget,
             result: "not_found",
-            message:
-              `No files import '${cleanTarget}'. ` +
-              `It may be internal-only or not yet indexed.`,
+            message: `No files import '${cleanTarget}'. It may be internal-only or not yet indexed.`,
           });
           break;
         }
@@ -160,9 +234,7 @@ export function executeGraphQuery(queryType, target) {
           result = JSON.stringify({
             file: cleanTarget,
             result: "not_found",
-            message:
-              `No exports found for '${cleanTarget}'. ` +
-              `Check the file path or run a graph re-index.`,
+            message: `No exports found for '${cleanTarget}'. Check the file path or run a graph re-index.`,
           });
           break;
         }
@@ -177,6 +249,8 @@ export function executeGraphQuery(queryType, target) {
               complexity: r.complexity,
             })),
             count: rows.length,
+            next_step:
+              "Use find_symbol with one of the exported names above to get the body and line numbers.",
           },
           null,
           2,
@@ -185,27 +259,46 @@ export function executeGraphQuery(queryType, target) {
       }
 
       case "find_symbol": {
-        const rows = queryFindSymbol(cleanTarget);
+        let rows = queryFindSymbol(cleanTarget);
+        let isFuzzy = false;
+
+        if (rows.length === 0) {
+          rows = queryFindSymbolFuzzy(cleanTarget);
+          isFuzzy = rows.length > 0;
+        }
+
         if (rows.length === 0) {
           result = JSON.stringify({
             symbol: cleanTarget,
             result: "not_found",
-            message: `Symbol '${cleanTarget}' not found in the graph index.`,
+            message:
+              `Symbol '${cleanTarget}' not found in the graph index. ` +
+              `Try who_imports_this or what_does_this_export on the file you expect it to live in.`,
           });
           break;
         }
+
+        const definitions = rows.map((r) => ({
+          file: r.file_path,
+          kind: r.kind,
+          start_line: r.start_line,
+          end_line: r.end_line,
+          complexity: r.complexity,
+          body: capBodyText(r.body_text, r.name),
+        }));
+
         result = JSON.stringify(
           {
             symbol: cleanTarget,
-            definitions: rows.map((r) => ({
-              file: r.file_path,
-              kind: r.kind,
-              start_line: r.start_line,
-              end_line: r.end_line,
-              complexity: r.complexity,
-              body: r.body_text || null,
-            })),
+            fuzzy_match: isFuzzy,
+            ...(isFuzzy && {
+              fuzzy_note:
+                `Exact match not found. Showing ${rows.length} partial match(es) for '${cleanTarget}'. ` +
+                `Use the exact name from the results for subsequent queries.`,
+            }),
+            definitions,
             count: rows.length,
+            tip: "If body shows truncation ('... N more lines'), use read_file_chunk with the start_line/end_line above to get the complete raw text.",
           },
           null,
           2,
@@ -260,6 +353,182 @@ export function executeGraphQuery(queryType, target) {
         break;
       }
 
+      // ── Relational queries ──
+
+      case "show_callers": {
+        const rows = queryWhoCallsThis(cleanTarget);
+
+        if (rows.length === 0) {
+          result = JSON.stringify({
+            symbol: cleanTarget,
+            result: "no_callers",
+            message:
+              `No indexed callers found for '${cleanTarget}'. ` +
+              `This does NOT mean the function is never called — ` +
+              `top-level scripts and anonymous callbacks may not appear as callers in the graph. ` +
+              `NEXT STEP: Use who_imports_this('${cleanTarget}') to find which files import this symbol, ` +
+              `then read those files directly to locate the call site. ` +
+              `Do NOT retry show_callers with variations of the name.`,
+          });
+          break;
+        }
+
+        const callers = rows.map((r) => {
+          let snippet = null;
+          let callLine = r.source_line ?? null;
+          const fileName = r.source_file;
+
+          // source_line not yet populated for this edge (indexed before migration).
+          // Grep the source file to find the call site.
+          if (!callLine) {
+            callLine = findCallLineInFile(fileName, cleanTarget);
+          }
+
+          if (callLine) {
+            const lines = readFileLines(fileName);
+            if (lines) {
+              const start = Math.max(0, callLine - 4);
+              const end = Math.min(lines.length, callLine + 3);
+              snippet = lines.slice(start, end).join("\n");
+            }
+          }
+
+          // Extract just the call line text for exact search_string values
+          let callText = null;
+          if (callLine) {
+            const lines = readFileLines(fileName);
+            if (lines && callLine > 0 && callLine <= lines.length) {
+              const raw = lines[callLine - 1].trim();
+              callText = raw.length > 200 ? raw.slice(0, 200) + "..." : raw;
+            }
+          }
+
+          return {
+            file: fileName,
+            caller: r.source_symbol || "(module scope — top-level script)",
+            call_line: callLine,
+            call_text: callText,
+            code_snippet: snippet,
+          };
+        });
+
+        result = JSON.stringify(
+          {
+            symbol: cleanTarget,
+            callers,
+            count: rows.length,
+            hint:
+              "Use 'call_line' and 'call_text' to locate the exact call site. " +
+              "Use 'code_snippet' (7 lines of context) to see how the function is called " +
+              "and to build search_string values for patches.",
+          },
+          null,
+          2,
+        );
+        break;
+      }
+
+      case "show_dependencies": {
+        const rows = querySymbolDependencies(cleanTarget);
+        if (rows.length === 0) {
+          result = JSON.stringify({
+            symbol: cleanTarget,
+            result: "no_dependencies",
+            message: `'${cleanTarget}' makes no indexed function calls, or is not yet indexed.`,
+          });
+          break;
+        }
+        result = JSON.stringify(
+          {
+            symbol: cleanTarget,
+            dependencies: rows.map((r) => ({
+              calls: r.target_symbol,
+              file: r.target_file || "(same file)",
+              kind: r.kind || "unknown",
+              line: r.start_line || null,
+            })),
+            count: rows.length,
+          },
+          null,
+          2,
+        );
+        break;
+      }
+
+      case "analyze_impact": {
+        const rows = querySymbolImpact(cleanTarget);
+        if (rows.length === 0) {
+          result = JSON.stringify({
+            symbol: cleanTarget,
+            result: "no_impact",
+            message: `No callers found for '${cleanTarget}'. Safe to modify without cascading changes.`,
+          });
+          break;
+        }
+
+        const direct = rows.filter((r) => r.depth === 1);
+        const transitive = rows.filter((r) => r.depth === 2);
+
+        result = JSON.stringify(
+          {
+            symbol: cleanTarget,
+            analysis: "call_chain_impact",
+            summary:
+              `${rows.length} affected symbol(s): ` +
+              `${direct.length} direct caller(s), ${transitive.length} transitive caller(s).`,
+            direct_callers: direct.map((r) => ({
+              file: r.source_file,
+              caller: r.source_symbol || "(file-level)",
+            })),
+            transitive_callers: transitive.map((r) => ({
+              file: r.source_file,
+              caller: r.source_symbol || "(file-level)",
+            })),
+            recommendation:
+              rows.length > 10
+                ? "High-impact change. Review all callers before modifying."
+                : rows.length > 0
+                  ? "Moderate impact. Update callers as needed."
+                  : "Low impact. No cascading changes required.",
+          },
+          null,
+          2,
+        );
+        break;
+      }
+
+      case "find_route": {
+        const filter = cleanTarget.length > 0 ? cleanTarget : null;
+        const rows = queryFindRoutes(filter);
+        if (rows.length === 0) {
+          result = JSON.stringify({
+            filter: filter || "(all routes)",
+            result: "no_routes",
+            message: filter
+              ? `No HTTP routes matching '${filter}' found.`
+              : "No HTTP routes found. Routes are detected from Express/Fastify/Hono patterns.",
+          });
+          break;
+        }
+        result = JSON.stringify(
+          {
+            filter: filter || "(all routes)",
+            routes: rows.map((r) => ({
+              route: r.route_path,
+              file: r.source_file,
+              handler: r.handler || "(inline)",
+              patch_hint: r.handler
+                ? `Use find_symbol('${r.handler}') to get the handler body and line numbers.`
+                : `Route is inline — use contextforge_retrieve on ${r.source_file} to get surrounding context.`,
+            })),
+            count: rows.length,
+          },
+          null,
+          2,
+        );
+        break;
+      }
+
       default:
         result = JSON.stringify({
           error: "unknown_query_type",
@@ -270,13 +539,15 @@ export function executeGraphQuery(queryType, target) {
             "find_symbol",
             "what_does_this_import",
             "who_depends_on_file",
+            "show_callers",
+            "show_dependencies",
+            "analyze_impact",
+            "find_route",
           ],
         });
     }
 
-    // ── Dashboard hook — fires after every successful query ──
     statsEmitter.recordGraphQuery(queryType, cleanTarget);
-
     return result;
   } catch (err) {
     console.error(`[GraphQuery] ❌ Query failed: ${err.message}`);
@@ -287,10 +558,10 @@ export function executeGraphQuery(queryType, target) {
   }
 }
 
-/**
- * Check if a tool call is a graph query.
- * Used by the Ghost Interceptor to route the call.
- */
+// ─────────────────────────────────────────────
+// Ghost Interceptor helpers
+// ─────────────────────────────────────────────
+
 export function isGraphToolCall(toolName) {
   return (
     GRAPH_TOOL_ALIASES.has(toolName) ||
@@ -298,40 +569,192 @@ export function isGraphToolCall(toolName) {
   );
 }
 
-/**
- * Inject the graph tool into a tools array.
- * Injects unconditionally if graph has been initialized,
- * even if indexing is still in progress.
- */
+let _graphInjectedOnce = false;
+
 export function injectGraphTool(tools) {
   const currentTools = tools || [];
 
-  // Check if already present
   for (const tool of currentTools) {
     const name = tool.name || tool.function?.name;
     if (name === GRAPH_TOOL_NAME) {
-      console.log(`[GraphInject] Already present — skipping`);
       return currentTools;
     }
   }
 
-  // Inject regardless of node count — indexing may still be in progress
-  // The LLM will get a "not yet indexed" response from executeGraphQuery
-  // if it calls before indexing completes, which is better than no tool at all
-  try {
-    const stats = getGraphStats();
-    const nodeCount = stats?.node_count ?? 0;
-    console.log(
-      `[GraphInject] ✅ Injecting graph tool (nodes: ${nodeCount}, ` +
-        `indexing: ${nodeCount === 0 ? "in progress" : "complete"})`,
-    );
-  } catch (err) {
-    // graphDb not initialized yet — inject anyway, queries will return
-    // friendly "not indexed" messages rather than crashing
-    console.log(
-      `[GraphInject] ⚠️  graphDb not ready (${err.message}) — injecting with warning`,
-    );
+  if (!_graphInjectedOnce) {
+    try {
+      const stats = getGraphStats();
+      const nodeCount = stats?.node_count ?? 0;
+      console.log(
+        `[GraphInject] ✅ Graph tool active — ${nodeCount} nodes indexed`,
+      );
+    } catch (err) {
+      console.log(`[GraphInject] ⚠️  graphDb not ready (${err.message})`);
+    }
+    _graphInjectedOnce = true;
   }
 
   return [...currentTools, getGraphToolDefinition()];
+}
+
+// ─────────────────────────────────────────────────────────────
+// read_file_chunk — surgical file reading (supports full files)
+// ─────────────────────────────────────────────────────────────
+
+export const READ_FILE_CHUNK_TOOL_NAME = "read_file_chunk";
+
+export function isReadFileChunkTool(toolName) {
+  if (!toolName) return false;
+  return (
+    toolName === READ_FILE_CHUNK_TOOL_NAME ||
+    toolName.includes(READ_FILE_CHUNK_TOOL_NAME)
+  );
+}
+
+export function executeReadFileChunk(filePath, startLine, endLine) {
+  if (!filePath || typeof filePath !== "string") {
+    return JSON.stringify({ error: "file_path is required" });
+  }
+
+  const start = parseInt(startLine, 10);
+  const end = parseInt(endLine, 10);
+
+  if (isNaN(start) || isNaN(end) || start < 1 || end < start) {
+    return JSON.stringify({
+      error: "Invalid line range",
+      message: `start_line and end_line must be positive integers with end_line >= start_line. Got start=${startLine}, end=${endLine}.`,
+    });
+  }
+
+  let resolvedPath = filePath;
+  if (!path.isAbsolute(resolvedPath)) {
+    resolvedPath = path.resolve(process.cwd(), resolvedPath);
+  }
+
+  try {
+    const content = fs.readFileSync(resolvedPath, "utf-8");
+    const normalized = content.replace(/\r\n/g, "\n");
+    const allLines = normalized.split("\n");
+
+    if (start > allLines.length) {
+      return JSON.stringify({
+        error: "start_line beyond file end",
+        message: `File '${filePath}' has ${allLines.length} lines. Requested start_line=${start}.`,
+      });
+    }
+
+    const actualEnd = Math.min(end, allLines.length);
+    const chunk = allLines.slice(start - 1, actualEnd);
+
+    const searchHint =
+      chunk.length > 0 && chunk[0].trim()
+        ? chunk[0].trim().substring(0, 40)
+        : "";
+
+    const result = {
+      file: filePath,
+      start_line: start,
+      end_line: actualEnd,
+      total_lines: allLines.length,
+      lines: chunk,
+      content: chunk.join("\n"),
+      hint:
+        `To patch this file: use contextforge_patch_ast with ` +
+        `search_string set to one of these lines and file_path="${filePath}". ` +
+        `To retrieve from vault: contextforge_retrieve with search_query="${searchHint}".`,
+    };
+
+    return JSON.stringify(result, null, 2);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return JSON.stringify({
+        error: "File not found",
+        message: `'${filePath}' does not exist. Check the path — graph tools use paths relative to the workspace root.`,
+      });
+    }
+    console.error(`[read_file_chunk] ❌ Failed: ${err.message}`);
+    return JSON.stringify({
+      error: "Read failed",
+      message: err.message,
+    });
+  }
+}
+
+export function getReadFileChunkToolDefinition() {
+  return {
+    type: "function",
+    function: {
+      name: READ_FILE_CHUNK_TOOL_NAME,
+      description:
+        "Read a range of lines from a file on disk. " +
+        "Use start_line=1, end_line=99999 to read the entire file. " +
+        "Combine with find_symbol to get exact start_line/end_line for specific functions. " +
+        "Returns raw, exact text that matches the file on disk — " +
+        "perfect for building search_string values for editing tools.",
+      parameters: {
+        type: "object",
+        properties: {
+          file_path: {
+            type: "string",
+            description:
+              "File path relative to workspace root (e.g., 'src/proxy/upstreamRequest.js')",
+          },
+          start_line: {
+            type: "integer",
+            description:
+              "First line to read (1-indexed, inclusive). Use the start_line from find_symbol results.",
+          },
+          end_line: {
+            type: "integer",
+            description:
+              "Last line to read (1-indexed, inclusive). Use 99999 to read to end of file.",
+          },
+        },
+        required: ["file_path", "start_line", "end_line"],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+let _readFileChunkInjectedOnce = false;
+
+export function injectReadFileChunkTool(tools) {
+  const currentTools = tools || [];
+
+  for (const tool of currentTools) {
+    const name = tool.name || tool.function?.name;
+    if (name === READ_FILE_CHUNK_TOOL_NAME) {
+      return currentTools;
+    }
+  }
+
+  if (!_readFileChunkInjectedOnce) {
+    console.log(`[ReadFileChunk] ✅ Tool injected`);
+    _readFileChunkInjectedOnce = true;
+  }
+
+  return [...currentTools, getReadFileChunkToolDefinition()];
+}
+
+// ─────────────────────────────────────────────
+// Grep a source file for function call sites.
+// Used as fallback when source_line is not yet
+// populated in the edges table (files indexed
+// before the source_line migration).
+// ─────────────────────────────────────────────
+
+function findCallLineInFile(filePath, functionName) {
+  const lines = readFileLines(filePath);
+  if (!lines) return null;
+
+  const escaped = functionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const callRegex = new RegExp(`\\b${escaped}\\s*\\(`);
+
+  for (let i = 0; i < lines.length; i++) {
+    if (callRegex.test(lines[i])) {
+      return i + 1; // 1-indexed line number
+    }
+  }
+  return null;
 }

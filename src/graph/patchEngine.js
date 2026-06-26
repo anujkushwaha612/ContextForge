@@ -1,26 +1,14 @@
 /**
  * patchEngine.js
  *
- * Write-side counterpart to vaultRetriever.js.
+ * Upgrades applied:
+ *   Fuzzy match: when replace_string fails due to whitespace differences,
+ *     return the exact matching block with a "Did you mean?" message so
+ *     the LLM can self-correct without a human in the loop.
  *
- * Given a symbol name, a file path, and a replacement body,
- * locates the symbol in the graph index, splices the file on disk,
- * re-indexes the file, and returns a structured result for the LLM.
- *
- * LINE INDEXING CONTRACT:
- *   graphDb stores 0-based line numbers as emitted by Tree-sitter.
- *   All slice operations in this file use 0-based indices directly.
- *   No +1 / -1 corrections are applied — the DB values are used as-is.
- *
- *   start_line  → first line of the full node (including signature)
- *   end_line    → last line of the full node (inclusive, 0-based)
- *   body_start_line → first line of the body (after opening brace)
- *   body_end_line   → last line of the body (before closing brace)
- *
- *   Slice convention:
- *     lines.slice(0, start_line)          → everything before symbol
- *     lines.slice(start_line, end_line+1) → the symbol itself
- *     lines.slice(end_line + 1)           → everything after symbol
+ *   insert_at_line: new operation that inserts new_body at a specific
+ *     1-based line number without needing a named symbol to anchor to.
+ *     Solves the anonymous handler problem (SSE handler in server.js).
  */
 
 import fs from "node:fs";
@@ -41,20 +29,73 @@ export const PATCH_OPERATIONS = {
   INSERT_AFTER: "insert_after",
   INSERT_BEFORE: "insert_before",
   DELETE: "delete",
+  REPLACE_STRING: "replace_string",
+  INSERT_AT_LINE: "insert_at_line", // ← new
 };
 
 const MAX_PATCHABLE_FILE_SIZE = 500_000;
 
 // ─────────────────────────────────────────────
+// CRLF-safe file reader
+// ─────────────────────────────────────────────
+
+function readSource(filePath) {
+  const raw = fs.readFileSync(filePath, "utf-8");
+  const hasCRLF = raw.includes("\r\n");
+  const source = hasCRLF ? raw.replace(/\r\n/g, "\n") : raw;
+  return { source, hasCRLF };
+}
+
+// ─────────────────────────────────────────────
+// Fuzzy match helper
+//
+// When replace_string fails, the most common cause on Windows is
+// whitespace differences:
+//   - LLM sends search_string with \n between lines
+//   - file has \r\n (fixed by readSource normalization)
+//   - OR LLM uses 2-space indent but file uses 4-space
+//   - OR LLM omits/adds a trailing newline
+//
+// findFuzzyMatch strips all whitespace from both the search string and
+// a sliding window of the source to find a content-identical match.
+// When found, it returns the EXACT raw slice from source so the LLM
+// can use it verbatim as search_string on the next attempt.
+//
+// Returns: string (exact match from source) | null (no match found)
+// ─────────────────────────────────────────────
+
+function findFuzzyMatch(source, searchString) {
+  // Strip all whitespace to get canonical token sequence
+  const needleTokens = searchString.replace(/\s+/g, "");
+  if (needleTokens.length === 0) return null;
+
+  const lines = source.split("\n");
+  const needleLines = searchString.split("\n").length;
+  // Search window: needle line count ± 3 lines to account for blank line differences
+  const windowSize = needleLines + 3;
+
+  for (let start = 0; start <= lines.length - needleLines + 3; start++) {
+    for (
+      let end = start + Math.max(1, needleLines - 3);
+      end <= Math.min(lines.length, start + windowSize);
+      end++
+    ) {
+      const candidate = lines.slice(start, end).join("\n");
+      const candidateTokens = candidate.replace(/\s+/g, "");
+
+      if (candidateTokens === needleTokens) {
+        return candidate; // exact raw slice from source
+      }
+    }
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────
 // Symbol resolution
 // ─────────────────────────────────────────────
 
-/**
- * Resolve a symbol to its graph record, verifying it lives in the
- * requested file. Accepts relative and absolute path variants.
- *
- * @returns {{ row, normalizedFilePath } | { error: string }}
- */
 function resolveSymbol(symbolName, filePath) {
   const rows = queryFindSymbol(symbolName);
 
@@ -94,27 +135,9 @@ function resolveSymbol(symbolName, filePath) {
 // Body integrity check
 // ─────────────────────────────────────────────
 
-/**
- * Verify the body stored in the graph matches what is currently on disk.
- *
- * Uses body_text (stored at index time) as ground truth.
- * body_start_line / body_end_line are 0-based, sourced directly from
- * Tree-sitter — no offset correction needed.
- *
- * If the check fails, the caller re-indexes before patching.
- *
- * @param {string[]} lines   — current file split by "\n"
- * @param {object}   row     — graph node row from queryFindSymbol
- * @returns {{ stale: boolean, reason?: string }}
- */
 function checkBodyIntegrity(lines, row) {
-  if (!row.body_text) {
-    // No body stored (e.g. import node) — proceed on line numbers alone
-    return { stale: false };
-  }
+  if (!row.body_text) return { stale: false };
 
-  // body_start_line and body_end_line are 0-based.
-  // body_end_line is the last line inclusive — slice end must be +1.
   const bodyStart = row.body_start_line ?? row.start_line;
   const bodyEnd = row.body_end_line ?? row.end_line;
 
@@ -127,19 +150,16 @@ function checkBodyIntegrity(lines, row) {
     };
   }
 
-  // Slice is 0-based start, exclusive end → bodyEnd + 1
   const currentBody = lines
     .slice(bodyStart, bodyEnd + 1)
     .join("\n")
     .trim();
-  const indexedBody = row.body_text.trim();
+  const indexedBody = row.body_text.replace(/\r\n/g, "\n").trim();
 
   if (currentBody !== indexedBody) {
     return {
       stale: true,
-      reason:
-        `Body mismatch at lines ${bodyStart}–${bodyEnd}. ` +
-        `File has been modified since last index.`,
+      reason: `Body mismatch at lines ${bodyStart}–${bodyEnd}. File modified since last index.`,
     };
   }
 
@@ -150,36 +170,14 @@ function checkBodyIntegrity(lines, row) {
 // Indentation preservation
 // ─────────────────────────────────────────────
 
-/**
- * Re-indent new_body to match the indentation of the original symbol.
- *
- * Problem: LLM generates new_body starting at column 0 (flat).
- * If the target symbol is indented (e.g. a method inside a class),
- * writing flat text corrupts the file's formatting.
- * For Python, this also breaks semantics.
- *
- * Algorithm:
- *   1. Capture leading whitespace from the first line of the original symbol.
- *   2. Find the minimum indentation already present in new_body (strip base).
- *   3. Prepend the captured indent to every non-blank line.
- *
- * @param {string}   newBody      — replacement code from LLM
- * @param {string[]} fileLines    — current file lines (0-based)
- * @param {number}   startLine    — 0-based start line of original symbol
- * @returns {string[]}            — re-indented lines ready for splice
- */
 function reindentBody(newBody, fileLines, startLine) {
   const originalFirstLine = fileLines[startLine] || "";
   const indentMatch = originalFirstLine.match(/^(\s+)/);
   const baseIndent = indentMatch ? indentMatch[1] : "";
 
-  // No indentation on original → nothing to do
   if (!baseIndent) return newBody.split("\n");
 
   const bodyLines = newBody.split("\n");
-
-  // Find minimum existing indent in new_body (ignoring blank lines)
-  // so we strip it cleanly before applying the file's indent level.
   const existingIndents = bodyLines
     .filter((l) => l.trim().length > 0)
     .map((l) => {
@@ -191,9 +189,8 @@ function reindentBody(newBody, fileLines, startLine) {
     existingIndents.length > 0 ? Math.min(...existingIndents) : 0;
 
   return bodyLines.map((l) => {
-    if (l.trim().length === 0) return ""; // blank line — no indent
-    const stripped = l.slice(minIndent); // strip LLM's base indent
-    return baseIndent + stripped; // apply file's indent
+    if (l.trim().length === 0) return "";
+    return baseIndent + l.slice(minIndent);
   });
 }
 
@@ -201,71 +198,46 @@ function reindentBody(newBody, fileLines, startLine) {
 // Line splice
 // ─────────────────────────────────────────────
 
-/**
- * Apply the patch operation to the file's lines array.
- *
- * LINE INDEXING:
- *   start_line and end_line are 0-based (as stored in graphDb).
- *   end_line is the last line of the symbol, inclusive.
- *   Slice to exclude: lines.slice(end_line + 1) gets everything after.
- *
- * @param {string[]} lines      — current file lines
- * @param {object}   row        — graph node (start_line, end_line are 0-based)
- * @param {string}   newBody    — replacement source from LLM
- * @param {string}   operation  — PATCH_OPERATIONS value
- * @returns {string[]}          — modified lines array
- */
 function applyLineSplice(lines, row, newBody, operation) {
-  // 0-based, used directly — no offset correction
   const startIdx = row.start_line;
   const endIdx = row.end_line;
-
-  // Re-indent before splicing
   const newLines = reindentBody(newBody, lines, startIdx);
 
   switch (operation) {
     case PATCH_OPERATIONS.REPLACE_BODY:
       return [
-        ...lines.slice(0, startIdx), // before symbol
-        ...newLines, // replacement
-        ...lines.slice(endIdx + 1), // after symbol
+        ...lines.slice(0, startIdx),
+        ...newLines,
+        ...lines.slice(endIdx + 1),
       ];
-
     case PATCH_OPERATIONS.INSERT_AFTER:
       return [
-        ...lines.slice(0, endIdx + 1), // up to and including symbol
+        ...lines.slice(0, endIdx + 1),
         ...newLines,
-        ...lines.slice(endIdx + 1), // rest of file
+        ...lines.slice(endIdx + 1),
       ];
-
     case PATCH_OPERATIONS.INSERT_BEFORE:
       return [
-        ...lines.slice(0, startIdx), // before symbol
+        ...lines.slice(0, startIdx),
         ...newLines,
-        ...lines.slice(startIdx), // symbol onward
+        ...lines.slice(startIdx),
       ];
-
     case PATCH_OPERATIONS.DELETE:
       return [...lines.slice(0, startIdx), ...lines.slice(endIdx + 1)];
-
     default:
       throw new Error(`Unknown operation: ${operation}`);
   }
 }
 
 // ─────────────────────────────────────────────
-// Atomic write
+// Atomic write — restores original line endings
 // ─────────────────────────────────────────────
 
-/**
- * Write content atomically.
- * Temp file → rename prevents partial writes on crash.
- * On POSIX rename is atomic. On Windows: best-effort.
- */
-function atomicWrite(filePath, content) {
+function atomicWrite(filePath, content, hasCRLF = false) {
+  const output = hasCRLF ? content.replace(/\n/g, "\r\n") : content;
   const tmpPath = filePath + ".cf_tmp";
   try {
-    fs.writeFileSync(tmpPath, content, "utf-8");
+    fs.writeFileSync(tmpPath, output, "utf-8");
     fs.renameSync(tmpPath, filePath);
   } catch (err) {
     try {
@@ -281,11 +253,6 @@ function atomicWrite(filePath, content) {
 // Re-index
 // ─────────────────────────────────────────────
 
-/**
- * Re-index a single file after patching.
- * Synchronous — graph must be current before we return the result
- * so the next contextforge_query_graph call sees updated line numbers.
- */
 function reindexFile(filePath, newSource) {
   try {
     const langInfo = getLanguageForFile(filePath);
@@ -302,11 +269,10 @@ function reindexFile(filePath, newSource) {
     });
 
     console.log(
-      `[PatchEngine] 🔄 Re-indexed ${filePath} ` +
+      `[PatchEngine] 🔄 Re-indexed ${path.basename(filePath)} ` +
         `(${nodes.length} nodes, ${edges.length} edges)`,
     );
   } catch (err) {
-    // Non-fatal — graph self-heals on next watchWorkspace event
     console.error(
       `[PatchEngine] ⚠️  Re-index failed for ${filePath}: ${err.message}`,
     );
@@ -318,40 +284,50 @@ function reindexFile(filePath, newSource) {
 // ─────────────────────────────────────────────
 
 function buildDiffSummary(linesBefore, linesAfter, startLine, endLine) {
-  const removed = endLine - startLine + 1; // 0-based inclusive range
+  const removed = endLine - startLine + 1;
   const netDelta = linesAfter - linesBefore;
   const sign = netDelta >= 0 ? "+" : "";
   return `${sign}${netDelta} lines net (${removed} removed, ${removed + netDelta} inserted)`;
 }
 
 // ─────────────────────────────────────────────
+// Post-patch cache invalidation
+// ─────────────────────────────────────────────
+
+function postPatchInvalidate(normalizedFilePath, newSource, semanticCache) {
+  try {
+    const newHash = crypto.createHash("sha256").update(newSource).digest("hex");
+    invalidateByFile(normalizedFilePath, newHash, semanticCache);
+  } catch (err) {
+    console.warn(`[PatchEngine] ⚠️  Vault invalidation failed: ${err.message}`);
+  }
+  try {
+    invalidateRegistryEntry(normalizedFilePath);
+  } catch (err) {
+    console.warn(
+      `[PatchEngine] ⚠️  SimHash registry invalidation failed: ${err.message}`,
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
 // Main export
 // ─────────────────────────────────────────────
 
-/**
- * Apply a patch to a source file.
- *
- * @param {object} args
- * @param {string} args.file_path
- * @param {string} args.target_symbol
- * @param {string} args.new_body
- * @param {string} args.operation
- * @param {object} [args.semanticCache]   — for vault cache invalidation
- *
- * @returns {object}  always has { success: boolean }
- */
 export async function executePatch({
   file_path,
-  target_symbol,
+  target_symbol = null,
   new_body = "",
   operation = PATCH_OPERATIONS.REPLACE_BODY,
+  search_string = null,
+  replacement_string = null,
+  insert_line = null, // ← new: for INSERT_AT_LINE
   semanticCache = null,
 }) {
   console.log(
-    `[PatchEngine] 🩹 ${operation}('${target_symbol}') in ${file_path}`,
+    `[PatchEngine] 🩹 ${operation}('${target_symbol || "GLOBAL"}') in ${file_path}`,
   );
 
-  // ── Validate operation ──
   if (!Object.values(PATCH_OPERATIONS).includes(operation)) {
     return {
       success: false,
@@ -359,25 +335,250 @@ export async function executePatch({
     };
   }
 
-  if (operation !== PATCH_OPERATIONS.DELETE && !new_body?.trim()) {
+  // ── INSERT_AT_LINE: no symbol needed, just a line number ─────────────────
+  // This is the solution for anonymous handlers (SSE handler in server.js).
+  // find_route returns the line number, LLM calls insert_at_line directly.
+  if (operation === PATCH_OPERATIONS.INSERT_AT_LINE) {
+    if (
+      insert_line === null ||
+      insert_line === undefined ||
+      !Number.isInteger(Number(insert_line))
+    ) {
+      return {
+        success: false,
+        error:
+          "insert_at_line requires an integer insert_line parameter (1-based line number).",
+      };
+    }
+    if (!new_body?.trim()) {
+      return { success: false, error: "insert_at_line requires new_body." };
+    }
+
+    const normalizedFilePath = file_path
+      .replace(/\\/g, "/")
+      .replace(/^\.\//, "");
+    let source, hasCRLF;
+    try {
+      ({ source, hasCRLF } = readSource(normalizedFilePath));
+    } catch (err) {
+      return {
+        success: false,
+        error: `Cannot read '${normalizedFilePath}': ${err.message}`,
+      };
+    }
+
+    const lines = source.split("\n");
+    const lineNumber = Number(insert_line);
+
+    // Clamp to valid range: 1 = before first line, lines.length+1 = after last line
+    if (lineNumber < 1 || lineNumber > lines.length + 1) {
+      return {
+        success: false,
+        error: `insert_line ${lineNumber} out of range (file has ${lines.length} lines, valid range 1–${lines.length + 1}).`,
+      };
+    }
+
+    // splice is 0-based, insert_line is 1-based
+    const insertIdx = lineNumber - 1;
+    const newBodyLines = new_body.split("\n");
+    const newLines = [
+      ...lines.slice(0, insertIdx),
+      ...newBodyLines,
+      ...lines.slice(insertIdx),
+    ];
+    const newSource = newLines.join("\n");
+
+    try {
+      atomicWrite(normalizedFilePath, newSource, hasCRLF);
+    } catch (err) {
+      return { success: false, error: `Write failed: ${err.message}` };
+    }
+
+    console.log(
+      `[PatchEngine] ✅ insert_at_line ${lineNumber}: ${path.basename(normalizedFilePath)} ` +
+        `(${lines.length} → ${newLines.length} lines)`,
+    );
+
+    reindexFile(normalizedFilePath, newSource);
+    postPatchInvalidate(normalizedFilePath, newSource, semanticCache);
+
+    return {
+      success: true,
+      file: normalizedFilePath,
+      symbol: null,
+      operation,
+      insert_line: lineNumber,
+      lines_inserted: newBodyLines.length,
+      file_lines_after: newLines.length,
+      message: `Inserted ${newBodyLines.length} line(s) at line ${lineNumber} in ${path.basename(normalizedFilePath)}.`,
+    };
+  }
+
+  // ── replace_string validation ──
+  if (operation === PATCH_OPERATIONS.REPLACE_STRING) {
+    if (
+      !search_string ||
+      typeof search_string !== "string" ||
+      !search_string.trim()
+    ) {
+      return {
+        success: false,
+        error: "replace_string requires a non-empty search_string parameter.",
+      };
+    }
+    if (replacement_string === null || replacement_string === undefined) {
+      return {
+        success: false,
+        error:
+          'replace_string requires a replacement_string parameter. Pass "" to delete.',
+      };
+    }
+  }
+
+  if (
+    operation !== PATCH_OPERATIONS.DELETE &&
+    operation !== PATCH_OPERATIONS.REPLACE_STRING &&
+    !new_body?.trim()
+  ) {
     return {
       success: false,
       error: "new_body is required for non-delete operations",
     };
   }
 
+  // ── GLOBAL REPLACE_STRING (no target_symbol) ──────────────────────────
+  if (!target_symbol) {
+    if (operation !== PATCH_OPERATIONS.REPLACE_STRING) {
+      return {
+        success: false,
+        error: `target_symbol is required for ${operation}. Only replace_string and insert_at_line can be used without a target_symbol.`,
+      };
+    }
+
+    const normalizedFilePath = file_path
+      .replace(/\\/g, "/")
+      .replace(/^\.\//, "");
+    let source, hasCRLF;
+    try {
+      ({ source, hasCRLF } = readSource(normalizedFilePath));
+    } catch (err) {
+      return {
+        success: false,
+        error: `Cannot read '${normalizedFilePath}': ${err.message}`,
+      };
+    }
+
+    if (source.length > MAX_PATCHABLE_FILE_SIZE) {
+      return {
+        success: false,
+        error: `File too large to patch (${source.length} chars > ${MAX_PATCHABLE_FILE_SIZE})`,
+      };
+    }
+
+    const normalizedSearch = search_string.replace(/\r\n/g, "\n");
+
+    if (!source.includes(normalizedSearch)) {
+      // ── FIX: Auto-apply fuzzy match instead of asking LLM to retry ──
+      // Previously returned a "Did you mean?" error with <exact_match> tags,
+      // forcing the LLM to burn an entire round-trip (~8-10k tokens) just to
+      // copy-paste the exact text. Now we auto-apply the replacement using
+      // the fuzzy-matched text, saving a full LLM hop.
+      const fuzzyMatch = findFuzzyMatch(source, normalizedSearch);
+      if (fuzzyMatch) {
+        console.log(
+          `[PatchEngine] 🔧 Fuzzy match found (whitespace diff). Auto-applying replacement.`,
+        );
+        const newSource = source.replaceAll(fuzzyMatch, replacement_string);
+        try {
+          atomicWrite(normalizedFilePath, newSource, hasCRLF);
+        } catch (err) {
+          return { success: false, error: `Write failed: ${err.message}` };
+        }
+        const linesChanged = fuzzyMatch.split("\n").length;
+        console.log(
+          `[PatchEngine] ✅ replace_string (global, fuzzy): ${path.basename(normalizedFilePath)} ` +
+            `(${linesChanged} line(s) changed)`,
+        );
+        reindexFile(normalizedFilePath, newSource);
+        postPatchInvalidate(normalizedFilePath, newSource, semanticCache);
+        const fuzzyMatchOffset = source.indexOf(fuzzyMatch);
+        const fuzzyPatchStartLine =
+          fuzzyMatchOffset >= 0
+            ? source.slice(0, fuzzyMatchOffset).split("\n").length - 1
+            : null;
+        const fuzzyPatchEndLine =
+          fuzzyPatchStartLine !== null
+            ? fuzzyPatchStartLine + linesChanged - 1
+            : null;
+
+        return {
+          success: true,
+          file: normalizedFilePath,
+          symbol: null,
+          operation,
+          lines_changed: linesChanged,
+          fuzzy_applied: true,
+          patch_start_line: fuzzyPatchStartLine,
+          patch_end_line: fuzzyPatchEndLine,
+          message: `replace_string applied (auto-corrected whitespace differences). ${linesChanged} line(s) changed. Graph re-indexed.`,
+        };
+      }
+      return {
+        success: false,
+        error:
+          `replace_string: search_string not found anywhere in '${normalizedFilePath}'. ` +
+          `Ensure you are targeting the correct file and the text matches exactly.`,
+        search_string_preview: search_string.slice(0, 120),
+      };
+    }
+
+    const newSource = source.replaceAll(normalizedSearch, replacement_string);
+
+    try {
+      atomicWrite(normalizedFilePath, newSource, hasCRLF);
+    } catch (err) {
+      return { success: false, error: `Write failed: ${err.message}` };
+    }
+
+    const linesChanged = normalizedSearch.split("\n").length;
+    // Find where the match occurred so patchTools.js can read back the patched region
+    const matchOffset = source.indexOf(normalizedSearch);
+    const patchStartLine =
+      matchOffset >= 0
+        ? source.slice(0, matchOffset).split("\n").length - 1
+        : null;
+    const patchEndLine =
+      patchStartLine !== null ? patchStartLine + linesChanged - 1 : null;
+
+    console.log(
+      `[PatchEngine] ✅ replace_string (global): ${path.basename(normalizedFilePath)} ` +
+        `(${linesChanged} line(s) changed)`,
+    );
+
+    reindexFile(normalizedFilePath, newSource);
+    postPatchInvalidate(normalizedFilePath, newSource, semanticCache);
+
+    return {
+      success: true,
+      file: normalizedFilePath,
+      symbol: null,
+      operation,
+      lines_changed: linesChanged,
+      patch_start_line: patchStartLine,
+      patch_end_line: patchEndLine,
+      message: `replace_string applied globally. ${linesChanged} line(s) changed. Graph re-indexed.`,
+    };
+  }
+
   // ── Resolve symbol ──
   const resolved = resolveSymbol(target_symbol, file_path);
-  if (resolved.error) {
-    return { success: false, error: resolved.error };
-  }
+  if (resolved.error) return { success: false, error: resolved.error };
 
   let { row, normalizedFilePath } = resolved;
 
-  // ── Read file ──
-  let source;
+  let source, hasCRLF;
   try {
-    source = fs.readFileSync(normalizedFilePath, "utf-8");
+    ({ source, hasCRLF } = readSource(normalizedFilePath));
   } catch (err) {
     return {
       success: false,
@@ -386,60 +587,236 @@ export async function executePatch({
   }
 
   if (source.length > MAX_PATCHABLE_FILE_SIZE) {
-    return {
-      success: false,
-      error: `File too large to patch (${source.length} chars > ${MAX_PATCHABLE_FILE_SIZE})`,
-    };
+    return { success: false, error: `File too large (${source.length} chars)` };
   }
 
-  const lines = source.split("\n");
+  let lines = source.split("\n");
 
-  // ── Integrity check — re-index if stale ──
   const integrity = checkBodyIntegrity(lines, row);
   if (integrity.stale) {
     console.log(
-      `[PatchEngine] ⚠️  Stale index: ${integrity.reason}. Re-indexing...`,
+      `[PatchEngine] ⚠️  Stale index: ${integrity.reason}. Re-indexing…`,
     );
     reindexFile(normalizedFilePath, source);
-
-    // Re-resolve with fresh data
     const fresh = resolveSymbol(target_symbol, file_path);
-    if (fresh.error) {
+    if (fresh.error)
       return { success: false, error: `After re-index: ${fresh.error}` };
-    }
     row = fresh.row;
+    // FIX: Re-read lines from current source to match fresh row bounds.
+    // Previously the stale `lines` array was used with fresh row indices,
+    // causing off-by-one mismatches when the file had been modified.
+    try {
+      ({ source, hasCRLF } = readSource(normalizedFilePath));
+      lines = source.split("\n");
+    } catch {
+      /* use existing source — fine */
+    }
   }
 
-  // ── Safety check: incomplete new_body guard ──────────────────────────────
-  // If new_body is suspiciously shorter than the original symbol,
-  // the LLM likely generated from a truncated body reference.
-  // Reject early — no disk write occurs.
   if (operation === PATCH_OPERATIONS.REPLACE_BODY) {
     const symbolLineCount = row.end_line - row.start_line + 1;
     const newBodyLineCount = new_body.split("\n").length;
-    const SUSPICIOUS_RATIO = 0.3;
-
-    if (
-      symbolLineCount > 20 &&
-      newBodyLineCount < symbolLineCount * SUSPICIOUS_RATIO
-    ) {
+    if (symbolLineCount > 20 && newBodyLineCount < symbolLineCount * 0.3) {
       return {
         success: false,
         error:
-          `Safety check: new_body is ${newBodyLineCount} lines but ` +
-          `'${target_symbol}' is ${symbolLineCount} lines in the graph. ` +
-          `new_body appears incomplete. ` +
-          `Call contextforge_retrieve(vault_id, search_query:"${target_symbol}") ` +
-          `to retrieve just this function, then resubmit with the complete body.`,
+          `Safety check: new_body is ${newBodyLineCount} lines but '${target_symbol}' ` +
+          `is ${symbolLineCount} lines. new_body appears incomplete.`,
         hint: "retrieve_symbol_not_file",
-        symbol: target_symbol,
-        symbol_lines: symbolLineCount,
-        new_body_lines: newBodyLineCount,
       };
     }
   }
 
-  // ── Splice ──
+  if (operation === PATCH_OPERATIONS.REPLACE_STRING) {
+    const startIdx = row.start_line;
+    const endIdx = row.end_line;
+    const symbolBlock = lines.slice(startIdx, endIdx + 1).join("\n");
+
+    const normalizedSearch = search_string.replace(/\r\n/g, "\n");
+
+    if (!symbolBlock.includes(normalizedSearch)) {
+      // ── FIX: Auto-escalation chain instead of returning errors ──
+      // Previously each failure returned an error to the LLM, costing a full
+      // round-trip (~8-10k tokens) per attempt. Now we try 3 strategies
+      // in sequence WITHOUT burning LLM hops:
+      //   1. Fuzzy match within symbol scope → auto-apply
+      //   2. Exact match in global file scope → auto-apply
+      //   3. Fuzzy match in global file scope → auto-apply
+      //   4. All failed → return error (only 1 LLM hop burned)
+
+      // Strategy 1: Fuzzy match within symbol body
+      const fuzzyInSymbol = findFuzzyMatch(symbolBlock, normalizedSearch);
+      if (fuzzyInSymbol) {
+        console.log(
+          `[PatchEngine] 🔧 Fuzzy match inside '${target_symbol}'. Auto-applying.`,
+        );
+        const updatedBlock = symbolBlock.replaceAll(
+          fuzzyInSymbol,
+          replacement_string,
+        );
+        const updatedBlockLines = updatedBlock.split("\n");
+        const newLines = [
+          ...lines.slice(0, startIdx),
+          ...updatedBlockLines,
+          ...lines.slice(endIdx + 1),
+        ];
+        const newSource = newLines.join("\n");
+        try {
+          atomicWrite(normalizedFilePath, newSource, hasCRLF);
+        } catch (err) {
+          return { success: false, error: `Write failed: ${err.message}` };
+        }
+        const linesChanged = fuzzyInSymbol.split("\n").length;
+        console.log(
+          `[PatchEngine] ✅ replace_string (symbol, fuzzy): ${path.basename(normalizedFilePath)} ` +
+            `(${linesChanged} line(s) changed inside '${target_symbol}')`,
+        );
+        reindexFile(normalizedFilePath, newSource);
+        postPatchInvalidate(normalizedFilePath, newSource, semanticCache);
+        const symFuzzyOffset = symbolBlock.indexOf(fuzzyInSymbol);
+        const symFuzzyStartLine =
+          symFuzzyOffset >= 0
+            ? startIdx +
+              symbolBlock.slice(0, symFuzzyOffset).split("\n").length -
+              1
+            : startIdx;
+        const symFuzzyEndLine = symFuzzyStartLine + linesChanged - 1;
+
+        return {
+          success: true,
+          file: normalizedFilePath,
+          symbol: target_symbol,
+          operation,
+          lines_changed: linesChanged,
+          fuzzy_applied: true,
+          patch_start_line: symFuzzyStartLine,
+          patch_end_line: symFuzzyEndLine,
+          message: `replace_string applied inside '${target_symbol}' (auto-corrected whitespace). ${linesChanged} line(s) changed. Graph re-indexed.`,
+        };
+      }
+
+      // Strategy 2: Exact match in global file scope (text exists outside symbol bounds)
+      if (source.includes(normalizedSearch)) {
+        console.log(
+          `[PatchEngine] 🔧 Search string not in '${target_symbol}' but found in file. Auto-escalating to global scope.`,
+        );
+        const newSource = source.replaceAll(
+          normalizedSearch,
+          replacement_string,
+        );
+        try {
+          atomicWrite(normalizedFilePath, newSource, hasCRLF);
+        } catch (err) {
+          return { success: false, error: `Write failed: ${err.message}` };
+        }
+        const linesChanged = normalizedSearch.split("\n").length;
+        console.log(
+          `[PatchEngine] ✅ replace_string (auto-escalated to global): ${path.basename(normalizedFilePath)} ` +
+            `(${linesChanged} line(s) changed)`,
+        );
+        reindexFile(normalizedFilePath, newSource);
+        postPatchInvalidate(normalizedFilePath, newSource, semanticCache);
+        return {
+          success: true,
+          file: normalizedFilePath,
+          symbol: null,
+          operation,
+          lines_changed: linesChanged,
+          auto_escalated: true,
+          message: `replace_string applied (auto-escalated from '${target_symbol}' to global scope — text was outside symbol bounds). ${linesChanged} line(s) changed. Graph re-indexed.`,
+        };
+      }
+
+      // Strategy 3: Fuzzy match in global file scope
+      const fuzzyInFile = findFuzzyMatch(source, normalizedSearch);
+      if (fuzzyInFile) {
+        console.log(
+          `[PatchEngine] 🔧 Fuzzy match found in file (outside '${target_symbol}'). Auto-applying globally.`,
+        );
+        const newSource = source.replaceAll(fuzzyInFile, replacement_string);
+        try {
+          atomicWrite(normalizedFilePath, newSource, hasCRLF);
+        } catch (err) {
+          return { success: false, error: `Write failed: ${err.message}` };
+        }
+        const linesChanged = fuzzyInFile.split("\n").length;
+        console.log(
+          `[PatchEngine] ✅ replace_string (global, fuzzy): ${path.basename(normalizedFilePath)} ` +
+            `(${linesChanged} line(s) changed)`,
+        );
+        reindexFile(normalizedFilePath, newSource);
+        postPatchInvalidate(normalizedFilePath, newSource, semanticCache);
+        return {
+          success: true,
+          file: normalizedFilePath,
+          symbol: null,
+          operation,
+          lines_changed: linesChanged,
+          fuzzy_applied: true,
+          auto_escalated: true,
+          message: `replace_string applied (auto-escalated to global + auto-corrected whitespace). ${linesChanged} line(s) changed. Graph re-indexed.`,
+        };
+      }
+
+      // All strategies exhausted — return error (only 1 LLM hop burned total)
+      return {
+        success: false,
+        error:
+          `replace_string: search_string not found inside '${target_symbol}' or anywhere in '${normalizedFilePath}' ` +
+          `(even after fuzzy whitespace matching). Verify the exact text exists in the current file version. ` +
+          `TIP: Use find_symbol('${target_symbol}') to get the current body, then copy the exact text.`,
+        symbol: target_symbol,
+        search_string_preview: search_string.slice(0, 200),
+      };
+    }
+
+    const updatedBlock = symbolBlock.replaceAll(
+      normalizedSearch,
+      replacement_string,
+    );
+    const updatedBlockLines = updatedBlock.split("\n");
+    const newLines = [
+      ...lines.slice(0, startIdx),
+      ...updatedBlockLines,
+      ...lines.slice(endIdx + 1),
+    ];
+    const newSource = newLines.join("\n");
+
+    try {
+      atomicWrite(normalizedFilePath, newSource, hasCRLF);
+    } catch (err) {
+      return { success: false, error: `Write failed: ${err.message}` };
+    }
+
+    const linesChanged = normalizedSearch.split("\n").length;
+    console.log(
+      `[PatchEngine] ✅ replace_string: ${path.basename(normalizedFilePath)} ` +
+        `(${linesChanged} line(s) changed inside '${target_symbol}')`,
+    );
+
+    reindexFile(normalizedFilePath, newSource);
+    postPatchInvalidate(normalizedFilePath, newSource, semanticCache);
+
+    // Find line number within symbol block
+    const symMatchOffset = symbolBlock.indexOf(normalizedSearch);
+    const symPatchStartLine =
+      symMatchOffset >= 0
+        ? startIdx + symbolBlock.slice(0, symMatchOffset).split("\n").length - 1
+        : startIdx;
+    const symPatchEndLine = symPatchStartLine + linesChanged - 1;
+
+    return {
+      success: true,
+      file: normalizedFilePath,
+      symbol: target_symbol,
+      operation,
+      lines_changed: linesChanged,
+      patch_start_line: symPatchStartLine,
+      patch_end_line: symPatchEndLine,
+      message: `replace_string applied. ${linesChanged} line(s) changed inside '${target_symbol}'. Graph re-indexed.`,
+    };
+  }
+
   let newLines;
   try {
     newLines = applyLineSplice(lines, row, new_body, operation);
@@ -449,46 +826,20 @@ export async function executePatch({
 
   const newSource = newLines.join("\n");
 
-  // ── Atomic write ──
   try {
-    atomicWrite(normalizedFilePath, newSource);
+    atomicWrite(normalizedFilePath, newSource, hasCRLF);
   } catch (err) {
     return { success: false, error: `Write failed: ${err.message}` };
   }
 
   console.log(
-    `[PatchEngine] ✅ Written: ${normalizedFilePath} ` +
+    `[PatchEngine] ✅ Written: ${path.basename(normalizedFilePath)} ` +
       `(${lines.length} → ${newLines.length} lines)`,
   );
 
-  // ── Re-index ──
   reindexFile(normalizedFilePath, newSource);
+  postPatchInvalidate(normalizedFilePath, newSource, semanticCache);
 
-  // ── Full cache invalidation ──
-  // Three layers must all be cleared:
-  //   1. SQLite vault entries for this file path
-  //   2. Semantic vector cache entries
-  //   3. SemanticDedup in-process SimHash registry
-  try {
-    const newHash = crypto.createHash("sha256").update(newSource).digest("hex");
-
-    invalidateByFile(normalizedFilePath, newHash, semanticCache);
-    console.log(
-      `[PatchEngine] 🗑️  Vault cache invalidated: ${normalizedFilePath}`,
-    );
-  } catch (err) {
-    console.warn(`[PatchEngine] ⚠️  Vault invalidation failed: ${err.message}`);
-  }
-
-  try {
-    invalidateRegistryEntry(normalizedFilePath);
-  } catch (err) {
-    console.warn(
-      `[PatchEngine] ⚠️  SimHash registry invalidation failed: ${err.message}`,
-    );
-  }
-
-  // ── Result ──
   const diffSummary = buildDiffSummary(
     lines.length,
     newLines.length,
@@ -501,14 +852,11 @@ export async function executePatch({
     file: normalizedFilePath,
     symbol: target_symbol,
     operation,
-    lines_before: row.start_line, // 0-based, as stored
-    lines_after: row.end_line, // 0-based, as stored
+    lines_before: row.start_line,
+    lines_after: row.end_line,
     file_lines_before: lines.length,
     file_lines_after: newLines.length,
     diff_summary: diffSummary,
-    message:
-      `Patch applied. '${target_symbol}' in ${normalizedFilePath} updated ` +
-      `(${diffSummary}). Graph re-indexed. ` +
-      `Use contextforge_query_graph find_symbol to verify new line numbers.`,
+    message: `Patch applied. '${target_symbol}' in ${normalizedFilePath} updated (${diffSummary}). Graph re-indexed.`,
   };
 }

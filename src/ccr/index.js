@@ -92,6 +92,9 @@ function scanNewMessagesOnly(sessionId, messages) {
  *        double-counting (pipeline already counted before this stage).
  * Fix 2: Only scan NEW messages for vault markers (O(1) per turn
  *        instead of O(history)).
+ * Fix 3 (Phase 1): Proactive expansion disabled — it added 200-500 tokens
+ *        speculatively without meaningful precision. The retrieve tool
+ *        is injected on-demand; LLM pulls context when it needs it.
  *
  * @param {object} payload        - The translated OpenAI payload
  * @param {number} [tokenCount]   - Pre-counted tokens from pipeline (optional)
@@ -102,7 +105,7 @@ export function applyCCRPipeline(payload, tokenCount = null) {
   const tokens = tokenCount ?? countTokens(payload);
 
   if (tokens < CCR_MIN_TOKENS) {
-    console.log(`[CCR] ⏭️  Skipped — ${tokens} tokens below threshold`);
+    // console.log(`[CCR] ⏭️  Skipped — ${tokens} tokens below threshold`);
     return payload;
   }
 
@@ -121,7 +124,7 @@ export function applyCCRPipeline(payload, tokenCount = null) {
   // Manually set detected vault IDs from our incremental scan
   injector._detectedVaultIds = [
     ...session.knownVaultIds, // vaults from prior turns (sticky)
-    ...newVaultIds, // vaults found in new messages
+    ...newVaultIds,           // vaults found in new messages
   ];
 
   const { messages, tools, toolWasInjected } = injector.processRequest(
@@ -141,7 +144,8 @@ export function applyCCRPipeline(payload, tokenCount = null) {
     );
   }
 
-  // Track new vault IDs in context tracker
+  // Track new vault IDs in context tracker (kept for future query-matching
+  // improvements — only the proactive push is disabled, not the tracking itself)
   for (const vaultId of newVaultIds) {
     // Register in session for sticky tracking
     session.addKnownVaultId?.(vaultId);
@@ -155,21 +159,28 @@ export function applyCCRPipeline(payload, tokenCount = null) {
     });
   }
 
-  // Proactive expansion
-  const currentQuery = extractLastUserQuery(messages);
-  if (currentQuery) {
-    const recommendations = contextTracker.analyzeQuery(currentQuery, {
-      currentTurn: turnNumber,
-      workspaceKey,
-    });
-
-    if (recommendations.length > 0) {
-      console.log(
-        `[CCR] 🔮 Proactive expansion: ${recommendations.length} vault(s) relevant to query`,
-      );
-      payload._ccrRecommendations = recommendations;
-    }
-  }
+  // ── Proactive expansion — DISABLED (Phase 1 dead-weight removal) ──
+  //
+  // Audit finding: Fires speculatively and adds 200-500 tokens of vault
+  // context the LLM never uses. The retrieve tool injected above already
+  // gives the LLM on-demand access. Proactive push causes net-negative
+  // compression on sessions where the predicted vault isn't relevant.
+  //
+  // To re-enable: gate on confidence > 0.85 and verify precision in logs.
+  //
+  // const currentQuery = extractLastUserQuery(messages);
+  // if (currentQuery) {
+  //   const recommendations = contextTracker.analyzeQuery(currentQuery, {
+  //     currentTurn: turnNumber,
+  //     workspaceKey,
+  //   });
+  //   if (recommendations.length > 0) {
+  //     console.log(
+  //       `[CCR] 🔮 Proactive expansion: ${recommendations.length} vault(s) relevant to query`,
+  //     );
+  //     payload._ccrRecommendations = recommendations;
+  //   }
+  // }
 
   return {
     ...payload,

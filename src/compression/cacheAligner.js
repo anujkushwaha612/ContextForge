@@ -4,8 +4,18 @@ import { statsEmitter } from "../proxy/statsEmitter.js";
 // ─────────────────────────────────────────────
 // Dynamic content patterns
 // ─────────────────────────────────────────────
+//
+// Two sets of patterns:
+//   DYNAMIC_PATTERNS      — Claude Code / Anthropic format
+//   GEMINI_DYNAMIC_PATTERNS — Gemini CLI session_context format
+//
+// Both sets are checked by isDynamicLine(). Lines matching either
+// set are classified as dynamic and excluded from the static prefix
+// hash, preventing false "prefix changed" warnings on every turn.
+// ─────────────────────────────────────────────
 
 const DYNAMIC_PATTERNS = [
+  // ── Claude Code / Anthropic ──
   /^.*Today(?:'s)? date is .+/i,
   /^.*Current date:? .+/i,
   /^.*The current (?:month|year|date) is .+/i,
@@ -32,18 +42,50 @@ const DYNAMIC_PATTERNS = [
   /^.*Platform:? .+/i,
   /^.*Shell:? .+/i,
   /^.*OS Version:? .+/i,
+
+  // ── Gemini CLI session_context ──
+  // These appear in the <session_context> block sent as the first
+  // user message every turn. They change per-session or per-turn
+  // and must not pollute the static prefix hash.
+  /^My operating system is:.+/i,
+  /^The project's temporary directory is:.+/i,
+  /^- \*\*Workspace Directories:\*\*/i,
+  /^Showing up to \d+ items.+/i,
+  /^- \*\*Directory Structure:\*\*/i,
+  /^<session_context>/i,
+  /^<\/session_context>/i,
+  /^This is the Gemini CLI\./i,
+  /^We are setting up the context for our chat\./i,
 ];
 
 const SYSTEM_REMINDER_PATTERN = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
 
 // ─────────────────────────────────────────────
-// Static content fingerprinting
+// Per-client state
+// ─────────────────────────────────────────────
+// Module-level singletons caused cross-client contamination:
+// Anthropic streak state was overwritten by Gemini requests
+// and vice versa, causing false "prefix changed" warnings
+// and incorrect hit rate calculations.
+//
+// Each client type gets its own isolated state bucket.
 // ─────────────────────────────────────────────
 
-let _lastStaticHash   = null;
-let _lastStaticTokens = 0;
-let _consecutiveHits  = 0;
-let _totalAlignments  = 0;
+const _clientState = new Map();
+
+function _getState(clientName) {
+  if (!_clientState.has(clientName)) {
+    _clientState.set(clientName, {
+      lastStaticHash:   null,
+      lastStaticTokens: 0,
+      lastStaticPrefix: "", // FIX 2: Track old prefix for diagnostic logging
+      consecutiveHits:  0,
+      totalAlignments:  0,
+      totalHits:        0,  // FIX 3: Track total hits separately for accurate hit rate
+    });
+  }
+  return _clientState.get(clientName);
+}
 
 // ─────────────────────────────────────────────
 // isDynamicLine
@@ -154,7 +196,7 @@ function extractSystemReminders(content) {
 // alignCachePrefix — main export
 // ─────────────────────────────────────────────
 
-export function alignCachePrefix(payload) {
+export function alignCachePrefix(payload, clientName = "anthropic") {
   if (
     !payload.messages       ||
     !Array.isArray(payload.messages) ||
@@ -163,7 +205,9 @@ export function alignCachePrefix(payload) {
     return payload;
   }
 
-  _totalAlignments++;
+  // ── Get per-client state ──
+  const state = _getState(clientName);
+  state.totalAlignments++;
 
   // ── Step 1: Separate system messages from conversation ──
   const systemMessages       = [];
@@ -219,28 +263,34 @@ export function alignCachePrefix(payload) {
   const staticPrefix   = allStaticParts.join("\n\n");
   const dynamicContext = allDynamicParts.join("\n\n");
 
-  // ── Step 5: Stability check ──
+  // ── Step 5: Stability check — uses per-client state ──
   const staticHash = crypto
     .createHash("sha256")
     .update(staticPrefix)
     .digest("hex")
     .slice(0, 16);
 
-  if (_lastStaticHash === staticHash) {
-    _consecutiveHits++;
+  if (state.lastStaticHash === staticHash) {
+    state.consecutiveHits++;
+    state.totalHits++; // FIX 3: Increment actual total hits
   } else {
-    if (_lastStaticHash !== null) {
-      const delta = Math.round(staticPrefix.length / 4) - _lastStaticTokens;
+    if (state.lastStaticHash !== null) {
+      const delta = Math.round(staticPrefix.length / 4) - state.lastStaticTokens;
       console.log(
         `[CacheAligner] ⚠️ Static prefix changed ` +
-        `(new hash: ${staticHash}, ` +
-        `previous streak: ${_consecutiveHits} hits, ` +
+        `(client: ${clientName}, new hash: ${staticHash}, ` +
+        `previous streak: ${state.consecutiveHits} hits, ` +
         `token delta: ${delta > 0 ? "+" : ""}${delta})`,
       );
+      
+      // FIX 2: Diagnostic output showing exactly what changed
+      // console.log(`[CacheAligner] 🔍 OLD PREFIX (first 300 chars):\n${state.lastStaticPrefix.slice(0, 300)}`);
+      // console.log(`[CacheAligner] 🔍 NEW PREFIX (first 300 chars):\n${staticPrefix.slice(0, 300)}`);
     }
-    _consecutiveHits  = 1;
-    _lastStaticHash   = staticHash;
-    _lastStaticTokens = Math.round(staticPrefix.length / 4);
+    state.consecutiveHits  = 1;
+    state.lastStaticHash   = staticHash;
+    state.lastStaticTokens = Math.round(staticPrefix.length / 4);
+    state.lastStaticPrefix = staticPrefix; // FIX 2: Store new prefix for future comparisons
   }
 
   // ── Step 6: Assemble aligned messages ──
@@ -270,21 +320,25 @@ export function alignCachePrefix(payload) {
     ...conversationMessages,   // ← conversation history untouched, sequences intact
   ];
 
-  // ── Step 7: Stats ──
+  // ── Step 7: Stats — uses per-client state ──
   const staticTokens  = Math.round(staticPrefix.length / 4);
   const dynamicTokens = Math.round(dynamicContext.length / 4);
-  const hitRate       = ((_consecutiveHits - 1) / _totalAlignments * 100).toFixed(1);
+  
+  // FIX 3: Corrected hit rate formula
+  const hitRate = state.totalAlignments > 0 
+    ? ((state.totalHits / state.totalAlignments) * 100).toFixed(1) 
+    : "0.0";
 
   console.log(
-    `[CacheAligner] 📌 Prefix: ${staticTokens} tokens (hash: ${staticHash}) | ` +
+    `[CacheAligner] 📌 [${clientName}] Prefix: ${staticTokens} tokens (hash: ${staticHash}) | ` +
     `Dynamic: ${dynamicTokens} tokens | ` +
-    `Streak: ${_consecutiveHits} | ` +
+    `Streak: ${state.consecutiveHits} | ` +
     `Hit rate: ${hitRate}%`,
   );
 
   // ── Dashboard hook ──
   statsEmitter.recordCacheAlignStreak(
-    _consecutiveHits,
+    state.consecutiveHits,
     parseFloat(hitRate),
   );
 
@@ -295,21 +349,22 @@ export function alignCachePrefix(payload) {
 // Stats exports
 // ─────────────────────────────────────────────
 
-export function getCacheAlignerStats() {
-  return {
-    lastStaticHash:  _lastStaticHash,
-    consecutiveHits: _consecutiveHits,
-    totalAlignments: _totalAlignments,
-    estimatedCacheHitRate:
-      _totalAlignments > 0
-        ? ((_consecutiveHits - 1) / _totalAlignments * 100).toFixed(1) + "%"
-        : "N/A",
-  };
+export function getCacheAlignerStats(clientName = null) {
+  if (clientName) {
+    return { ...(_getState(clientName)) };
+  }
+  // Return all clients
+  const result = {};
+  for (const [name, state] of _clientState.entries()) {
+    result[name] = { ...state };
+  }
+  return result;
 }
 
-export function resetCacheAlignerStats() {
-  _lastStaticHash   = null;
-  _consecutiveHits  = 0;
-  _totalAlignments  = 0;
-  _lastStaticTokens = 0;
+export function resetCacheAlignerStats(clientName = null) {
+  if (clientName) {
+    _clientState.delete(clientName);
+  } else {
+    _clientState.clear();
+  }
 }

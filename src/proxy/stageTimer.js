@@ -1,28 +1,14 @@
 /**
  * Stage-timing instrumentation for request handlers.
  *
- *
  * Design goals:
  *   1. Durations captured even if measured body throws
  *   2. Single StageTimer holds all stages for one request
  *   3. Uses performance.now() for monotonic high-resolution measurement
  *   4. Zero external dependencies
- *
- * Usage:
- *   const timer = new StageTimer();
- *
- *   // Synchronous
- *   using(timer.measure("translation"), () => {
- *     payload = translateAnthropicToOpenAI(payload);
- *   });
- *
- *   // Or manual
- *   const t = timer.start("compression");
- *   payload = compressionEngine(payload);
- *   t.stop();
- *
- *   console.log(timer.summary());
- *   // { translation: 2.3, compression: 45.1 }
+ *   5. Optional per-stage token delta tracking (two APIs):
+ *        - recordTokens(name, before, after)  — computes savings
+ *        - recordTokenSavings(name, saved)    — direct delta from caller
  */
 
 // ─────────────────────────────────────────────
@@ -32,7 +18,7 @@
 export class StageMeasurement {
   constructor(timer, name) {
     this._timer = timer;
-    this._name = name;
+    this._name  = name;
     this._start = null;
   }
 
@@ -48,10 +34,6 @@ export class StageMeasurement {
     this._start = null;
   }
 
-  /**
-   * Wrap a synchronous function call.
-   * Duration is recorded even if the function throws.
-   */
   wrap(fn) {
     this.start();
     try {
@@ -61,9 +43,6 @@ export class StageMeasurement {
     }
   }
 
-  /**
-   * Wrap an async function call.
-   */
   async wrapAsync(fn) {
     this.start();
     try {
@@ -80,23 +59,22 @@ export class StageMeasurement {
 
 export class StageTimer {
   constructor() {
-    this._stages = {};
+    // Structure: {
+    //   [name]: {
+    //     duration:     number,
+    //     tokensBefore: number|null,
+    //     tokensAfter:  number|null,
+    //     tokensSaved:  number|null
+    //   }
+    // }
+    this._stages    = {};
     this._createdAt = performance.now();
   }
 
-  /**
-   * Create and start a StageMeasurement for the named stage.
-   * Call .stop() when done, or use .wrap() / .wrapAsync().
-   */
   measure(name) {
     return new StageMeasurement(this, name).start();
   }
 
-  /**
-   * Convenience: time a synchronous function.
-   *
-   * const result = timer.time("translation", () => translate(payload));
-   */
   time(name, fn) {
     const m = this.measure(name);
     try {
@@ -106,64 +84,119 @@ export class StageTimer {
     }
   }
 
-  /**
-   * Convenience: time an async function.
-   *
-   * const result = await timer.timeAsync("compression", () => compress(payload));
-   */
   async timeAsync(stage, fn) {
-    const start = performance.now();
+    const start  = performance.now();
     const result = await fn();
-    this._stages[stage] = performance.now() - start;
+    this._record(stage, performance.now() - start);
     return result;
   }
 
-  /**
-   * Record a pre-computed duration (e.g. from an existing timer).
-   */
   record(name, durationMs) {
-    this._stages[name] = Number(durationMs);
+    this._record(name, Number(durationMs));
   }
 
   _record(name, durationMs) {
-    this._stages[name] = durationMs;
+    if (!this._stages[name]) {
+      this._stages[name] = {
+        duration:     0,
+        tokensBefore: null,
+        tokensAfter:  null,
+        tokensSaved:  null,
+      };
+    }
+    this._stages[name].duration = durationMs;
   }
 
   /**
-   * Total milliseconds since StageTimer was created.
+   * Record token deltas for a specific stage from a before/after pair.
+   * Used when the caller has both counts (e.g. semantic dedup measuring
+   * payload size pre- and post-stage).
    */
+  recordTokens(name, before, after) {
+    if (!this._stages[name]) {
+      this._stages[name] = {
+        duration:     0,
+        tokensBefore: null,
+        tokensAfter:  null,
+        tokensSaved:  null,
+      };
+    }
+    this._stages[name].tokensBefore = before;
+    this._stages[name].tokensAfter  = after;
+    this._stages[name].tokensSaved  = before - after;
+  }
+
+  /**
+   * Record a precomputed savings delta for a specific stage.
+   * Used when the stage itself reports how many tokens it saved
+   * (e.g. minimizeToolSchemas attaches _cf_minimizeTokensSaved to the
+   * payload, server.js reads it and forwards via this method).
+   *
+   * Additive: if a stage records savings multiple times in one request,
+   * they accumulate. This matches the semantics of recordTokens(), which
+   * overwrites — recordTokens is "I measured the total delta", while
+   * recordTokenSavings is "this sub-step contributed N more tokens saved".
+   *
+   * @param {string} name   Stage name (use STAGES.* constants)
+   * @param {number} saved  Tokens saved (positive number)
+   */
+  recordTokenSavings(name, saved) {
+    const delta = Number(saved) || 0;
+    if (!this._stages[name]) {
+      this._stages[name] = {
+        duration:     0,
+        tokensBefore: null,
+        tokensAfter:  null,
+        tokensSaved:  0,
+      };
+    }
+    if (this._stages[name].tokensSaved === null) {
+      this._stages[name].tokensSaved = 0;
+    }
+    this._stages[name].tokensSaved += delta;
+  }
+
   elapsedMs() {
     return performance.now() - this._createdAt;
   }
 
   /**
-   * Snapshot of all recorded stage durations in milliseconds.
+   * Returns a flat object of stage durations (backward compatible).
    */
   summary() {
-    return { ...this._stages };
+    const out = {};
+    for (const [k, v] of Object.entries(this._stages)) {
+      out[k] = v.duration;
+    }
+    return out;
+  }
+
+  /**
+   * Returns a flat object of per-stage token savings.
+   * Only stages that recorded token data are included.
+   */
+  tokenSummary() {
+    const out = {};
+    for (const [k, v] of Object.entries(this._stages)) {
+      if (v.tokensSaved !== null) {
+        out[k] = v.tokensSaved;
+      }
+    }
+    return out;
   }
 
   has(name) {
     return name in this._stages;
   }
 
-  /**
-   * Emit a structured log line of stage timings.
-   *
-   * @param {string}   path           - Request path
-   * @param {string}   requestId      - Request ID for correlation
-   * @param {string[]} expectedStages - All stages to include (null for missing ones)
-   */
   emitLog(path, requestId, expectedStages = []) {
     const summary = this.summary();
-    const padded = {};
+    const padded  = {};
 
-    // Include all expected stages (null for ones that never ran)
     for (const stage of expectedStages) {
       padded[stage] = summary[stage] ?? null;
     }
 
-    // Include any extra stages recorded but not in expectedStages
     for (const [stage, value] of Object.entries(summary)) {
       if (!(stage in padded)) {
         padded[stage] = value;
@@ -171,10 +204,10 @@ export class StageTimer {
     }
 
     const payload = JSON.stringify({
-      event: "stage_timings",
+      event:      "stage_timings",
       path,
       request_id: requestId,
-      stages: padded,
+      stages:     padded,
     });
 
     console.log(`[${requestId}] STAGE_TIMINGS ${payload}`);
@@ -186,26 +219,26 @@ export class StageTimer {
 // Stage name constants — prevents typos
 // ─────────────────────────────────────────────
 
-// src/proxy/stageTimer.js
-
 export const STAGES = {
-  TRANSLATION: "translation",
-  SCRUB: "scrub",
-  TAG: "tag",
-  PRUNE: "prune",
-  SLICE_CODE: "slice_code",
-  CODE_COMPRESS: "code_compress",
-  PREDICTIVE: "predictive_injection",
-  VAULT_INTERCEPT: "vault_intercept",
-  STRIP_ANTHROPIC: "strip_anthropic",
-  CCR_PIPELINE: "ccr_pipeline",
-  MINIMIZE_TOOLS: "minimize_tools",
-  DEDUPLICATE: "deduplicate",
-  EGRESS: "egress", // if you time the upstream request
-  TOTAL: "total",
-  MEMORY_INJECT: "memory_inject",
-  MEMORY_CONTEXT: "memory_context",
-  SEMANTIC_DEDUP: "semantic_dedup",
-  CACHE_ALIGN: "cache_align",
-  GRAPH_INJECT: "graph_inject",
+  TRANSLATION:      "translation",
+  SCRUB:            "scrub",
+  TAG:              "tag",
+  PRUNE:            "prune",
+  SLICE_CODE:       "slice_code",
+  CODE_COMPRESS:    "code_compress",
+  PREDICTIVE:       "predictive_injection",
+  VAULT_INTERCEPT:  "vault_intercept",
+  STRIP_ANTHROPIC:  "strip_anthropic",
+  CCR_PIPELINE:     "ccr_pipeline",
+  MINIMIZE_TOOLS:   "minimize_tools",
+  DEDUPLICATE:      "deduplicate",
+  EGRESS:           "egress",
+  TOTAL:            "total",
+  MEMORY_INJECT:    "memory_inject",
+  MEMORY_CONTEXT:   "memory_context",
+  SEMANTIC_DEDUP:   "semantic_dedup",
+ CACHE_ALIGN: "cache_align",
+ BUDGET_ENFORCER: "budget_enforcer",
+ GRAPH_INJECT: "graph_inject",
+ SYS_PROMPT_PRUNE: "sys_prompt_prune",
 };

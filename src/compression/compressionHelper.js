@@ -30,6 +30,8 @@ export function countTokens(payload) {
 
   // Tool definitions (if present)
   if (payload.tools) {
+    // Tools array changes rarely, but we don't cache it on the array object 
+    // to avoid stale cache issues if tools are pushed/popped.
     tokens += enc.encode(JSON.stringify(payload.tools)).length;
   }
 
@@ -39,9 +41,17 @@ export function countTokens(payload) {
 /**
  * Counts tokens for a single message, handling string/array content,
  * tool calls, and tool results.
+ * 
+ * FIX 2: Caches the result on the message object to avoid redundant 
+ * tiktoken encoding passes on messages that pass through the pipeline untouched.
  */
 export function countMessageTokens(msg) {
   if (!msg) return 0;
+
+  // Return cached count if this exact message object was already counted
+  if (msg._cachedTokens !== undefined) {
+    return msg._cachedTokens;
+  }
 
   let tokens = 4; // role + framing overhead
 
@@ -82,5 +92,7 @@ export function countMessageTokens(msg) {
     }
   }
 
+  // Cache the result on the object reference
+  msg._cachedTokens = tokens;
   return tokens;
 }

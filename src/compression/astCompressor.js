@@ -37,9 +37,6 @@ try {
 
 // ─────────────────────────────────────────────
 // Compressor instance cache
-// Key: serialized policy fingerprint → instance
-// Avoids recreating for same policy, avoids
-// single stale instance when policy changes
 // ─────────────────────────────────────────────
 const _compressorCache = new Map();
 
@@ -62,14 +59,12 @@ function getCompressor(policy = null) {
       vaultOnCompress: true,
       docstringMode: 1, // FIRST_LINE
 
-      // Policy-driven values — fall back to safe defaults
       preserveErrorHandlers: policy?.preserveErrorHandlers ?? true,
       maxBodyLines: policy?.maxBodyLines ?? 4,
       minTokensToCompress: policy?.minTokensToCompress ?? 80,
     };
 
     _compressorCache.set(key, new NativeASTCompressor(opts));
-
     console.log(`[AST Compressor] Created compressor instance [${key}]`);
   }
 
@@ -79,8 +74,22 @@ function getCompressor(policy = null) {
 // ─────────────────────────────────────────────
 // compressCodeOutput
 // ─────────────────────────────────────────────
-export function compressCodeOutput(text, languageHint = "", policy = null) {
-  if (typeof text !== "string" || text.length < 200) {
+
+/**
+ * @param {string}      text          — source text to compress
+ * @param {string}      languageHint  — file extension language hint
+ * @param {object|null} policy        — compression policy from compressionPolicy.js
+ * @param {string|null} filePath      — original file path, used in compression header
+ *                                      to guide the LLM toward graph queries
+ */
+export function compressCodeOutput(
+  text,
+  languageHint = "",
+  policy = null,
+  filePath = null,
+) {
+  // FIX F3: Raise threshold to ~200 tokens to avoid inflating tiny files
+  if (typeof text !== "string" || text.length < 800) {
     return { kept: text, vaulted: false };
   }
 
@@ -91,11 +100,27 @@ export function compressCodeOutput(text, languageHint = "", policy = null) {
       (policy ? ` [mode=${policy.mode}]` : ""),
   );
 
-  // ── Path A: Native tree-sitter ──────────────
+  // ── Path A: Native tree-sitter ──
   const compressor = getCompressor(policy);
   if (compressor) {
     try {
       const result = compressor.compress(text, languageHint);
+
+      // Sanity check: if auto-detect contradicts extension hint, log it
+      if (languageHint && result.languageDetected !== languageHint) {
+        console.warn(
+          `[AST Compressor] ⚠️  Language mismatch: extension says ${languageHint}, ` +
+            `auto-detected ${result.languageDetected} — trusting extension hint`,
+        );
+        // Re-compress with forced language if auto-detect produced 0 nodes
+        // but we know the language from the file extension
+        if (result.nodesCompressed === 0 && languageHint) {
+          const retryResult = compressor.compress(text, "");
+          if (retryResult.nodesCompressed > result.nodesCompressed) {
+            Object.assign(result, retryResult);
+          }
+        }
+      }
 
       console.log(
         `[AST Compressor] Lang: ${result.languageDetected} | ` +
@@ -113,7 +138,6 @@ export function compressCodeOutput(text, languageHint = "", policy = null) {
         );
       }
 
-      // Only vault if meaningful reduction achieved
       const reductionRatio = result.compressionRatio;
       if (reductionRatio < 0.2 || result.nodesCompressed === 0) {
         console.log(
@@ -126,22 +150,22 @@ export function compressCodeOutput(text, languageHint = "", policy = null) {
       const vaultId = saveToVault(text);
 
       // ── Inject vault ID into every compressed marker ──
-      // C++ emits: "// ↓ N lines compressed (name) · vault_retrieve to expand"
-      // We replace the generic hint with the actual callable vault ID
-      // so Claude knows exactly what to pass to contextforge_retrieve()
       const keptWithVaultId = result.compressedSource.replace(
         /· vault_retrieve to expand/g,
-        `· call contextforge_retrieve(vault_id:"${vaultId}") to expand`,
+        `Use tool call contextforge_retrieve with vault_id="${vaultId}" to read this content.`,
       );
 
       // ── File-level header ──
-      // Appears at the very top of what Claude receives.
-      // Gives Claude the vault ID upfront before it reads any code,
-      // and explicitly tells it not to proceed on the skeleton alone.
+      const fileRef = filePath ? filePath.replace(/\\/g, "/") : "this file";
+
       const compressionHeader = [
         `[CF_COMPRESSED_FILE vault_id:"${vaultId}"]`,
         `⚠️  This is an AST skeleton — ${result.originalLines} lines compressed to ${result.compressedLines}.`,
-        `You MUST call contextforge_retrieve(vault_id:"${vaultId}") before writing docs or modifying code.`,
+        `To read the full source: use tool call contextforge_retrieve with vault_id="${vaultId}".`,
+        `To explore without reading the full file:`,
+        `  - what_does_this_export("${fileRef}") — list all exports`,
+        `  - find_symbol("functionName") — get a specific function body directly`,
+        `  Search for function names, NOT class names.`,
         ``,
       ].join("\n");
 
@@ -154,7 +178,7 @@ export function compressCodeOutput(text, languageHint = "", policy = null) {
       );
 
       return {
-        kept: finalKept, // ← now has header + vault IDs in markers
+        kept: finalKept,
         vaulted: true,
         vaultId,
         originalText: text,
@@ -173,17 +197,26 @@ export function compressCodeOutput(text, languageHint = "", policy = null) {
     }
   }
 
-  // ── Path B: Regex fallback ──────────────────
+  // ── Path B: Regex fallback ──
   console.warn(
     "[AST Compressor] Using regex fallback — build native for best results",
   );
   return regexFallbackCompress(text);
 }
 
-async function compressCodeOutputAsync(text, languageHint = "", policy = null) {
+/**
+ * Async wrapper — yields to event loop via setImmediate so compression
+ * does not block the server during large file processing.
+ */
+async function compressCodeOutputAsync(
+  text,
+  languageHint = "",
+  policy = null,
+  filePath = null,
+) {
   return new Promise((resolve) => {
     setImmediate(() => {
-      resolve(compressCodeOutput(text, languageHint, policy));
+      resolve(compressCodeOutput(text, languageHint, policy, filePath));
     });
   });
 }
@@ -215,7 +248,6 @@ function regexFallbackCompress(text) {
   for (const pattern of patterns) {
     pattern.lastIndex = 0;
     let match;
-    let charCount = 0;
     while ((match = pattern.exec(text)) !== null) {
       const startIdx = match.index;
       let c = 0;
@@ -274,8 +306,13 @@ function regexFallbackCompress(text) {
   }
 
   const vaultId = saveToVault(text);
+
+  const fallbackStub =
+    `[CF_VAULT:${vaultId}] ${Math.round(text.length / 4)} tokens compressed. ` +
+    `Use tool call contextforge_retrieve with vault_id="${vaultId}" to read this content.`;
+
   return {
-    kept: keptText,
+    kept: fallbackStub + "\n\n" + keptText,
     vaulted: true,
     vaultId,
     originalText: text,
@@ -311,22 +348,57 @@ export async function compressCodeToolResults(payload) {
     highComplexityFunctions: [],
   };
 
-  // ── Cannot use .map() with async — use a for loop instead ──
   const newMessages = [];
-  for (const msg of payload.messages) {
 
+  for (const msg of payload.messages) {
     // ── Tool messages (post-translation format) ──
     if (
       msg.role === "tool" &&
       typeof msg.content === "string" &&
       msg._cf_type === "code"
     ) {
+      // ── Skip already-AST-compressed messages ──
+      if (msg._compressedVaultId) {
+        newMessages.push(msg);
+        continue;
+      }
+
+      // ── Skip if SemanticDedup or FatCatch already vaulted ──
+      if (
+        msg._dedupVaultId ||
+        (typeof msg.content === "string" && msg.content.includes("[CF_VAULT:"))
+      ) {
+        newMessages.push(msg);
+        continue;
+      }
+
+      // ── ADD THIS BLOCK: Skip if SemanticDedup deduped (exact or near-dup) ──
+      // Messages with _cf_deduped=true have already been processed by
+      // SemanticDedup — their content is either a CF_DELTA stub or a
+      // vault reference. Running tree-sitter on these wastes 10-30ms
+      // and produces garbage output.
+      if (msg._cf_deduped) {
+        newMessages.push(msg);
+        continue;
+      }
+
+      // ── Skip tiny files — not worth AST overhead ──
+      if (msg.content.split("\n").length < 30) {
+        newMessages.push(msg);
+        continue;
+      }
+
       const beforeLen = msg.content.length;
       const langHint = msg._filename
         ? (EXT_TO_LANG[msg._filename.split(".").pop()?.toLowerCase()] ?? "")
         : "";
 
-      const result = await compressCodeOutputAsync(msg.content, langHint, policy); // ← async
+      const result = await compressCodeOutputAsync(
+        msg.content,
+        langHint,
+        policy,
+        msg._filename || null,
+      );
 
       if (result.vaulted) {
         stats.compressed++;
@@ -359,8 +431,29 @@ export async function compressCodeToolResults(payload) {
           typeof block.content === "string" &&
           block._cf_type === "code"
         ) {
+          // ── Guard: Skip already-vaulted blocks ──
+          if (
+            block._dedupVaultId ||
+            (typeof block.content === "string" &&
+              block.content.includes("[CF_VAULT:"))
+          ) {
+            newBlocks.push(block);
+            continue;
+          }
+
           const beforeLen = block.content.length;
-          const result = await compressCodeOutputAsync(block.content, "", policy); // ← async
+
+          const blockLangHint = block._filename
+            ? (EXT_TO_LANG[block._filename.split(".").pop()?.toLowerCase()] ??
+              "")
+            : "";
+
+          const result = await compressCodeOutputAsync(
+            block.content,
+            blockLangHint,
+            policy,
+            block._filename || null,
+          );
 
           if (result.vaulted) {
             stats.compressed++;

@@ -180,6 +180,7 @@ export class CCRToolInjector {
       }
     }
 
+    console.log('Injecting retrieve tool');
     const ccrTool = createCCRToolDefinition(this.provider);
     return { tools: [...currentTools, ccrTool], wasInjected: true };
   }

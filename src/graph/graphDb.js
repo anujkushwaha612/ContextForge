@@ -1,26 +1,15 @@
 /**
  * graphDb.js
  *
- * SQLite schema and query layer for the ContextForge code knowledge graph.
- *
- * Separate from contextforge.db because:
- *   - Graph is workspace-scoped, not session-scoped
- *   - Graph must survive cache resets (contextforge.db gets wiped)
- *   - Write pattern differs: one large batch at startup, then reads only
- *
- * Schema:
- *   nodes  — every exported symbol (function, class, const) in the workspace
- *   edges  — directional relationships between symbols and files
- *   files  — indexed files with their last-modified timestamp
+ * source_line migration: edges table gets a source_line column so
+ * find_route can return exact line numbers for inline handlers.
+ * This lets the LLM call contextforge_retrieve with a line hint
+ * instead of reading the entire file.
  */
 
 import Database from "better-sqlite3";
 import path from "node:path";
 import crypto from "node:crypto";
-
-// ─────────────────────────────────────────────
-// Database initialization
-// ─────────────────────────────────────────────
 
 let _db = null;
 
@@ -28,67 +17,74 @@ export function getGraphDb(dbPath = null) {
   if (_db) return _db;
 
   const resolvedPath = dbPath || path.join(process.cwd(), "graph.db");
-
   _db = new Database(resolvedPath);
 
-  // WAL mode — allows reads during batch writes at startup
   _db.exec("PRAGMA journal_mode = WAL");
   _db.exec("PRAGMA synchronous  = NORMAL");
   _db.exec("PRAGMA foreign_keys = ON");
 
   _db.exec(`
-    -- Files table: tracks which files have been indexed and when
     CREATE TABLE IF NOT EXISTS files (
-      file_id       TEXT PRIMARY KEY,   -- SHA256 of absolute path (first 16 chars)
+      file_id       TEXT PRIMARY KEY,
       file_path     TEXT UNIQUE NOT NULL,
       language      TEXT NOT NULL,
-      last_modified INTEGER NOT NULL,   -- mtime in ms
-      indexed_at    INTEGER NOT NULL,   -- when we indexed it
+      last_modified INTEGER NOT NULL,
+      indexed_at    INTEGER NOT NULL,
       node_count    INTEGER DEFAULT 0
     );
 
-    -- Nodes table: every exported/declared symbol
     CREATE TABLE IF NOT EXISTS nodes (
-      node_id     TEXT PRIMARY KEY,     -- file_id + ":" + name
+      node_id     TEXT PRIMARY KEY,
       file_id     TEXT NOT NULL,
-      file_path   TEXT NOT NULL,        -- denormalized for fast lookup
-      name        TEXT NOT NULL,        -- symbol name: "sliceJsonOutput"
-      kind        TEXT NOT NULL,        -- "function" | "class" | "const" | "import"
+      file_path   TEXT NOT NULL,
+      name        TEXT NOT NULL,
+      kind        TEXT NOT NULL,
       start_line  INTEGER NOT NULL,
       end_line    INTEGER NOT NULL,
-      is_exported INTEGER DEFAULT 0,    -- 1 if exported
+      is_exported INTEGER DEFAULT 0,
       is_async    INTEGER DEFAULT 0,
       complexity  INTEGER DEFAULT 0,
       body_text   TEXT,
       FOREIGN KEY (file_id) REFERENCES files(file_id) ON DELETE CASCADE
     );
 
-    -- Edges table: directional relationships
     CREATE TABLE IF NOT EXISTS edges (
       edge_id       TEXT PRIMARY KEY,
-      source_file   TEXT NOT NULL,      -- file that contains the import/reference
-      target_file   TEXT,               -- file being imported (null if external)
-      source_symbol TEXT,               -- symbol doing the importing (null = file-level)
-      target_symbol TEXT NOT NULL,      -- symbol being imported/referenced
-      relation      TEXT NOT NULL,      -- "imports" | "exports" | "calls" | "extends"
+      source_file   TEXT NOT NULL,
+      target_file   TEXT,
+      source_symbol TEXT,
+      target_symbol TEXT NOT NULL,
+      relation      TEXT NOT NULL,
+      source_line   INTEGER,
       FOREIGN KEY (source_file) REFERENCES files(file_path) ON DELETE CASCADE
     );
 
-    -- Indexes for fast graph traversal
     CREATE INDEX IF NOT EXISTS idx_nodes_name      ON nodes(name);
     CREATE INDEX IF NOT EXISTS idx_nodes_file      ON nodes(file_id);
     CREATE INDEX IF NOT EXISTS idx_nodes_exported  ON nodes(is_exported) WHERE is_exported = 1;
     CREATE INDEX IF NOT EXISTS idx_edges_target    ON edges(target_symbol);
     CREATE INDEX IF NOT EXISTS idx_edges_source    ON edges(source_file);
     CREATE INDEX IF NOT EXISTS idx_edges_relation  ON edges(relation);
+    CREATE INDEX IF NOT EXISTS idx_edges_caller    ON edges(source_symbol);
     CREATE INDEX IF NOT EXISTS idx_files_path      ON files(file_path);
   `);
+
+  // ── Migration: add source_line to existing graph.db instances ──
+  // CREATE TABLE IF NOT EXISTS won't add new columns to an existing table.
+  // This try/catch is the standard SQLite migration pattern — it's a no-op
+  // if the column already exists.
+  try {
+    _db.exec(`ALTER TABLE edges ADD COLUMN source_line INTEGER`);
+    console.log("[GraphDb] ✅ Migrated edges table: added source_line column");
+  } catch {
+    // Column already exists — normal on every run after first migration
+  }
 
   return _db;
 }
 
 // ─────────────────────────────────────────────
-// Prepared statements (lazy — built on first use)
+// Prepared statements
 // ─────────────────────────────────────────────
 
 let _stmts = null;
@@ -98,7 +94,6 @@ function stmts() {
   const db = getGraphDb();
 
   _stmts = {
-    // File operations
     upsertFile: db.prepare(`
       INSERT OR REPLACE INTO files
         (file_id, file_path, language, last_modified, indexed_at, node_count)
@@ -117,24 +112,21 @@ function stmts() {
       DELETE FROM edges WHERE source_file = ?
     `),
 
-    // Node operations
     insertNode: db.prepare(`
-  INSERT OR IGNORE INTO nodes
-    (node_id, file_id, file_path, name, kind, start_line, end_line,
-     is_exported, is_async, complexity, body_text)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`),
-
-    // Edge operations
-    insertEdge: db.prepare(`
-      INSERT OR IGNORE INTO edges
-        (edge_id, source_file, target_file, source_symbol, target_symbol, relation)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO nodes
+        (node_id, file_id, file_path, name, kind, start_line, end_line,
+         is_exported, is_async, complexity, body_text)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
 
-    // ── Graph query statements ──
+    // source_line added — nullable for non-route edges
+    insertEdge: db.prepare(`
+      INSERT OR IGNORE INTO edges
+        (edge_id, source_file, target_file, source_symbol, target_symbol,
+         relation, source_line)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `),
 
-    // Who imports symbol X?
     whoImportsThis: db.prepare(`
       SELECT DISTINCT source_file, source_symbol
       FROM   edges
@@ -143,7 +135,6 @@ function stmts() {
       ORDER BY source_file
     `),
 
-    // What does file X export?
     whatDoesThisExport: db.prepare(`
       SELECT name, kind, start_line, complexity, is_async
       FROM   nodes
@@ -152,15 +143,22 @@ function stmts() {
       ORDER BY start_line
     `),
 
-    // Find symbol definition
     findSymbol: db.prepare(`
-  SELECT file_path, name, kind, start_line, end_line, complexity, body_text
-  FROM   nodes
-  WHERE  name = ?
-  ORDER BY is_exported DESC, complexity DESC
-`),
+      SELECT file_path, name, kind, start_line, end_line, complexity, body_text
+      FROM   nodes
+      WHERE  name = ?
+      ORDER BY is_exported DESC, complexity DESC
+    `),
 
-    // What does file X import?
+    findSymbolFuzzy: db.prepare(`
+      SELECT file_path, name, kind, start_line, end_line, complexity, body_text
+      FROM   nodes
+      WHERE  name LIKE '%' || ? || '%'
+        AND  name != ?
+      ORDER BY is_exported DESC, complexity DESC
+      LIMIT 10
+    `),
+
     whatDoesThisImport: db.prepare(`
       SELECT target_symbol, target_file
       FROM   edges
@@ -169,7 +167,6 @@ function stmts() {
       ORDER BY target_symbol
     `),
 
-    // Files that depend on file X
     whoDependsOnFile: db.prepare(`
       SELECT DISTINCT source_file
       FROM   edges
@@ -177,15 +174,76 @@ function stmts() {
         AND  relation    = 'imports'
     `),
 
-    // Graph stats
-    stats: db.prepare(`
-      SELECT
-        (SELECT COUNT(*) FROM files)  AS file_count,
-        (SELECT COUNT(*) FROM nodes)  AS node_count,
-        (SELECT COUNT(*) FROM edges)  AS edge_count
+    whoCallsThis: db.prepare(`
+      SELECT DISTINCT source_file, source_symbol, source_line
+      FROM   edges
+      WHERE  target_symbol = ?
+        AND  relation      = 'calls'
+      ORDER BY source_file, source_symbol
     `),
 
-    // All files (for incremental update check)
+    whatDoesThisCall: db.prepare(`
+      SELECT DISTINCT target_symbol, target_file
+      FROM   edges
+      WHERE  source_symbol = ?
+        AND  relation      = 'calls'
+      ORDER BY target_symbol
+    `),
+
+    symbolImpact: db.prepare(`
+      WITH RECURSIVE impact(source_file, source_symbol, depth) AS (
+        SELECT source_file, source_symbol, 1
+        FROM   edges
+        WHERE  target_symbol = ?
+          AND  relation      = 'calls'
+        UNION
+        SELECT e.source_file, e.source_symbol, i.depth + 1
+        FROM   edges e
+        JOIN   impact i ON e.target_symbol = i.source_symbol
+        WHERE  e.relation = 'calls'
+          AND  i.depth < 2
+      )
+      SELECT DISTINCT source_file, source_symbol, MIN(depth) AS depth
+      FROM   impact
+      GROUP BY source_file, source_symbol
+      ORDER BY depth, source_file
+    `),
+
+    symbolDependencies: db.prepare(`
+      SELECT DISTINCT e.target_symbol, e.target_file,
+             n.kind, n.start_line
+      FROM   edges e
+      LEFT JOIN nodes n ON n.name = e.target_symbol
+                        AND n.file_path = e.target_file
+      WHERE  e.source_symbol = ?
+        AND  e.relation      = 'calls'
+      ORDER BY e.target_symbol
+    `),
+
+    // source_line returned so graphTools can include line number in response
+    findRoutes: db.prepare(`
+      SELECT source_file, target_symbol AS route_path,
+             source_symbol AS handler, source_line
+      FROM   edges
+      WHERE  relation = 'defines_route'
+        AND  (? IS NULL OR target_symbol LIKE '%' || ? || '%')
+      ORDER BY source_file, target_symbol
+    `),
+
+    allNodeNames: db.prepare(`
+      SELECT DISTINCT name FROM nodes
+    `),
+
+    stats: db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM files) AS file_count,
+        (SELECT COUNT(*) FROM nodes) AS node_count,
+        (SELECT COUNT(*) FROM edges) AS edge_count,
+        (SELECT COUNT(*) FROM edges WHERE relation = 'calls')         AS calls_count,
+        (SELECT COUNT(*) FROM edges WHERE relation = 'imports')       AS imports_count,
+        (SELECT COUNT(*) FROM edges WHERE relation = 'defines_route') AS routes_count
+    `),
+
     allFiles: db.prepare(`
       SELECT file_path, last_modified FROM files
     `),
@@ -195,16 +253,12 @@ function stmts() {
 }
 
 // ─────────────────────────────────────────────
-// Write operations — called by workspaceMapper
+// Write operations
 // ─────────────────────────────────────────────
 
-/**
- * Batch-write a single file's nodes and edges to the graph.
- * Wrapped in a transaction — either all succeeds or nothing.
- */
 export function writeFileGraph(fileData) {
   const db = getGraphDb();
-  const s = stmts();
+  const s  = stmts();
 
   const fileId = crypto
     .createHash("sha256")
@@ -213,7 +267,6 @@ export function writeFileGraph(fileData) {
     .slice(0, 16);
 
   const writeTransaction = db.transaction(() => {
-    // Upsert file record
     s.upsertFile.run(
       fileId,
       fileData.filePath,
@@ -223,11 +276,9 @@ export function writeFileGraph(fileData) {
       fileData.nodes.length,
     );
 
-    // Clear old data for this file (re-index)
     s.deleteFileNodes.run(fileId);
     s.deleteFileEdges.run(fileData.filePath);
 
-    // Insert nodes
     for (const node of fileData.nodes) {
       const nodeId = fileId + ":" + node.name + ":" + node.startLine;
       s.insertNode.run(
@@ -239,18 +290,20 @@ export function writeFileGraph(fileData) {
         node.startLine,
         node.endLine,
         node.isExported ? 1 : 0,
-        node.isAsync ? 1 : 0,
+        node.isAsync    ? 1 : 0,
         node.complexity || 0,
-        node.bodyText || null, // ← pass body if symbolExtractor provides it
+        node.bodyText   || null,
       );
     }
 
-    // Insert edges
     for (const edge of fileData.edges) {
       const edgeId = crypto
         .createHash("sha256")
         .update(
-          fileData.filePath + "|" + edge.targetSymbol + "|" + edge.relation,
+          fileData.filePath +
+          "|" + (edge.sourceSymbol || "") +
+          "|" + edge.targetSymbol +
+          "|" + edge.relation,
         )
         .digest("hex")
         .slice(0, 16);
@@ -258,10 +311,11 @@ export function writeFileGraph(fileData) {
       s.insertEdge.run(
         edgeId,
         fileData.filePath,
-        edge.targetFile || null,
+        edge.targetFile   || null,
         edge.sourceSymbol || null,
         edge.targetSymbol,
         edge.relation,
+        edge.sourceLine   ?? null,   // ← new: null for non-route edges
       );
     }
   });
@@ -271,89 +325,78 @@ export function writeFileGraph(fileData) {
 }
 
 // ─────────────────────────────────────────────
-// Read operations — called by ghost interceptor
+// Read operations
 // ─────────────────────────────────────────────
 
-/**
- * Who imports symbol X?
- * Returns list of files that import the given symbol name.
- */
 export function queryWhoImportsThis(symbolName) {
   return stmts().whoImportsThis.all(symbolName);
 }
 
-/**
- * What does file X export?
- * Returns all exported symbols from the given file path.
- */
 export function queryWhatDoesThisExport(filePath) {
-  // Normalize: accept both absolute and relative paths
-  const normalized = normalizeFilePath(filePath);
-  return stmts().whatDoesThisExport.all(normalized);
+  return stmts().whatDoesThisExport.all(normalizeFilePath(filePath));
 }
 
-/**
- * Where is symbol X defined?
- */
 export function queryFindSymbol(symbolName) {
   return stmts().findSymbol.all(symbolName);
 }
 
-/**
- * What does file X import?
- */
+export function queryFindSymbolFuzzy(symbolName) {
+  return stmts().findSymbolFuzzy.all(symbolName, symbolName);
+}
+
 export function queryWhatDoesThisImport(filePath) {
-  const normalized = normalizeFilePath(filePath);
-  return stmts().whatDoesThisImport.all(normalized);
+  return stmts().whatDoesThisImport.all(normalizeFilePath(filePath));
 }
 
-/**
- * Which files depend on file X?
- */
 export function queryWhoDependsOnFile(filePath) {
-  const normalized = normalizeFilePath(filePath);
-  return stmts().whoDependsOnFile.all(normalized);
+  return stmts().whoDependsOnFile.all(normalizeFilePath(filePath));
 }
 
-/**
- * Get graph statistics.
- */
+export function queryWhoCallsThis(symbolName) {
+  return stmts().whoCallsThis.all(symbolName);
+}
+
+export function queryWhatDoesThisCall(symbolName) {
+  return stmts().whatDoesThisCall.all(symbolName);
+}
+
+export function querySymbolImpact(symbolName) {
+  return stmts().symbolImpact.all(symbolName);
+}
+
+export function querySymbolDependencies(symbolName) {
+  return stmts().symbolDependencies.all(symbolName);
+}
+
+export function queryFindRoutes(routeFilter = null) {
+  return stmts().findRoutes.all(routeFilter, routeFilter);
+}
+
 export function getGraphStats() {
   return stmts().stats.get();
 }
 
-/**
- * Get all indexed files with their mtimes (for incremental update).
- */
 export function getAllIndexedFiles() {
   return stmts().allFiles.all();
 }
 
-/**
- * Get file record by path.
- */
+export function getAllNodeNames() {
+  return stmts().allNodeNames.all().map((r) => r.name);
+}
+
 export function getFileRecord(filePath) {
   return stmts().getFile.get(normalizeFilePath(filePath));
 }
 
-// ─────────────────────────────────────────────
-// Path normalization
-// ─────────────────────────────────────────────
-
-/**
- * Normalize a file path for consistent lookups.
- * Handles: relative paths, Windows backslashes, trailing slashes.
- */
 function normalizeFilePath(filePath) {
   if (!filePath) return filePath;
-  // Normalize Windows backslashes
   return filePath.replace(/\\/g, "/");
 }
 
 export function closeGraphDb() {
   if (_db) {
     _db.close();
-    _db = null;
+    _db    = null;
     _stmts = null;
   }
 }

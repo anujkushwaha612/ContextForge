@@ -673,6 +673,7 @@ const _toolSchemaCacheMap = new Map();
 // Wrap minimizeToolSchemas:
 export function minimizeToolSchemas(payload) {
   if (!payload.tools || payload.tools.length === 0) return payload;
+  console.log('Anuj is checking the engine');
 
   // Hash the current tools array
   const toolsJson = JSON.stringify(payload.tools);
@@ -748,6 +749,9 @@ export function minimizeToolSchemas(payload) {
     `[Tool Minimizer] ${originalSize} → ${newSize} chars ` +
       `(saved ~${savedTokens} tokens across ${payload.tools.length} tools) [cached as ${hash}]`,
   );
+
+  // FIX F5: Stamp savings for observability and baseline derivation
+  payload._cf_minimizeTokensSaved = savedTokens;
 
   return payload;
 }
@@ -965,8 +969,16 @@ export function interceptAndVaultMassiveToolResults(
   payload,
   charThreshold = 15000,
 ) {
-  console.log("[interceptAndVaultMassiveToolResults] called");
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
+
+  // ── Kill-switch: CF_DISABLE_FAT_CATCH=true bypasses this stage entirely ──
+  // Useful for debugging without removing the import / disabling the module.
+  if (process.env.CF_DISABLE_FAT_CATCH === "true") {
+    console.warn(
+      "[Fat Catch] ⚠️  Bypassed via CF_DISABLE_FAT_CATCH=true environment variable",
+    );
+    return payload;
+  }
 
   payload.messages = payload.messages.map((msg) => {
     if (msg.role !== "tool" || typeof msg.content !== "string") return msg;
@@ -995,9 +1007,10 @@ export function interceptAndVaultMassiveToolResults(
         );
         return {
           ...msg,
+          _cf_vaulted: true, // FIX F7: Flag to skip downstream dedup
           content:
             `[CF_VAULT:${vaultId}] ${Math.round(contentLength / 4)} tokens compressed. ` +
-            `Call contextforge_retrieve(vault_id:"${vaultId}") to expand.`,
+            `Use tool call contextforge_retrieve with vault_id="${vaultId}" to read this content.`,
         };
       }
     }
@@ -1011,9 +1024,10 @@ export function interceptAndVaultMassiveToolResults(
       );
       return {
         ...msg,
+        _cf_vaulted: true, // FIX F7: Flag to skip downstream dedup
         content:
           `[CF_VAULT:${vaultId}] ${Math.round(contentLength / 4)} tokens compressed. ` +
-          `Call contextforge_retrieve(vault_id:"${vaultId}") to expand.`,
+          `Use tool call contextforge_retrieve with vault_id="${vaultId}" to read this content.`,
       };
     }
 
@@ -1300,16 +1314,16 @@ export async function tagToolResults(payload) {
   await Promise.all(classifyJobs);
 
   const newlyClassified = classifyJobs.length;
-  console.log(
-    `[ContentRouter] 🏷️  Tagged tool results: ` +
-      Object.entries(typesReport)
-        .filter(([_, count]) => count > 0)
-        .map(([type, count]) => `${count}x ${type}`)
-        .join(", ") +
-      (skippedAlreadyTagged > 0
-        ? ` (${skippedAlreadyTagged} cached, ${newlyClassified} new)`
-        : ""),
-  );
+  // console.log(
+  //   `[ContentRouter] 🏷️  Tagged tool results: ` +
+  //     Object.entries(typesReport)
+  //       .filter(([_, count]) => count > 0)
+  //       .map(([type, count]) => `${count}x ${type}`)
+  //       .join(", ") +
+  //     (skippedAlreadyTagged > 0
+  //       ? ` (${skippedAlreadyTagged} cached, ${newlyClassified} new)`
+  //       : ""),
+  // );
 
   return payload;
 }
@@ -1627,7 +1641,7 @@ export function pruneToolResults(payload) {
     charsSaved: 0,
     linesRemoved: 0,
     vaultsCreated: 0,
-    skipped: 0, // already-pruned messages skipped this turn
+    skipped: 0,
   };
 
   payload.messages = payload.messages.map((msg) => {
@@ -1636,12 +1650,10 @@ export function pruneToolResults(payload) {
       typeof msg.content === "string" &&
       msg._cf_type
     ) {
-      // ── Skip already-pruned messages ──
-      // _prunedVaultId is set the first time we prune this message.
-      // On subsequent turns the content is already the short summary —
-      // re-pruning it would either be a no-op or corrupt the summary.
-      // Vault re-creation wastes disk and inflates vaultsCreated stats.
-      if (msg._prunedVaultId) {
+      // Skip already-processed messages — SemanticDedup and AST Compressor
+      // run before Pruner in the pipeline. Messages they've already handled
+      // should not be re-pruned.
+      if (msg._prunedVaultId || msg._cf_deduped || msg._compressedVaultId || msg._dedupVaultId) {
         pruneStats.skipped++;
         return msg;
       }
@@ -1678,16 +1690,21 @@ export function pruneToolResults(payload) {
             `(~${Math.floor((result.removedChars || 0) / 4)} tokens) → Vault ${vaultId}`,
         );
 
+        // ── Append vault retrieval stub ──
+        // The pruner returns kept text with gap markers but no vault reference.
+        // Without the stub the LLM cannot retrieve the full content.
+        // Framed as tool call to avoid MCP skill misrouting.
+        const vaultStub =
+          `\n[CF_VAULT:${vaultId}] Full content available. ` +
+          `Use tool call contextforge_retrieve with vault_id="${vaultId}" to read the complete output.`;
+
         return {
           ...msg,
-          content: result.kept,
+          content: result.kept + vaultStub,
           _prunedVaultId: vaultId,
         };
       }
 
-      // Non-vaulted: content replaced in-place, no vault needed
-      // Do NOT set _prunedVaultId here — content was not vaulted,
-      // so future turns should re-check (content may grow prunable)
       msg.content = result.kept;
       return msg;
     }
@@ -1702,8 +1719,7 @@ export function pruneToolResults(payload) {
             typeof block.content === "string" &&
             block._cf_type
           ) {
-            // Same skip logic for pre-translation blocks
-            if (block._prunedVaultId) {
+            if (block._prunedVaultId || block._cf_deduped || block._compressedVaultId || block._dedupVaultId) {
               pruneStats.skipped++;
               return block;
             }
@@ -1732,9 +1748,15 @@ export function pruneToolResults(payload) {
                   `removed ${result.removedLines} lines ` +
                   `(~${Math.floor((result.removedChars || 0) / 4)} tokens) → Vault ${vaultId}`,
               );
+
+              // ── Append vault retrieval stub (same as above) ──
+              const vaultStub =
+                `\n[CF_VAULT:${vaultId}] Full content available. ` +
+                `Use tool call contextforge_retrieve with vault_id="${vaultId}" to read the complete output.`;
+
               return {
                 ...block,
-                content: result.kept,
+                content: result.kept + vaultStub,
                 _prunedVaultId: vaultId,
               };
             }
@@ -2408,16 +2430,43 @@ function buildSuggestionBlock(searchQuery, results) {
 // ─────────────────────────────────────────────
 
 /**
- * Walks all tool results in the payload, detects genuine runtime failures,
- * and appends predictive BM25 suggestions from the project vault.
+ * Walks tool results from the CURRENT TURN ONLY to detect genuine runtime
+ * failures and append predictive BM25 suggestions from the project vault.
+ *
+ * FIX: Previously walked ALL messages in payload.messages, so failed grep
+ * tool results from turn N were re-detected on turns N+1, N+2, etc.,
+ * causing 4x repeated log lines and wasted retriever queries every pipeline
+ * run. Now only scans tool results that appear after the last assistant
+ * message — i.e. the responses that just came back this turn.
  */
 export function applyPredictiveInjection(payload, hybridRetriever) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
   if (!hybridRetriever) return payload;
 
+  // ── Find the start of the current turn's tool results ──
+  // The current turn is everything after the last assistant message.
+  // Tool results before that are from previous turns and must not be
+  // re-scanned — they were already processed when they first appeared.
+  let currentTurnStart = 0;
+  for (let i = payload.messages.length - 1; i >= 0; i--) {
+    if (payload.messages[i].role === "assistant") {
+      currentTurnStart = i + 1;
+      break;
+    }
+  }
+
+  // No assistant message found — this is the first turn, scan everything.
+  // (Shouldn't happen in practice but safe fallback.)
+  const currentTurnMessages = payload.messages.slice(currentTurnStart);
+
+  // Quick exit: nothing to scan in this turn
+  if (currentTurnMessages.length === 0) return payload;
+
   let injectCount = 0;
 
-  payload.messages = payload.messages.map((msg) => {
+  // Build updated messages: keep history untouched, only mutate current turn
+  const historicalMessages = payload.messages.slice(0, currentTurnStart);
+  const updatedTurnMessages = currentTurnMessages.map((msg) => {
     if (msg.role !== "tool" || typeof msg.content !== "string") return msg;
 
     // ── Gate 1: is this actually a failure? ──
@@ -2435,7 +2484,7 @@ export function applyPredictiveInjection(payload, hybridRetriever) {
     try {
       const errorSignal = extractErrorSignal(msg.content);
 
-      // Enrich query with recent user intent
+      // Enrich query with recent user intent from the full history
       let searchQuery = errorSignal;
       for (let i = payload.messages.length - 1; i >= 0; i--) {
         if (payload.messages[i].role === "user") {
@@ -2456,11 +2505,7 @@ export function applyPredictiveInjection(payload, hybridRetriever) {
 
       let results = [];
       try {
-        results = hybridRetriever.sparseSearch(
-          searchQuery,
-          5, // top k
-          1.5, // minScore — pushed into C++, no JS filter pass needed
-        );
+        results = hybridRetriever.sparseSearch(searchQuery, 5, 1.5);
       } catch (searchErr) {
         console.warn(
           `[Predictive Injection] Search error: ${searchErr.message}`,
@@ -2470,7 +2515,6 @@ export function applyPredictiveInjection(payload, hybridRetriever) {
 
       if (!results || results.length === 0) return msg;
 
-      // Only length check needed — minScore already handled in C++
       const meaningful = results.filter(
         (r) => (r.breadcrumb || "").length > 100,
       );
@@ -2495,6 +2539,8 @@ export function applyPredictiveInjection(payload, hybridRetriever) {
     }
   });
 
+  payload.messages = [...historicalMessages, ...updatedTurnMessages];
+
   if (injectCount > 0) {
     console.log(
       `[Predictive Injection] Summary: ${injectCount} result(s) enriched`,
@@ -2507,6 +2553,7 @@ export function applyPredictiveInjection(payload, hybridRetriever) {
 // ============================================================
 // INLINE SYSTEM MESSAGE DEDUPLICATOR & PRUNER
 // ============================================================
+
 export function deduplicateSystemMessages(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
@@ -2562,9 +2609,12 @@ export function deduplicateSystemMessages(payload) {
   });
 
   if (prunedCount > 0) {
+    const tokensSaved = Math.floor(charsSaved / 4);
     console.log(
-      `[SysPrompt Pruner] ✂️  Removed ${prunedCount} redundant system blocks (saved ~${Math.floor(charsSaved / 4)} tokens)`,
+      `[SysPrompt Pruner] ✂️  Removed ${prunedCount} redundant system blocks (saved ~${tokensSaved} tokens)`,
     );
+    // FIX 8: Stamp savings onto payload for StageTimer observability
+    payload._cf_sysPromptTokensSaved = tokensSaved;
   }
 
   return payload;

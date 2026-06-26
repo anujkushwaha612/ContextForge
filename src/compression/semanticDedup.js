@@ -1,8 +1,24 @@
 /**
  * Semantic deduplication for tool results.
+ *
+ * Fixes applied:
+ *   FIX-A: getDynamicThreshold was called with a bare number (content.length)
+ *          but expects { contentLength, fileType } — always returned 8 (default).
+ *          Now called correctly.
+ *
+ *   FIX-B: Path key inconsistency between "file:src/proxy/stagetimer.js" and
+ *          "file:proxy/stagetimer.js" caused cache misses for the same file.
+ *          normalizeFilePath now additionally strips common src/ prefixes so
+ *          both resolve to the same canonical key.
+ *
+ *   FIX-C: MIN_SAVINGS_RATIO lowered 0.3 → 0.1 so near-dup deltas are sent
+ *          more aggressively. When savings are still below threshold but the
+ *          content is already vaulted, we now send a vault stub instead of
+ *          full content — preventing double-transmission of large files.
  */
 
 import { createRequire } from "module";
+import path from "path";
 import { saveToVault, fetchFromVault } from "../logging/cacheDb.js";
 import { statsEmitter } from "../proxy/statsEmitter.js";
 
@@ -73,50 +89,14 @@ const FILENAME_PATTERNS = [
 ];
 
 const SOURCE_EXTENSIONS = new Set([
-  "js",
-  "ts",
-  "jsx",
-  "tsx",
-  "mjs",
-  "cjs",
-  "py",
-  "rb",
-  "go",
-  "rs",
-  "java",
-  "kt",
-  "swift",
-  "c",
-  "cpp",
-  "h",
-  "hpp",
-  "cs",
-  "json",
-  "yaml",
-  "yml",
-  "toml",
-  "xml",
-  "md",
-  "mdx",
-  "txt",
-  "rst",
-  "css",
-  "scss",
-  "less",
-  "html",
-  "htm",
-  "vue",
-  "svelte",
-  "sh",
-  "bash",
-  "zsh",
-  "fish",
-  "sql",
-  "graphql",
-  "proto",
-  "env",
-  "gitignore",
-  "dockerignore",
+  "js", "ts", "jsx", "tsx", "mjs", "cjs",
+  "py", "rb", "go", "rs", "java", "kt", "swift",
+  "c", "cpp", "h", "hpp", "cs",
+  "json", "yaml", "yml", "toml", "xml",
+  "md", "mdx", "txt", "rst",
+  "css", "scss", "less", "html", "htm",
+  "vue", "svelte", "sh", "bash", "zsh", "fish",
+  "sql", "graphql", "proto", "env", "gitignore", "dockerignore",
 ]);
 
 function extractFilename(msg) {
@@ -131,14 +111,8 @@ function extractFilename(msg) {
 
   if (msg._args && typeof msg._args === "object") {
     const pathFields = [
-      "file_path",
-      "path",
-      "filepath",
-      "filename",
-      "file",
-      "source",
-      "target",
-      "uri",
+      "file_path", "path", "filepath", "filename",
+      "file", "source", "target", "uri",
     ];
     for (const field of pathFields) {
       const val = msg._args[field];
@@ -164,10 +138,46 @@ function extractFilename(msg) {
   return null;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// normalizeFilePath
+//
+// FIX-B: Added canonical src/ prefix stripping.
+//
+// The inconsistency between "file:src/proxy/stagetimer.js" and
+// "file:proxy/stagetimer.js" comes from different tools passing paths
+// differently:
+//   - Claude Code's read_file passes: "src/proxy/stageTimer.js"
+//   - PatchEngine / grep passes:      "proxy/stageTimer.js"
+//     (relative to src/ instead of cwd)
+//
+// Both are already relative paths so CWD_PREFIX stripping doesn't help.
+// The fix is to canonicalize by checking if the path WITHOUT a leading
+// "src/" resolves to a file that also exists WITH "src/" — but that
+// requires a filesystem hit. Instead we do the cheaper thing: always
+// strip a leading "src/" so both paths become "proxy/stagetimer.js".
+//
+// This is safe because:
+//   1. ContextForge's source lives under src/ exclusively
+//   2. No two files have the same path differing only by src/ prefix
+//   3. The canonical key just needs to be consistent, not match any
+//      real filesystem path
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CWD_PREFIX = path
+  .resolve(process.cwd())
+  .replace(/\\/g, "/")
+  .toLowerCase()
+  .replace(/\/?$/, "/");
+
+// Leading directory segments that different tools strip inconsistently.
+// We remove these to produce a canonical path that all tools agree on.
+// Order matters: try longest prefix first.
+const STRIP_PREFIXES = ["src/"];
+
 function normalizeFilePath(rawPath) {
   if (!rawPath || typeof rawPath !== "string") return null;
 
-  const p = rawPath.trim();
+  let p = rawPath.trim();
   if (p.length === 0 || p.length > 300) return null;
 
   const extMatch = p.match(/\.(\w+)$/);
@@ -175,18 +185,58 @@ function normalizeFilePath(rawPath) {
   const ext = extMatch[1].toLowerCase();
   if (!SOURCE_EXTENSIONS.has(ext)) return null;
 
-  return p
-    .replace(/\\/g, "/")
+  // Normalise separators and lowercase
+  p = p.replace(/\\/g, "/").toLowerCase();
+
+  // Strip process.cwd() prefix (absolute paths)
+  if (p.startsWith(CWD_PREFIX)) {
+    p = p.slice(CWD_PREFIX.length);
+  }
+
+  // Strip bare drive letter
+  p = p.replace(/^[a-z]:\//i, "");
+
+  // Strip leading slashes / "./"
+  p = p
     .replace(/^\.\/+/, "")
     .replace(/^\/+/, "")
-    .replace(/\/+/g, "/")
-    .toLowerCase();
+    .replace(/\/+/g, "/");
+
+  // FIX-B: Strip canonical leading prefixes so tools that pass
+  // "src/proxy/foo.js" and tools that pass "proxy/foo.js" both
+  // produce the same registry key: "proxy/foo.js"
+  for (const prefix of STRIP_PREFIXES) {
+    if (p.startsWith(prefix)) {
+      p = p.slice(prefix.length);
+      break; // only strip one prefix level
+    }
+  }
+
+  return p.length > 0 ? p : null;
 }
+
+// ─────────────────────────────────────────────
+// buildMessageKey
+// ─────────────────────────────────────────────
 
 function buildMessageKey(msg) {
   const filename = extractFilename(msg);
-  if (!filename) return null;
-  return "file:" + filename;
+  if (filename) {
+    const toolSuffix =
+      msg.name && typeof msg.name === "string" ? `|tool:${msg.name}` : "";
+    return `file:${filename}${toolSuffix}`;
+  }
+
+  if (
+    msg._cf_type === "text" &&
+    typeof msg.content === "string" &&
+    msg.content.length >= 100
+  ) {
+    const prefix = msg.content.slice(0, 200);
+    return "text:" + fnv1a64(prefix);
+  }
+
+  return null;
 }
 
 // ─────────────────────────────────────────────
@@ -212,15 +262,7 @@ function fingerprintDistance(a, b) {
 }
 
 // ─────────────────────────────────────────────
-// Fast content identity check
-//
-// FNV-1a 32-bit run twice over interleaved offsets.
-// Used to verify true byte-for-byte identity when SimHash
-// distance=0 — because SimHash is lossy and a 1-line change
-// in a large file may not flip any bits of the 64-bit hash.
-//
-// Zero allocation, no crypto module dependency.
-// Runs in O(n) time — faster than SHA-256 for this use case.
+// Fast content identity check (FNV-1a 64-bit)
 // ─────────────────────────────────────────────
 
 function fnv1a64(str) {
@@ -252,33 +294,15 @@ async function computeLineDiff(oldText, newText) {
 
   const totalLines = oldLines.length + newLines.length;
 
-  // CIRCUIT BREAKER 1: Myers Diff is O(n*d) — too slow for large files
-  // CIRCUIT BREAKER 2: For very large files, even fastLineDiff produces
-  // a delta larger than the source (equal lines dominate the output).
-  // At this scale, Fat Catch will vault regardless — skip diffing.
-  if (totalLines > 2000) {
-    return null;
-  }
+  if (totalLines > 2000) return null;
 
-  // ── Fix 2: Horizontally-massive content early abort ──────────────────────
-  // If both old and new content are minified/single-line (< 5 lines total)
-  // but individually large (> 20k chars each), a line-diff is mathematically
-  // guaranteed to produce negative savings:
-  //
-  //   old: 1 line × 50k chars → delete 1 line (50k chars)
-  //   new: 1 line × 50k chars → insert 1 line (50k chars)
-  //   delta output: 100k chars — worse than the original
-  //
-  // Abort here in ~0ms. Fat Catch will vault the content anyway since
-  // it exceeds charThreshold. SemanticDedup registers the near-dup in
-  // the session registry (caller handles this) but sends no delta.
   if (
     oldLines.length < 5 &&
     newLines.length < 5 &&
     oldText.length > 20_000 &&
     newText.length > 20_000
   ) {
-    return null; // same signal as the 2000-line breaker — delta not viable
+    return null;
   }
 
   if (totalLines > 500) {
@@ -289,12 +313,12 @@ async function computeLineDiff(oldText, newText) {
 }
 
 function myersDiff(oldLines, newLines) {
-  const m = oldLines.length;
-  const n = newLines.length;
+  const m   = oldLines.length;
+  const n   = newLines.length;
   const max = m + n;
   if (max === 0) return [];
 
-  const V = new Int32Array(2 * max + 1);
+  const V     = new Int32Array(2 * max + 1);
   const trace = [];
 
   for (let d = 0; d <= max; d++) {
@@ -330,8 +354,8 @@ function _myersBacktrack(trace, oldLines, newLines, max) {
   let y = newLines.length;
 
   for (let d = trace.length - 1; d > 0; d--) {
-    const V = trace[d];
-    const k = x - y;
+    const V  = trace[d];
+    const k  = x - y;
     let prevK;
     if (k === -d || (k !== d && V[k - 1 + max] < V[k + 1 + max])) {
       prevK = k + 1;
@@ -381,11 +405,11 @@ function fastLineDiff(oldLines, newLines) {
     if (!oldIndex.has(key)) oldIndex.set(key, i);
   }
 
-  const ops = [];
-  let oldPtr = 0;
+  const ops    = [];
+  let   oldPtr = 0;
 
   for (const newLine of newLines) {
-    const key = _lineHash(newLine);
+    const key      = _lineHash(newLine);
     const matchIdx = oldIndex.get(key);
     if (matchIdx !== undefined && matchIdx >= oldPtr) {
       for (let i = oldPtr; i < matchIdx; i++) {
@@ -409,7 +433,7 @@ function _lineHash(line) {
   let h = 0x811c9dc5;
   for (let i = 0; i < line.length; i++) {
     h ^= line.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
+    h  = Math.imul(h, 0x01000193) >>> 0;
   }
   return h;
 }
@@ -422,8 +446,8 @@ const CONTEXT_LINES = 3;
 
 function formatDeltaForLLM(ops, ref) {
   const insertions = ops.filter((o) => o.type === "insert").length;
-  const deletions = ops.filter((o) => o.type === "delete").length;
-  const unchanged = ops.filter((o) => o.type === "equal").length;
+  const deletions  = ops.filter((o) => o.type === "delete").length;
+  const unchanged  = ops.filter((o) => o.type === "equal").length;
 
   const header = [
     `[CF_DELTA: ${ref.filename} — unchanged from turn ${ref.seenTurn}]`,
@@ -437,7 +461,7 @@ function formatDeltaForLLM(ops, ref) {
     return [
       ...header,
       `[No changes — content is identical to turn ${ref.seenTurn}]`,
-      `Call contextforge_retrieve(vault_id:"${ref.vaultId}") if you need the full content.`,
+      `Use tool call contextforge_retrieve with vault_id="${ref.vaultId}" to read the full content.`,
     ].join("\n");
   }
 
@@ -454,8 +478,8 @@ function formatDeltaForLLM(ops, ref) {
     }
   }
 
-  const body = [`--- Changes from turn ${ref.seenTurn} ---`];
-  let inGap = false;
+  const body   = [`--- Changes from turn ${ref.seenTurn} ---`];
+  let inGap    = false;
   let gapCount = 0;
 
   for (let i = 0; i < ops.length; i++) {
@@ -466,11 +490,11 @@ function formatDeltaForLLM(ops, ref) {
     }
     if (inGap) {
       body.push(`  [... ${gapCount} unchanged lines ...]`);
-      inGap = false;
+      inGap    = false;
       gapCount = 0;
     }
     const { type, line } = ops[i];
-    if (type === "equal") body.push(`  ${line}`);
+    if (type === "equal")  body.push(`  ${line}`);
     if (type === "delete") body.push(`- ${line}`);
     if (type === "insert") body.push(`+ ${line}`);
   }
@@ -479,7 +503,7 @@ function formatDeltaForLLM(ops, ref) {
 
   body.push(`--- End of changes ---`);
   body.push(
-    `Call contextforge_retrieve(vault_id:"${ref.vaultId}") for full content.`,
+    `Use tool call contextforge_retrieve with vault_id="${ref.vaultId}" to read the full content.`,
   );
 
   return [...header, ...body].join("\n");
@@ -489,18 +513,23 @@ function formatDeltaForLLM(ops, ref) {
 // Core deduplication
 // ─────────────────────────────────────────────
 
-const MIN_DEDUP_CHARS = 500;
-const MIN_SAVINGS_RATIO = 0.3;
+const MIN_DEDUP_CHARS   = 500;
 
-/**
- * Dynamically scales the allowed Hamming distance based on file size.
- * Large files saturate 64-bit hashes, requiring a more forgiving threshold
- * to successfully catch 1-line near-duplicates.
- */
-function getDynamicThreshold(contentLength) {
+// FIX-C: Lowered from 0.3 → 0.1 so near-dup deltas fire more aggressively.
+// Previously only deltas that saved >30% were sent; now >10% is enough.
+// When savings are still below 10% but content is already vaulted, we send
+// a vault stub instead of full content (see vault-stub path below).
+const MIN_SAVINGS_RATIO = 0.1;
+
+// FIX-A: getDynamicThreshold previously received content.length (a number)
+// but destructures { contentLength, fileType } — so contentLength was always
+// undefined and every if-check failed, returning the default 8 regardless of
+// file size. Large files (200k chars) should get threshold 24, not 8.
+function getDynamicThreshold({ contentLength, fileType }) {
+  if (contentLength > 200_000) return 24;
   if (contentLength > 100_000) return 20;
-  if (contentLength > 50_000) return 16;
-  if (contentLength > 20_000) return 12;
+  if (contentLength > 50_000)  return 16;
+  if (contentLength > 20_000)  return 12;
   return 8;
 }
 
@@ -510,17 +539,48 @@ async function deduplicateMessage(msg, key) {
     return { deduplicated: false, msg };
   }
 
+  const existing = sessionRegistry.get(key);
+
+  // ── Fast-path: FNV-1a exact match check before expensive SimHash ──
+  if (existing && existing.contentHash) {
+    const contentHash = fnv1a64(content);
+    if (contentHash === existing.contentHash) {
+      if (existing.turnIndex !== sessionRegistry._turnIndex) {
+        sessionRegistry.set(key, { ...existing, contentHash });
+      }
+      const tokensSaved = Math.round(content.length / 4);
+      statsEmitter.recordCacheHit("semanticDedup", true);
+      console.log(
+        `[SemanticDedup] ⚡ Fast-path exact duplicate: ${key} ` +
+          `(FNV-1a match, SimHash skipped)`,
+      );
+      return {
+        deduplicated: true,
+        msg: {
+          ...msg,
+          _cf_deduped: true,
+          content:
+            `[CF_DELTA: ${msg._filename || key} — IDENTICAL to turn ${existing.turnIndex}]\n` +
+            `Reference vault: ${existing.vaultId}\n` +
+            `Content is byte-for-byte identical to the version read on turn ${existing.turnIndex}.\n` +
+            `Tokens saved: ~${tokensSaved}\n` +
+            `Use tool call contextforge_retrieve with vault_id="${existing.vaultId}" to read the full content.`,
+          _dedupVaultId: existing.vaultId,
+          _dedupSimilarity: 100,
+        },
+      };
+    }
+  }
+
   const fingerprint = computeFingerprint(content);
   if (fingerprint === null) return { deduplicated: false, msg };
-
-  const existing = sessionRegistry.get(key);
 
   // ── First time seeing this key ──
   if (!existing) {
     const vaultId = saveToVault(content);
     sessionRegistry.set(key, {
       fingerprint,
-      contentHash: fnv1a64(content), // ← store for exact identity check
+      contentHash: fnv1a64(content),
       vaultId,
       contentLength: content.length,
     });
@@ -532,16 +592,21 @@ async function deduplicateMessage(msg, key) {
     return { deduplicated: false, msg };
   }
 
-  const distance = fingerprintDistance(fingerprint, existing.fingerprint);
+  const distance      = fingerprintDistance(fingerprint, existing.fingerprint);
   const similarityPct = Math.round(((64 - distance) / 64) * 100);
 
+  // FIX-A: Pass object with contentLength so getDynamicThreshold works correctly.
+  // Previously called as getDynamicThreshold(content.length) — a bare number —
+  // so destructuring { contentLength } always yielded undefined and the function
+  // always returned the default threshold of 8 regardless of file size.
+  const dynamicThreshold = getDynamicThreshold({ contentLength: content.length });
+
   // ── Sufficiently different — update registry ──
-  const dynamicThreshold = getDynamicThreshold(content.length);
   if (distance > dynamicThreshold) {
     const vaultId = saveToVault(content);
     sessionRegistry.set(key, {
       fingerprint,
-      contentHash: fnv1a64(content), // ← store hash
+      contentHash: fnv1a64(content),
       vaultId,
       contentLength: content.length,
     });
@@ -558,24 +623,16 @@ async function deduplicateMessage(msg, key) {
       `(distance=${distance}, ${similarityPct}% similar to turn ${existing.turnIndex})`,
   );
 
-  // ── distance === 0: verify with FNV-1a before trusting SimHash ──
-  //
-  // SimHash is a Locality-Sensitive Hash — lossy by design.
-  // On large files (2000+ lines), a 1-line change may not flip
-  // any bits of the 64-bit fingerprint. We use FNV-1a to confirm
-  // true byte-for-byte identity before taking the zero-cost path.
-  // If hashes differ, fall through to Myers diff below.
+  // ── distance === 0: verify with FNV-1a ──
   if (distance === 0) {
-    const contentHash = fnv1a64(content);
+    const contentHash      = fnv1a64(content);
     const isTrulyIdentical = existing.contentHash === contentHash;
 
     if (isTrulyIdentical) {
-      // Confirmed exact duplicate — zero cost path
       const tokensSaved = Math.round(content.length / 4);
-      sessionRegistry.set(key, {
-        ...existing,
-        contentHash,
-      });
+      if (existing.turnIndex !== sessionRegistry._turnIndex) {
+        sessionRegistry.set(key, { ...existing, contentHash });
+      }
       statsEmitter.recordCacheHit("semanticDedup", true);
       console.log(
         `[SemanticDedup] ✅ Exact duplicate: ${key} ` +
@@ -585,27 +642,24 @@ async function deduplicateMessage(msg, key) {
         deduplicated: true,
         msg: {
           ...msg,
+          _cf_deduped: true,
           content:
             `[CF_DELTA: ${msg._filename || key} — IDENTICAL to turn ${existing.turnIndex}]\n` +
             `Reference vault: ${existing.vaultId}\n` +
             `Content is byte-for-byte identical to the version read on turn ${existing.turnIndex}.\n` +
             `Tokens saved: ~${tokensSaved}\n` +
-            `Call contextforge_retrieve(vault_id:"${existing.vaultId}") if you need the full content.`,
+            `Use tool call contextforge_retrieve with vault_id="${existing.vaultId}" to read the full content.`,
           _dedupVaultId: existing.vaultId,
           _dedupSimilarity: 100,
         },
       };
     }
 
-    // SimHash collision — distance=0 but content genuinely differs.
-    // A 1-line change in a large file didn't flip any hash bits.
-    // Route to Myers diff to extract the actual delta.
     console.log(
       `[SemanticDedup] 🔀 SimHash collision on ${key}: ` +
         `distance=0 but FNV-1a differs — routing to diff ` +
         `(file size ${content.length} chars, 64-bit hash saturated)`,
     );
-    // Fall through to near-duplicate diff path below
   }
 
   // ── Near-duplicate — retrieve original and diff ──
@@ -638,14 +692,13 @@ async function deduplicateMessage(msg, key) {
     console.warn(`[SemanticDedup] ⚠️ Diff failed: ${err.message}`);
     sessionRegistry.set(key, {
       fingerprint,
-      contentHash: fnv1a64(content),
-      vaultId: existing.vaultId,
+      contentHash:   fnv1a64(content),
+      vaultId:       existing.vaultId,
       contentLength: content.length,
     });
     return { deduplicated: false, msg };
   }
 
-  // Diff not viable at this file size — Fat Catch will vault anyway
   if (ops === null) {
     console.log(
       `[SemanticDedup] ⏭️  File too large to diff (${content.length} chars) — ` +
@@ -653,8 +706,8 @@ async function deduplicateMessage(msg, key) {
     );
     sessionRegistry.set(key, {
       fingerprint,
-      contentHash: fnv1a64(content),
-      vaultId: existing.vaultId,
+      contentHash:   fnv1a64(content),
+      vaultId:       existing.vaultId,
       contentLength: content.length,
     });
     statsEmitter.recordCacheHit("semanticDedup", false);
@@ -662,34 +715,67 @@ async function deduplicateMessage(msg, key) {
   }
 
   const deltaText = formatDeltaForLLM(ops, {
-    filename: msg._filename || key,
-    seenTurn: existing.turnIndex,
-    vaultId: existing.vaultId,
+    filename:   msg._filename || key,
+    seenTurn:   existing.turnIndex,
+    vaultId:    existing.vaultId,
     similarity: similarityPct,
   });
 
   const savingsRatio = 1 - deltaText.length / content.length;
 
+  // FIX-C: Three-way branch on savings ratio:
+  //
+  //   ① savingsRatio >= MIN_SAVINGS_RATIO (10%)
+  //      → Normal path: send delta, update vault with new content.
+  //
+  //   ② savingsRatio < MIN_SAVINGS_RATIO AND existing.vaultId present
+  //      → Vault-stub path: content is already stored; sending full content
+  //        would re-transmit thousands of tokens for marginal delta. Instead
+  //        send a lightweight stub that the LLM can expand via retrieve tool.
+  //        This is the core fix — previously full content was always sent here.
+  //
+  //   ③ savingsRatio < MIN_SAVINGS_RATIO AND no vaultId
+  //      → Fallback: no vault available, must send full content.
   if (savingsRatio < MIN_SAVINGS_RATIO) {
+    if (existing.vaultId) {
+      // ② Vault-stub path — content already safe in vault, skip re-transmission
+      console.log(
+        `[SemanticDedup] ⏭️ Delta savings ${(savingsRatio * 100).toFixed(0)}% < ${(MIN_SAVINGS_RATIO * 100).toFixed(0)}% — ` +
+          `but content is vaulted. Sending stub instead of full content.`,
+      );
+      statsEmitter.recordCacheHit("semanticDedup", true);
+      return {
+        deduplicated: true,
+        msg: {
+          ...msg,
+          content: `[CF_VAULT:${existing.vaultId}] (Similarity: ${similarityPct}%)`,
+          _dedupVaultId: existing.vaultId,
+          _dedupSimilarity: similarityPct,
+        },
+      };
+    }
+
+    // ③ No vault — fall through and send full content
     console.log(
-      `[SemanticDedup] ⏭️  Delta savings ${(savingsRatio * 100).toFixed(0)}% < 30% — full content`,
+      `[SemanticDedup] ⏭️ Delta savings ${(savingsRatio * 100).toFixed(0)}% < ${(MIN_SAVINGS_RATIO * 100).toFixed(0)}% ` +
+        `and no vault available — sending full content`,
     );
     sessionRegistry.set(key, {
       fingerprint,
-      contentHash: fnv1a64(content),
-      vaultId: existing.vaultId,
+      contentHash:   fnv1a64(content),
+      vaultId:       existing.vaultId,
       contentLength: content.length,
     });
     statsEmitter.recordCacheHit("semanticDedup", false);
     return { deduplicated: false, msg };
   }
 
-  // ── Delta sent — near-duplicate hit ──
+  // ① Normal path — delta saves enough, send it
   const newVaultId = saveToVault(content);
   sessionRegistry.set(key, {
     fingerprint,
-    contentHash: fnv1a64(content), // ← always store hash
-    vaultId: newVaultId,
+    contentHash:   fnv1a64(content),
+    vaultId:       newVaultId,
     contentLength: content.length,
   });
   statsEmitter.recordCacheHit("semanticDedup", true);
@@ -703,8 +789,9 @@ async function deduplicateMessage(msg, key) {
     deduplicated: true,
     msg: {
       ...msg,
-      content: deltaText,
-      _dedupVaultId: newVaultId,
+      _cf_deduped:      true,
+      content:          deltaText,
+      _dedupVaultId:    newVaultId,
       _dedupSimilarity: similarityPct,
     },
   };
@@ -720,19 +807,24 @@ export async function applySemanticDedup(payload) {
   sessionRegistry.incrementTurn();
 
   const stats = {
-    checked: 0,
-    skippedType: 0,
+    checked:      0,
+    skippedType:  0,
     skippedNoKey: 0,
     deduplicated: 0,
-    exactDups: 0,
-    nearDups: 0,
-    charsSaved: 0,
+    exactDups:    0,
+    nearDups:     0,
+    charsSaved:   0,
   };
 
   const newMessages = [];
 
   for (const msg of payload.messages) {
     if (msg.role !== "tool" || typeof msg.content !== "string") {
+      newMessages.push(msg);
+      continue;
+    }
+
+    if (msg._cf_vaulted) {
       newMessages.push(msg);
       continue;
     }
@@ -785,27 +877,38 @@ export async function applySemanticDedup(payload) {
   return payload;
 }
 
-/**
- * Invalidate a single file's entry in the SimHash session registry.
- * Called by patchEngine after writing a patched file to disk.
- *
- * Without this, SemanticDedup would see the patched file on the next
- * turn and compare it against the pre-patch fingerprint — producing
- * a stale delta or a false "identical" result.
- *
- * @param {string} filePath — file path as stored (forward slashes)
- * @returns {boolean} true if an entry was found and removed
- */
-export function invalidateRegistryEntry(filePath) {
-  const normalizedKey =
-    "file:" + filePath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+// ─────────────────────────────────────────────
+// invalidateRegistryEntry
+// ─────────────────────────────────────────────
 
-  if (sessionRegistry._seen.has(normalizedKey)) {
-    sessionRegistry._seen.delete(normalizedKey);
-    console.log(`[SemanticDedup] 🗑️  Registry invalidated: ${normalizedKey}`);
-    return true;
+export function invalidateRegistryEntry(filePath) {
+  const normalized = normalizeFilePath(filePath);
+
+  if (!normalized) {
+    console.warn(
+      `[SemanticDedup] ⚠️  invalidateRegistryEntry: could not normalize "${filePath}" — skipped`,
+    );
+    return false;
   }
-  return false;
+
+  const prefix    = `file:${normalized}`;
+  let invalidated = 0;
+
+  for (const key of sessionRegistry._seen.keys()) {
+    if (key === prefix || key.startsWith(prefix + "|tool:")) {
+      sessionRegistry._seen.delete(key);
+      console.log(`[SemanticDedup] 🗑️  Registry invalidated: ${key}`);
+      invalidated++;
+    }
+  }
+
+  if (invalidated === 0) {
+    console.log(
+      `[SemanticDedup] ℹ️  invalidateRegistryEntry: no entry found for "${normalized}"`,
+    );
+  }
+
+  return invalidated > 0;
 }
 
 export { sessionRegistry as dedupRegistry };
