@@ -9,10 +9,16 @@
  * req.url === "/path" instead of Express app.get("/path").
  * This is what server.js uses — without this, find_route("/v1/stats/stream")
  * returns nothing and the LLM burns 5 retries trying to find the handler.
+ *
+ * HASH-BASED CHANGE DETECTION: fs.watch fires on file reads as well as
+ * writes on Windows. Before re-indexing, we SHA-256 the file content and
+ * skip if it matches the last known hash. This prevents re-index spam
+ * when the LLM reads files via read_file_chunk.
  */
 
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { statsEmitter } from "../proxy/statsEmitter.js";
 import { extractSymbols, getLanguageForFile } from "./symbolExtractor.js";
 import {
@@ -21,16 +27,28 @@ import {
   getGraphStats,
   getAllNodeNames,
 } from "./graphDb.js";
-import { clearSessionToolCache } from "../proxy/upstreamRequest.js";
+import { invalidateCacheForFile } from "../proxy/upstreamRequest.js";
 
 // ─────────────────────────────────────────────
 // Directory ignore list
 // ─────────────────────────────────────────────
 
 const IGNORE_DIRS = new Set([
-  "node_modules", ".git", ".claude", "dist", "build", "out",
-  ".next", ".nuxt", "coverage", "__pycache__", ".pytest_cache",
-  "target", "vendor", "native/build", "models",
+  "node_modules",
+  ".git",
+  ".claude",
+  "dist",
+  "build",
+  "out",
+  ".next",
+  ".nuxt",
+  "coverage",
+  "__pycache__",
+  ".pytest_cache",
+  "target",
+  "vendor",
+  "native/build",
+  "models",
 ]);
 
 const IGNORE_PATTERNS = [
@@ -40,6 +58,35 @@ const IGNORE_PATTERNS = [
   /\.map$/,
   /\.lock$/,
 ];
+
+// ─────────────────────────────────────────────
+// File hash cache — used by watchWorkspace to
+// skip re-indexing when content hasn't changed.
+// fs.watch fires on reads too (Windows), so
+// we need to verify actual content changes.
+// ─────────────────────────────────────────────
+
+const fileHashes = new Map();
+
+function getFileHash(filePath) {
+  try {
+    const content = fs.readFileSync(filePath, "utf-8");
+    return crypto.createHash("sha256").update(content).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function hasFileChanged(filePath) {
+  const newHash = getFileHash(filePath);
+  if (!newHash) return false;
+
+  const oldHash = fileHashes.get(filePath);
+  if (newHash === oldHash) return false;
+
+  fileHashes.set(filePath, newHash);
+  return true;
+}
 
 // ─────────────────────────────────────────────
 // Route detection patterns
@@ -62,15 +109,58 @@ const BARE_URL_PATTERN =
 const CALL_EXPRESSION_PATTERN = /\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
 
 const CALL_EXCLUSIONS = new Set([
-  "if", "for", "while", "switch", "catch", "function", "class", "return",
-  "typeof", "instanceof", "new", "await", "yield", "import", "export",
-  "const", "let", "var", "async", "static", "get", "set",
-  "console", "Math", "JSON", "Object", "Array", "String", "Number",
-  "Boolean", "Promise", "Error", "Date", "Map", "Set", "Symbol",
-  "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURIComponent",
-  "decodeURIComponent", "setTimeout", "setInterval", "clearTimeout",
-  "clearInterval", "setImmediate", "process", "Buffer", "require",
-  "performance", "crypto",
+  "if",
+  "for",
+  "while",
+  "switch",
+  "catch",
+  "function",
+  "class",
+  "return",
+  "typeof",
+  "instanceof",
+  "new",
+  "await",
+  "yield",
+  "import",
+  "export",
+  "const",
+  "let",
+  "var",
+  "async",
+  "static",
+  "get",
+  "set",
+  "console",
+  "Math",
+  "JSON",
+  "Object",
+  "Array",
+  "String",
+  "Number",
+  "Boolean",
+  "Promise",
+  "Error",
+  "Date",
+  "Map",
+  "Set",
+  "Symbol",
+  "parseInt",
+  "parseFloat",
+  "isNaN",
+  "isFinite",
+  "encodeURIComponent",
+  "decodeURIComponent",
+  "setTimeout",
+  "setInterval",
+  "clearTimeout",
+  "clearInterval",
+  "setImmediate",
+  "process",
+  "Buffer",
+  "require",
+  "performance",
+  "crypto",
 ]);
 
 // ─────────────────────────────────────────────
@@ -78,7 +168,7 @@ const CALL_EXCLUSIONS = new Set([
 // ─────────────────────────────────────────────
 
 function extractCallEdges(source, filePath, nodes, allKnownSymbols) {
-  const callEdges    = [];
+  const callEdges = [];
   const localSymbols = new Set(nodes.map((n) => n.name));
   const knownSymbols = allKnownSymbols ?? localSymbols;
 
@@ -95,19 +185,20 @@ function extractCallEdges(source, filePath, nodes, allKnownSymbols) {
     while ((match = CALL_EXPRESSION_PATTERN.exec(scanText)) !== null) {
       const callee = match[1];
       if (
-        callee === node.name   ||
+        callee === node.name ||
         CALL_EXCLUSIONS.has(callee) ||
-        !knownSymbols.has(callee)   ||
+        !knownSymbols.has(callee) ||
         seenCallees.has(callee)
-      ) continue;
+      )
+        continue;
 
       seenCallees.add(callee);
       callEdges.push({
         sourceSymbol: node.name,
         targetSymbol: callee,
-        targetFile:   null,
-        relation:     "calls",
-        sourceLine:   null,
+        targetFile: null,
+        relation: "calls",
+        sourceLine: null,
       });
     }
   }
@@ -139,15 +230,15 @@ function extractRouteEdges(source, filePath) {
   ROUTE_PATTERN.lastIndex = 0;
   let match;
   while ((match = ROUTE_PATTERN.exec(source)) !== null) {
-    const method     = match[1].toUpperCase();
-    const routePath  = match[2];
+    const method = match[1].toUpperCase();
+    const routePath = match[2];
     const sourceLine = offsetToLine(match.index);
 
     routeEdges.push({
       sourceSymbol: null,
       targetSymbol: `${method} ${routePath}`,
-      targetFile:   null,
-      relation:     "defines_route",
+      targetFile: null,
+      relation: "defines_route",
       sourceLine,
     });
   }
@@ -159,7 +250,7 @@ function extractRouteEdges(source, filePath) {
   // These are the handlers in server.js — Express pattern never fires there.
   BARE_URL_PATTERN.lastIndex = 0;
   while ((match = BARE_URL_PATTERN.exec(source)) !== null) {
-    const routePath  = match[1];
+    const routePath = match[1];
     const sourceLine = offsetToLine(match.index);
 
     // Detect HTTP method from context — look for req.method === "X" nearby
@@ -167,14 +258,16 @@ function extractRouteEdges(source, filePath) {
       Math.max(0, match.index - 10),
       match.index + match[0].length + 100,
     );
-    const methodMatch = contextWindow.match(/req\.method\s*===\s*['"`]([A-Z]+)['"`]/);
-    const method      = methodMatch ? methodMatch[1] : "ANY";
+    const methodMatch = contextWindow.match(
+      /req\.method\s*===\s*['"`]([A-Z]+)['"`]/,
+    );
+    const method = methodMatch ? methodMatch[1] : "ANY";
 
     routeEdges.push({
       sourceSymbol: null,
       targetSymbol: `${method} ${routePath}`,
-      targetFile:   null,
-      relation:     "defines_route",
+      targetFile: null,
+      relation: "defines_route",
       sourceLine,
     });
   }
@@ -216,7 +309,7 @@ function* walkDirectory(rootDir) {
 
 function buildIndexedFileMap() {
   const indexed = getAllIndexedFiles();
-  const map     = new Map();
+  const map = new Map();
   for (const row of indexed) map.set(row.file_path, row.last_modified);
   return map;
 }
@@ -249,7 +342,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
     const filePath = allFiles[i];
 
     try {
-      const stat  = fs.statSync(filePath);
+      const stat = fs.statSync(filePath);
       const mtime = stat.mtimeMs;
 
       if (!force && alreadyIndexed.has(filePath)) {
@@ -260,19 +353,24 @@ export async function indexWorkspace(workspacePath, options = {}) {
       }
 
       const source = fs.readFileSync(filePath, "utf-8");
-      if (source.length > 500_000) { stats.skipped++; continue; }
+      if (source.length > 500_000) {
+        stats.skipped++;
+        continue;
+      }
 
       const { nodes, edges } = extractSymbols(source, filePath);
 
       // G7: warn for JS/TS files with no named declarations
-      const isSynthetic = nodes.length === 1 && nodes[0].name.startsWith("__module_");
+      const isSynthetic =
+        nodes.length === 1 && nodes[0].name.startsWith("__module_");
       if (isSynthetic && source.length > 1000) {
-        const lang   = getLanguageForFile(filePath)?.language;
-        const isJsTs = lang === "javascript" || lang === "typescript" || lang === "tsx";
+        const lang = getLanguageForFile(filePath)?.language;
+        const isJsTs =
+          lang === "javascript" || lang === "typescript" || lang === "tsx";
         if (isJsTs) {
           console.warn(
             `[GraphMapper] ⚠️  ${path.basename(filePath)} has no named declarations ` +
-            `(${source.length} chars) — synthetic __module node created.`,
+              `(${source.length} chars) — synthetic __module node created.`,
           );
         }
       }
@@ -282,7 +380,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
 
       writeFileGraph({
         filePath,
-        language:     getLanguageForFile(filePath)?.language || "unknown",
+        language: getLanguageForFile(filePath)?.language || "unknown",
         lastModified: mtime,
         nodes,
         edges: pass1Edges,
@@ -292,15 +390,20 @@ export async function indexWorkspace(workspacePath, options = {}) {
       stats.indexed++;
 
       if (onProgress && i % 10 === 0) {
-        onProgress({ current: i + 1, total: stats.total,
-          file: path.relative(workspacePath, filePath), ...stats });
+        onProgress({
+          current: i + 1,
+          total: stats.total,
+          file: path.relative(workspacePath, filePath),
+          ...stats,
+        });
       }
       if (i % 5 === 0) await new Promise((r) => setImmediate(r));
-
     } catch (err) {
       stats.errors++;
       if (process.env.CF_DEBUG_GRAPH === "1") {
-        console.warn(`[GraphMapper] ⚠️ Failed to index ${filePath}: ${err.message}`);
+        console.warn(
+          `[GraphMapper] ⚠️ Failed to index ${filePath}: ${err.message}`,
+        );
       }
     }
   }
@@ -308,41 +411,50 @@ export async function indexWorkspace(workspacePath, options = {}) {
   console.log(`[GraphMapper] Pass 2/2 — computing cross-file call edges…`);
 
   const allKnownSymbols = new Set(getAllNodeNames());
-  console.log(`[GraphMapper] Global symbol set: ${allKnownSymbols.size} symbols`);
+  console.log(
+    `[GraphMapper] Global symbol set: ${allKnownSymbols.size} symbols`,
+  );
 
   for (const [filePath, { source, nodes, mtime }] of fileData) {
     try {
-      const callEdges = extractCallEdges(source, filePath, nodes, allKnownSymbols);
+      const callEdges = extractCallEdges(
+        source,
+        filePath,
+        nodes,
+        allKnownSymbols,
+      );
       if (callEdges.length === 0) continue;
 
       const { edges: symbolEdges } = extractSymbols(source, filePath);
       const routeEdges = extractRouteEdges(source, filePath);
-      const allEdges   = [...symbolEdges, ...callEdges, ...routeEdges];
+      const allEdges = [...symbolEdges, ...callEdges, ...routeEdges];
 
       writeFileGraph({
         filePath,
-        language:     getLanguageForFile(filePath)?.language || "unknown",
+        language: getLanguageForFile(filePath)?.language || "unknown",
         lastModified: mtime,
         nodes,
         edges: allEdges,
       });
     } catch (err) {
       if (process.env.CF_DEBUG_GRAPH === "1") {
-        console.warn(`[GraphMapper] ⚠️ Pass 2 failed for ${filePath}: ${err.message}`);
+        console.warn(
+          `[GraphMapper] ⚠️ Pass 2 failed for ${filePath}: ${err.message}`,
+        );
       }
     }
     await new Promise((r) => setImmediate(r));
   }
 
-  const elapsed    = Date.now() - startTime;
+  const elapsed = Date.now() - startTime;
   const graphStats = getGraphStats();
 
   console.log(
     `[GraphMapper] ✅ Index complete in ${elapsed}ms | ` +
-    `Files: ${stats.indexed} indexed, ${stats.skipped} skipped, ${stats.errors} errors | ` +
-    `Graph: ${graphStats.node_count} nodes, ${graphStats.edge_count} edges ` +
-    `(${graphStats.calls_count} calls, ${graphStats.imports_count} imports, ` +
-    `${graphStats.routes_count} routes)`,
+      `Files: ${stats.indexed} indexed, ${stats.skipped} skipped, ${stats.errors} errors | ` +
+      `Graph: ${graphStats.node_count} nodes, ${graphStats.edge_count} edges ` +
+      `(${graphStats.calls_count} calls, ${graphStats.imports_count} imports, ` +
+      `${graphStats.routes_count} routes)`,
   );
 
   statsEmitter.updateGraphStats({
@@ -351,16 +463,33 @@ export async function indexWorkspace(workspacePath, options = {}) {
     files: stats.indexed + stats.skipped,
   });
 
+  // Seed file hashes after initial indexing so watchWorkspace can detect future changes
+  for (const [filePath] of fileData) {
+    const hash = getFileHash(filePath);
+    if (hash) fileHashes.set(filePath, hash);
+  }
+
   return stats;
 }
 
 // ─────────────────────────────────────────────
 // watchWorkspace
+//
+// Uses fs.watch for recursive monitoring. On Windows, fs.watch fires
+// "change" events even when a file is read. To prevent unnecessary
+// re-indexing, we SHA-256 each file's content and skip if unchanged.
+//
+// Debounce: 800ms timer batches rapid-fire watch events into a single
+// processChanges call.
+//
+// Cache invalidation: uses invalidateCacheForFile (surgical) instead of
+// clearSessionToolCache (blunt). Only clears cache entries for the
+// specific file that changed.
 // ─────────────────────────────────────────────
 
 export function watchWorkspace(workspacePath) {
   const pendingFiles = new Set();
-  let debounceTimer  = null;
+  let debounceTimer = null;
 
   const processChanges = async () => {
     const files = [...pendingFiles];
@@ -369,33 +498,53 @@ export function watchWorkspace(workspacePath) {
     if (process.env.CF_DEBUG_GRAPH === "1") {
       console.log(
         `[GraphMapper] 🔄 processChanges triggered for ${files.length} file(s): ` +
-        files.map((f) => path.basename(f)).join(", "),
+          files.map((f) => path.basename(f)).join(", "),
       );
     }
 
+    // Refresh symbol set for cross-file call edge computation
     const allKnownSymbols = new Set(getAllNodeNames());
 
     for (const filePath of files) {
       if (!getLanguageForFile(filePath)) continue;
 
-      // W2: wait for editor/PatchEngine to flush
+      // W2: wait for editor/PatchEngine to flush writes
       await new Promise((r) => setTimeout(r, 200));
 
+      // ── Hash check: skip if content hasn't changed ──────────────────
+      // fs.watch fires on reads as well as writes (Windows). By comparing
+      // SHA-256 hashes we only re-index when content actually changed.
+      if (!hasFileChanged(filePath)) {
+        if (process.env.CF_DEBUG_GRAPH === "1") {
+          console.log(
+            `[GraphMapper] ⏭️  Skipped ${path.basename(filePath)} (content unchanged)`,
+          );
+        }
+        continue;
+      }
+      // ── End hash check ──────────────────────────────────────────────
+
       try {
-        const stat   = fs.statSync(filePath);
+        const stat = fs.statSync(filePath);
         const source = fs.readFileSync(filePath, "utf-8");
 
         if (source.length === 0) {
-          console.warn(`[GraphMapper] ⚠️  ${path.basename(filePath)} read as empty — skipping`);
+          console.warn(
+            `[GraphMapper] ⚠️  ${path.basename(filePath)} read as empty — skipping`,
+          );
+          // Remove stale hash so next watch event retries
+          fileHashes.delete(filePath);
           continue;
         }
 
         const { nodes, edges } = extractSymbols(source, filePath);
 
-        const isSynthetic = nodes.length === 1 && nodes[0].name.startsWith("__module_");
+        const isSynthetic =
+          nodes.length === 1 && nodes[0].name.startsWith("__module_");
         if (isSynthetic && source.length > 1000) {
-          const lang   = getLanguageForFile(filePath)?.language;
-          const isJsTs = lang === "javascript" || lang === "typescript" || lang === "tsx";
+          const lang = getLanguageForFile(filePath)?.language;
+          const isJsTs =
+            lang === "javascript" || lang === "typescript" || lang === "tsx";
           if (isJsTs) {
             console.warn(
               `[GraphMapper] ⚠️  ${path.basename(filePath)} re-indexed with synthetic __module node`,
@@ -403,13 +552,18 @@ export function watchWorkspace(workspacePath) {
           }
         }
 
-        const callEdges  = extractCallEdges(source, filePath, nodes, allKnownSymbols);
+        const callEdges = extractCallEdges(
+          source,
+          filePath,
+          nodes,
+          allKnownSymbols,
+        );
         const routeEdges = extractRouteEdges(source, filePath);
-        const allEdges   = [...edges, ...callEdges, ...routeEdges];
+        const allEdges = [...edges, ...callEdges, ...routeEdges];
 
         writeFileGraph({
-          filePath:     filePath.replace(/\\/g, "/"),
-          language:     getLanguageForFile(filePath)?.language || "unknown",
+          filePath: filePath.replace(/\\/g, "/"),
+          language: getLanguageForFile(filePath)?.language || "unknown",
           lastModified: stat.mtimeMs,
           nodes,
           edges: allEdges,
@@ -417,11 +571,13 @@ export function watchWorkspace(workspacePath) {
 
         console.log(
           `[GraphMapper] 🔄 Re-indexed: ${path.relative(workspacePath, filePath)} ` +
-          `(${nodes.length} nodes, ${allEdges.length} edges, ${callEdges.length} call edges)`,
+            `(${nodes.length} nodes, ${allEdges.length} edges, ${callEdges.length} call edges)`,
         );
 
-        // Clear session tool cache so next request gets fresh graph data
-        clearSessionToolCache();
+        // Surgical invalidation — only clears cache entries for this file.
+        // Previously called clearSessionToolCache() which wiped ALL cached
+        // symbols across ALL files, even unrelated ones.
+        invalidateCacheForFile(filePath);
 
         try {
           const updated = getGraphStats();
@@ -430,15 +586,18 @@ export function watchWorkspace(workspacePath) {
             edges: updated.edge_count,
             files: updated.file_count,
           });
-        } catch { /* non-critical */ }
-
+        } catch {
+          /* non-critical — stats emitter may not be ready during startup */
+        }
       } catch (err) {
         if (err.code !== "ENOENT") {
           console.warn(
             `[GraphMapper] ⚠️  Re-index failed for ${path.basename(filePath)}: ` +
-            `${err.code || err.message}`,
+              `${err.code || err.message}`,
           );
         }
+        // Remove stale hash on error so next watch event retries
+        fileHashes.delete(filePath);
       }
     }
   };
@@ -454,7 +613,9 @@ export function watchWorkspace(workspacePath) {
       if (IGNORE_PATTERNS.some((p) => p.test(path.basename(fullPath)))) return;
 
       if (process.env.CF_DEBUG_GRAPH === "1") {
-        console.log(`[GraphMapper] 👁️  Watch event: ${event} → ${path.basename(fullPath)}`);
+        console.log(
+          `[GraphMapper] 👁️  Watch event: ${event} → ${path.basename(fullPath)}`,
+        );
       }
 
       pendingFiles.add(fullPath);

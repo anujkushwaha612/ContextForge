@@ -163,17 +163,6 @@ function sessionCacheSet(name, argsStr, result) {
   SESSION_TOOL_CACHE.set(key, result);
 }
 
-export function clearSessionToolCache() {
-  const size = SESSION_TOOL_CACHE.size;
-  SESSION_TOOL_CACHE.clear();
-  CHUNK_CACHE.clear();
-  if (size > 0) {
-    console.log(
-      `[Ghost Interceptor] 🗑️  Session tool cache cleared (${size} entries)`,
-    );
-  }
-}
-
 /**
  * Surgical cache invalidation after a patch.
  *
@@ -186,8 +175,6 @@ export function clearSessionToolCache() {
  *      has changed so any cached line ranges are stale.
  *   4. Never clear symbols from OTHER files — they are unaffected.
  *
- * This replaces the blunt clearSessionToolCache() call after patches,
- * which was wiping valid cached results for untouched symbols.
  *
  * @param {string} filePath     - The file that was patched
  * @param {string|null} symbol  - The specific symbol that was modified, or null for global patches
@@ -242,6 +229,48 @@ export function invalidateCacheForPatch(filePath, symbol) {
     console.log(
       `[Ghost Interceptor] 🗑️  Invalidated ${cleared} cache entries` +
         (symbol ? ` for symbol '${symbol}'` : ` for file '${fileBasename}'`),
+    );
+  }
+}
+
+/**
+ * Surgical cache invalidation for external file modifications.
+ * 
+ * Called by the file watcher when a file is saved externally
+ * (not via patch). Clears all cache entries for THIS file only.
+ * 
+ * Differs from invalidateCacheForPatch:
+ *   - invalidateCacheForPatch: knows the specific symbol → ultra-surgical
+ *   - invalidateCacheForFile: file changed externally → clear all symbols in this file
+ * 
+ * @param {string} filePath - The file that was modified
+ */
+export function invalidateCacheForFile(filePath) {
+  const fileBasename = filePath
+    .replace(/\\/g, "/")
+    .split("/")
+    .pop()
+    .toLowerCase();
+  
+  let cleared = 0;
+  
+  for (const key of SESSION_TOOL_CACHE.keys()) {
+    const keyLower = key.toLowerCase();
+    
+    // Clear all graph queries for this file
+    // (find_symbol, find_route, show_callers, etc.)
+    if (keyLower.includes(fileBasename.replace(".js", ""))) {
+      SESSION_TOOL_CACHE.delete(key);
+      cleared++;
+    }
+  }
+  
+  // Clear all chunk cache entries for this file
+  chunkCacheInvalidateFile(filePath);
+  
+  if (cleared > 0) {
+    console.log(
+      `[Ghost Interceptor] 🗑️  Invalidated ${cleared} cache entries for file '${fileBasename}'`
     );
   }
 }

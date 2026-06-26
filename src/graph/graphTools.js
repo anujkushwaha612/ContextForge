@@ -516,10 +516,13 @@ export function executeGraphQuery(queryType, target) {
             routes: rows.map((r) => ({
               route: r.route_path,
               file: r.source_file,
+              start_line: r.source_line ?? null, // ← ADD THIS
               handler: r.handler || "(inline)",
               patch_hint: r.handler
                 ? `Use find_symbol('${r.handler}') to get the handler body and line numbers.`
-                : `Route is inline — use contextforge_retrieve on ${r.source_file} to get surrounding context.`,
+                : r.source_line
+                  ? `Route is inline at line ${r.source_line} — use insert_at_line with insert_line=${r.source_line} or read_file_chunk to get surrounding context.`
+                  : `Route is inline — use contextforge_retrieve on ${r.source_file} to get surrounding context.`,
             })),
             count: rows.length,
           },

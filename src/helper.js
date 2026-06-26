@@ -664,10 +664,7 @@ export function stripAnthropicSpecificFields(payload) {
   return cleaned;
 }
 
-// ========================================================
-// 3. STREAM TRANSLATOR: OpenAI Server Deltas -> Anthropic SSE
-// ========================================================
-// Add at module level in helper.js:
+
 const _toolSchemaCacheMap = new Map();
 
 // Wrap minimizeToolSchemas:

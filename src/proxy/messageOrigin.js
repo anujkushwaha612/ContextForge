@@ -213,3 +213,19 @@ export function detectMessageOrigin(messages) {
 export function requiresRepositoryWork(origin) {
   return origin !== "AGENT_STATUS" && origin !== "TOOL_FOLLOWUP";
 }
+
+/**
+ * Returns true if any of the last 4 messages contain tool activity
+ * (tool results or tool calls). Replaces broken inline checks that
+ * looked for role:"tool" (doesn't exist) and m.tool_calls (wrong field).
+ * 
+ * @param {object[]} messages - Full messages array from the request body
+ * @returns {boolean}
+ */
+export function detectRecentToolActivity(messages) {
+  if (!messages || messages.length === 0) return false;
+  const recent = messages.slice(-4);
+  return recent.some(
+    (m) => isToolResultMessage(m) || assistantCalledTools(m)
+  );
+}

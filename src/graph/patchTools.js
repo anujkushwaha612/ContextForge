@@ -232,7 +232,6 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
   }
 
   return JSON.stringify(result, null, 2);
-  F;
 }
 
 let _patchInjectedOnce = false;

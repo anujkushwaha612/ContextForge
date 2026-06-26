@@ -21,6 +21,7 @@ import { statsEmitter } from "./proxy/statsEmitter.js";
 // ── Message Origin ──
 import {
   detectMessageOrigin,
+  detectRecentToolActivity,
   requiresRepositoryWork,
 } from "./proxy/messageOrigin.js";
 
@@ -95,6 +96,8 @@ console.log("Initializing ContextForge Native Engine...");
 
 (async () => {
   const workspacePath = process.env.CF_WORKSPACE_PATH || process.cwd();
+
+  // ── Step 1: Index workspace ────────────────────────────────────────────
   try {
     await indexWorkspace(workspacePath, {
       force: false,
@@ -109,6 +112,19 @@ console.log("Initializing ContextForge Native Engine...");
   } catch (err) {
     console.error(`[GraphMapper] ❌ Failed to index workspace: ${err.message}`);
   }
+
+  // ── Step 2: Initialize embedder and planner ───────────────────────────
+  await onnxEmbedder.embed("warmup");
+  console.log("[Embedder] Ready");
+  console.log("[Embedder] Stats:", onnxEmbedder.getStats());
+
+  await initPlanner(onnxEmbedder, semanticCache);
+  console.log("[Planner] ✅ Initialization complete");
+
+  // ── Step 3: Start accepting requests ──────────────────────────────────
+  server.listen(3000, () => {
+    console.log("ContextForge Proxy routing engine active on port 3000");
+  });
 })();
 
 const onnxEmbedder = new native.OnnxEmbedder(
@@ -118,11 +134,7 @@ const onnxEmbedder = new native.OnnxEmbedder(
 );
 
 setEmbedder(onnxEmbedder);
-onnxEmbedder.embed("warmup").then(async () => {
-  console.log("[Embedder] Ready");
-  console.log("[Embedder] Stats:", onnxEmbedder.getStats());
-  await initPlanner(onnxEmbedder, semanticCache);
-});
+// Warmup and initialization moved to startup sequence
 
 const memoryStore = new native.PersistentMemoryStore(
   path.join(__dirname, "./data/memory.db"),
@@ -507,6 +519,10 @@ const server = http.createServer((req, res) => {
             ? ` | Confidence: ${plan.debug.regexConfidence.toFixed(2)}`
             : ""),
       );
+      // NEW: structured evidence for debugging misclassifications
+      if (plan.debug?.evidence?.length > 0) {
+        console.log(`[Planner] Evidence: ${plan.debug.evidence.join(" | ")}`);
+      }
 
       if (!plan.bypass) {
         if (plan.capabilities.has(CAPABILITIES.GRAPH))
@@ -855,9 +871,7 @@ const server = http.createServer((req, res) => {
   req.on("error", (err) => console.error("Ingress Socket Error:", err.message));
 });
 
-server.listen(3000, () => {
-  console.log("ContextForge Proxy routing engine active on port 3000");
-});
+// Moved to async startup block — see top of file
 
 process.on("SIGINT", () => {
   console.log("\n🛑 Shutting down ContextForge Proxy...");
