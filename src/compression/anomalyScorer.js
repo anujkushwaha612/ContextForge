@@ -50,7 +50,7 @@ const ERROR_STATUS_CODES = new Set([
 // ─────────────────────────────────────────────
 
 /**
- * Given a flat list of JSON nodes (from extractJsonNodes in helper.js),
+ * Given a flat list of JSON nodes (from extractJsonNodes in jsonSlicer.js),
  * groups them by their leaf field name and extracts numeric values.
  *
  * Only works on arrays-of-objects patterns — the dominant case in API
@@ -248,7 +248,7 @@ function extractArrayIndex(path, parentPrefix) {
  * Scores all nodes in a JSON node array using statistical anomaly detection.
  * Returns a Set of node indices that should ALWAYS be kept (regardless of K).
  *
- * Called from sliceJsonOutput in helper.js to augment the keyword scorer.
+ * Called from sliceJsonOutput in jsonSlicer.js to augment the keyword scorer.
  *
  * @param {Array<{path: string, value: any, leaf: boolean}>} nodes
  * @param {object} options

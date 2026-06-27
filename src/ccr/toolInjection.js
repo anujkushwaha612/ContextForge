@@ -2,7 +2,7 @@
  * CCR Tool Injection
  *
  * Fix 3: Tool schema sanitization cache in translateAnthropicToOpenAI
- * is handled in helper.js. Here we just ensure scanForMarkers is
+ * is handled in systemMessages.js. Here we just ensure scanForMarkers is
  * incremental-friendly (stateless, called with only new messages).
  */
 

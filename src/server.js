@@ -26,19 +26,15 @@ import {
 } from "./proxy/messageOrigin.js";
 
 // ── Pipeline helpers ──
-import {
-  detectMutation,
-  hashFile,
-  minimizeToolSchemas,
-  interceptAndVaultMassiveToolResults,
-  scrubToolResults,
-  tagToolResults,
-  pruneToolResults,
-  sliceJsonToolResults,
-  applyPredictiveInjection,
-  deduplicateSystemMessages,
-  stripAnthropicSpecificFields,
-} from "./helper.js";
+import { detectMutation, hashFile } from "./utils/fileUtils.js";
+import { minimizeToolSchemas } from "./proxy/translator.js";
+import { interceptAndVaultMassiveToolResults } from "./compression/fatCatch.js";
+import { scrubToolResults, tagToolResults } from "./compression/toolScrubber.js";
+import { pruneToolResults } from "./compression/pruner.js";
+import { sliceJsonToolResults } from "./compression/jsonSlicer.js";
+import { applyPredictiveInjection } from "./memory/predictiveInjection.js";
+import { deduplicateSystemMessages } from "./proxy/systemMessages.js";
+import { stripAnthropicSpecificFields } from "./proxy/translator.js";
 
 // ── Compression stages ──
 import { compressCodeToolResults } from "./compression/astCompressor.js";

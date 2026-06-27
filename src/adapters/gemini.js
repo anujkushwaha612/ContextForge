@@ -14,7 +14,7 @@
  *   https://ai.google.dev/api/generate-content
  */
 
-import { createTranslationContext } from "../helper.js";
+import { createTranslationContext } from "../proxy/translator.js";
 
 export class GeminiAdapter {
   constructor() {

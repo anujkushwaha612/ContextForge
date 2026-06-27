@@ -14,7 +14,7 @@ import {
   stripAnthropicSpecificFields,
   translateOpenAISSEToAnthropic,
   createTranslationContext,
-} from "../helper.js";
+} from "../proxy/translator.js";
 
 export class AnthropicAdapter {
   constructor() {

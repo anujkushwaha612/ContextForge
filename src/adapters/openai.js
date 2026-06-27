@@ -12,7 +12,7 @@
  * operates in OpenAI format internally.
  */
 
-import { createTranslationContext } from "../helper.js";
+import { createTranslationContext } from "../proxy/translator.js";
 
 export class OpenAIAdapter {
   constructor() {
