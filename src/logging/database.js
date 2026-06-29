@@ -3,8 +3,8 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 
-// This will create a file named contextforge.db in your project root
-const db = new Database(path.join(process.cwd(), 'contextforge.db'));
+// This will create a file named contextforge.db in your src/data
+const db = new Database(path.join(__dirname,  "../data/contextforge.db"));
 
 // Initialize the schema
 db.exec(`

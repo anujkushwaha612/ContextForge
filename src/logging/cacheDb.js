@@ -1,8 +1,12 @@
 import Database from "better-sqlite3";
 import path from "path";
 import crypto from "crypto";
+import { fileURLToPath } from "url";
 
-const db = new Database(path.join(process.cwd(), "contextforge.db"));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const db = new Database(path.join(__dirname,  "../data/contextforge.db"));
 
 // CRITICAL: Enable foreign keys for CASCADE DELETE
 db.exec(`PRAGMA foreign_keys = ON`);

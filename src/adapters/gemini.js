@@ -10,6 +10,10 @@
  *   POST /v1/models/{model}:generateContent          (non-streaming)
  *   POST /v1/models/{model}:streamGenerateContent    (streaming)
  *
+ * Model extraction:
+ *   Gemini encodes the model in the URL path, not the request body.
+ *   detectAdapter must extract it from the URL and pass via x-cf-model header.
+ *
  * Gemini API reference:
  *   https://ai.google.dev/api/generate-content
  */
@@ -79,10 +83,11 @@ export class GeminiAdapter {
     }
 
     // ── Generation config ──
+    // FIX: Use !== undefined to preserve temperature: 0 and topP: 0
     const gc = clientPayload.generationConfig || {};
-    if (gc.maxOutputTokens) payload.max_tokens = gc.maxOutputTokens;
-    if (gc.temperature) payload.temperature = gc.temperature;
-    if (gc.topP) payload.top_p = gc.topP;
+    if (gc.maxOutputTokens !== undefined) payload.max_tokens = gc.maxOutputTokens;
+    if (gc.temperature !== undefined) payload.temperature = gc.temperature;
+    if (gc.topP !== undefined) payload.top_p = gc.topP;
     if (gc.stopSequences?.length) payload.stop = gc.stopSequences;
     if (gc.candidateCount && gc.candidateCount > 1) {
       payload.n = gc.candidateCount;
@@ -142,13 +147,13 @@ export class GeminiAdapter {
     // ── Function responses → OpenAI tool messages ──
     // Must come before functionCall check — a turn can have both.
     //
-    // Use Gemini's real ID (p.functionResponse.id) when present.
-    // Fall back to `call_${name}_0` which matches the functionCall
-    // fallback format `call_${name}_${i}` at index 0.
+    // FIX: Use loop index i, not hardcoded 0, so multi-tool responses
+    // generate unique fallback IDs that match the functionCall side.
     if (functionResps.length > 0) {
-      for (const p of functionResps) {
+      for (let i = 0; i < functionResps.length; i++) {
+        const p = functionResps[i];
         const name = p.functionResponse.name;
-        const id = p.functionResponse.id || `call_${name}_0`;
+        const id = p.functionResponse.id || `call_${name}_${i}`;
         messages.push({
           role: "tool",
           tool_call_id: id,
@@ -164,9 +169,8 @@ export class GeminiAdapter {
 
     // ── Function calls → OpenAI assistant with tool_calls ──
     //
-    // Use Gemini's real ID (p.functionCall.id) when present.
-    // Fall back to `call_${name}_${i}` — same format as the
-    // functionResponse fallback so both sides always match.
+    // FIX: Use loop index i in fallback ID so both sides (functionCall
+    // and functionResponse) generate matching IDs when Gemini omits them.
     if (functionCalls.length > 0) {
       const textContent = textParts.map((p) => p.text).join("") || null;
       messages.push({
@@ -219,6 +223,9 @@ export class GeminiAdapter {
   /**
    * Convert OpenAI JSON response to Gemini generateContent response.
    *
+   * FIX: Preserve tool call ID in functionCall so Gemini CLI can correlate
+   * the next turn's functionResponse back to this call.
+   *
    * Gemini response shape:
    * {
    *   candidates: [{
@@ -261,6 +268,7 @@ export class GeminiAdapter {
     }
 
     // ── Tool calls → functionCall parts ──
+    // FIX: Preserve tc.id so Gemini CLI can match functionResponse to this call
     if (message?.tool_calls?.length > 0) {
       for (const tc of message.tool_calls) {
         let args = {};
@@ -271,6 +279,7 @@ export class GeminiAdapter {
         }
         parts.push({
           functionCall: {
+            id: tc.id, // FIXED: preserve ID for client correlation
             name: tc.function.name,
             args,
           },
@@ -315,7 +324,10 @@ export class GeminiAdapter {
    *   chunk 3: { delta: { tool_calls: [{ function: { arguments: ': "val"}' } }] } }
    *
    * We must assemble the full arguments string before emitting a functionCall part.
-   * This method uses _toolCallState on the adapter instance to accumulate fragments.
+   * This method uses toolState to accumulate fragments.
+   *
+   * FIX: Handle multi-tool streaming — accumulate ALL tool_calls indices,
+   * not just index 0.
    *
    * Gemini streaming: each chunk is SSE data: {...} format (same as OpenAI SSE,
    * but with Gemini response shape inside).
@@ -323,30 +335,38 @@ export class GeminiAdapter {
    * @param {string}  openAIDataLine  — raw data after "data: " prefix
    * @param {string}  messageId       — unused for Gemini but kept for interface compat
    * @param {boolean} isFirstChunk
-   * @param {object}  toolState       — shared state object across chunks (same as Anthropic)
+   * @param {object}  toolState       — shared state object across chunks
    * @returns {string[]}              — array of SSE strings to write
    */
   fromInternalSSE(openAIDataLine, messageId, isFirstChunk, toolState) {
     // ── Stream end ──
     if (!openAIDataLine || openAIDataLine === "[DONE]") {
-      if (toolState._geminiPendingToolCall) {
-        const tc = toolState._geminiPendingToolCall;
-        toolState._geminiPendingToolCall = null;
+      // Flush any pending tool calls
+      if (toolState._geminiPendingToolCalls?.length > 0) {
+        const parts = [];
+        for (const tc of toolState._geminiPendingToolCalls) {
+          if (!tc) continue; // sparse array guard
 
-        let args = {};
-        try {
-          args = JSON.parse(tc.arguments || "{}");
-        } catch {
-          /* keep empty */
+          let args = {};
+          try {
+            args = JSON.parse(tc.arguments || "{}");
+          } catch {
+            /* keep empty */
+          }
+          parts.push({
+            functionCall: {
+              id: tc.id,
+              name: tc.name,
+              args,
+            },
+          });
         }
+        toolState._geminiPendingToolCalls = null;
 
-        const chunk = this._buildStreamChunk(
-          [{ functionCall: { name: tc.name, args } }],
-          "STOP",
-        );
+        const chunk = this._buildStreamChunk(parts, "STOP");
         return [`data: ${JSON.stringify(chunk)}\n\n`];
       }
-      return []; // ← empty: [DONE] is never forwarded to Gemini client
+      return []; // [DONE] is never forwarded to Gemini client
     }
 
     let parsed;
@@ -366,42 +386,57 @@ export class GeminiAdapter {
     }
 
     // ── Tool call argument assembly ──
-    // OpenAI sends tool calls as fragments — accumulate until [DONE]
-    // or until a new tool call id appears (multi-tool responses)
+    // FIX: Handle ALL tool_calls indices, not just [0]
     if (delta?.tool_calls?.length > 0) {
-      const tc = delta.tool_calls[0];
-
-      if (!toolState._geminiPendingToolCall) {
-        // First fragment — initialize accumulator
-        toolState._geminiPendingToolCall = {
-          id: tc.id || "",
-          name: tc.function?.name || "",
-          arguments: tc.function?.arguments || "",
-        };
-      } else {
-        // Subsequent fragments — accumulate name and arguments
-        if (tc.function?.name)
-          toolState._geminiPendingToolCall.name += tc.function.name;
-        if (tc.function?.arguments)
-          toolState._geminiPendingToolCall.arguments += tc.function.arguments;
+      if (!toolState._geminiPendingToolCalls) {
+        toolState._geminiPendingToolCalls = [];
       }
 
-      // Don't emit yet — wait for [DONE] or finish_reason
+      for (const tc of delta.tool_calls) {
+        const index = tc.index ?? 0; // OpenAI sends index on each fragment
+
+        // Ensure array slot exists
+        if (!toolState._geminiPendingToolCalls[index]) {
+          toolState._geminiPendingToolCalls[index] = {
+            id: tc.id || "",
+            name: tc.function?.name || "",
+            arguments: tc.function?.arguments || "",
+          };
+        } else {
+          // Accumulate fragments
+          if (tc.id) toolState._geminiPendingToolCalls[index].id = tc.id;
+          if (tc.function?.name)
+            toolState._geminiPendingToolCalls[index].name += tc.function.name;
+          if (tc.function?.arguments)
+            toolState._geminiPendingToolCalls[index].arguments +=
+              tc.function.arguments;
+        }
+      }
+
+      // Don't emit yet — wait for finish_reason or [DONE]
     }
 
-    // ── Finish: flush pending tool call ──
-    if (finishReason && toolState._geminiPendingToolCall) {
-      const tc = toolState._geminiPendingToolCall;
-      toolState._geminiPendingToolCall = null;
+    // ── Finish: flush all pending tool calls ──
+    if (finishReason && toolState._geminiPendingToolCalls?.length > 0) {
+      for (const tc of toolState._geminiPendingToolCalls) {
+        if (!tc) continue; // sparse array guard
 
-      let args = {};
-      try {
-        args = JSON.parse(tc.arguments || "{}");
-      } catch {
-        /* keep empty */
+        let args = {};
+        try {
+          args = JSON.parse(tc.arguments || "{}");
+        } catch {
+          /* keep empty */
+        }
+
+        parts.push({
+          functionCall: {
+            id: tc.id,
+            name: tc.name,
+            args,
+          },
+        });
       }
-
-      parts.push({ functionCall: { name: tc.name, args } });
+      toolState._geminiPendingToolCalls = null;
     }
 
     if (parts.length === 0 && !finishReason) return [];
@@ -476,9 +511,20 @@ export class GeminiAdapter {
     return map[statusCode] || "INTERNAL";
   }
 
+  /**
+   * Extract model name from headers or payload.
+   *
+   * Gemini encodes the model in the URL path, not the request body:
+   *   POST /v1/models/gemini-2.0-flash:generateContent
+   *
+   * detectAdapter must extract the model from the URL and pass it via
+   * the x-cf-model header before calling toInternal().
+   */
   _extractModel(requestHeaders, clientPayload) {
     return (
-      requestHeaders["x-cf-model"] || clientPayload.model || "gemini-2.0-flash"
+      requestHeaders["x-cf-model"] ||
+      clientPayload.model ||
+      "gemini-2.0-flash"
     );
   }
 }

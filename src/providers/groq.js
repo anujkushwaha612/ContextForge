@@ -1,39 +1,39 @@
-// providers/groq.js
+/**
+ * providers/groq.js
+ *
+ * Groq Cloud API adapter.
+ * Groq is OpenAI-compatible — same endpoint paths, same auth format.
+ * Injects GROQ_API_KEY from env if present.
+ */
+
 export const GroqAdapter = {
-  name: 'groq',
-  hostname: 'api.groq.com',
-  port: 443,
-  transformHeaders: (incomingHeaders) => {
+  name:     "groq",
+  hostname: process.env.GROQ_HOST || "api.groq.com",
+  port:     parseInt(process.env.GROQ_PORT || "443", 10),
+  protocol: "https",
+
+  transformHeaders(incomingHeaders) {
     const outgoing = { ...incomingHeaders };
-    outgoing.host = 'api.groq.com';
-    
-    // Strip Anthropic-specific headers that Groq doesn't understand
-    delete outgoing['anthropic-version'];
-    delete outgoing['anthropic-beta'];
-    
-    // Groq expects OpenAI-style authorization
-    if (!outgoing['authorization'] && process.env.GROQ_API_KEY) {
-      outgoing['authorization'] = `Bearer ${process.env.GROQ_API_KEY}`;
+
+    // Point host header at Groq (or custom host)
+    outgoing.host = this.hostname;
+
+    // Inject Groq API key from env
+    const key = process.env.GROQ_API_KEY;
+    if (key) {
+      outgoing["authorization"] = `Bearer ${key}`;
     }
-    
+
+    // Remove hop-by-hop headers
+    delete outgoing["content-length"];
+    delete outgoing["accept-encoding"];
+    delete outgoing["connection"];
+
     return outgoing;
   },
-  transformPath: (incomingUrl) => {
-    // Claude Code sends Anthropic endpoints - translate to OpenAI/Groq endpoints
-    if (incomingUrl.startsWith('/v1/messages')) {
-      // Convert Anthropic's /v1/messages to Groq's /openai/v1/chat/completions
-      // Preserve any query parameters
-      const urlParts = incomingUrl.split('?');
-      const queryString = urlParts.length > 1 ? `?${urlParts[1]}` : '';
-      return `/openai/v1/chat/completions${queryString}`;
-    }
-    
-    // For other Anthropic endpoints, map them appropriately
-    if (incomingUrl.startsWith('/v1')) {
-      // Generic fallback: convert /v1/* to /openai/v1/*
-      return `/openai${incomingUrl}`;
-    }
-    
+
+  transformPath(incomingUrl) {
+    // Groq is OpenAI-compatible — pass paths through unchanged
     return incomingUrl;
-  }
+  },
 };

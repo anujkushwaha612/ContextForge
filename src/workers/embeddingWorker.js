@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
 // WORKER-OWNED DATABASE CONNECTION
 // WAL mode allows concurrent access with main thread
 // ==========================================
-const db = new Database(path.join(process.cwd(), "contextforge.db"));
+const db = new Database(path.join(__dirname,  "../data/contextforge.db"));
 db.exec("PRAGMA journal_mode = WAL");
 db.exec("PRAGMA synchronous = NORMAL");
 

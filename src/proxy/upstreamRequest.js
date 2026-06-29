@@ -20,6 +20,8 @@ import crypto from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { statsEmitter } from "./statsEmitter.js";
+
 import { countTokens } from "../compression/compressionHelper.js";
 import { retrieveFromVault } from "../vaultRetriever.js";
 import { recordCCRSuccess } from "../ccr/index.js";
@@ -30,15 +32,8 @@ import {
   isReadFileChunkTool,
   executeReadFileChunk,
 } from "../graph/graphTools.js";
-import {
-  isPatchToolCall,
-  executePatchToolCall,
-  PATCH_TOOL_NAME,
-} from "../graph/patchTools.js";
-import {
-  hasMemoryToolCalls,
-  executeMemoryToolCalls,
-} from "../memory/memoryTools.js";
+import { isPatchToolCall, executePatchToolCall, PATCH_TOOL_NAME } from "../graph/patchTools.js";
+import { hasMemoryToolCalls, executeMemoryToolCalls } from "../memory/memoryTools.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -101,24 +96,18 @@ function buildWorkspaceSummary() {
   if (workspaceState.modifiedFiles.size === 0) return null;
 
   const lines = ["[ContextForge WorkspaceState]"];
-  lines.push(
-    `Modified files this session: ${workspaceState.modifiedFiles.size}`,
-  );
+  lines.push(`Modified files this session: ${workspaceState.modifiedFiles.size}`);
   for (const [file, info] of workspaceState.modifiedFiles.entries()) {
-    lines.push(
-      `  • ${file} — symbol: ${info.symbol}, ${info.linesChanged} line(s) changed`,
-    );
+    lines.push(`  • ${file} — symbol: ${info.symbol}, ${info.linesChanged} line(s) changed`);
   }
   if (workspaceState.recentPatches.length > 0) {
     lines.push("Recent patches (newest first):");
     for (const p of workspaceState.recentPatches) {
-      lines.push(
-        `  • [${p.at}] ${p.file}::${p.symbol} — ${p.linesChanged} lines`,
-      );
+      lines.push(`  • [${p.at}] ${p.file}::${p.symbol} — ${p.linesChanged} lines`);
     }
   }
   lines.push(
-    "NOTE: These files have already been patched. Do not re-patch unless you have verified the current state with read_file_chunk.",
+    "NOTE: These files have already been patched. Do not re-patch unless you have verified the current state with read_file_chunk."
   );
   return lines.join("\n");
 }
@@ -142,9 +131,7 @@ const SESSION_CACHE_MAX = 200;
 function _sessionCacheKey(name, argsStr) {
   try {
     const parsed = JSON.parse(argsStr || "{}");
-    const sorted = JSON.stringify(
-      Object.fromEntries(Object.entries(parsed).sort()),
-    );
+    const sorted = JSON.stringify(Object.fromEntries(Object.entries(parsed).sort()));
     return `${name}:${sorted}`;
   } catch {
     return `${name}:${argsStr}`;
@@ -180,11 +167,7 @@ function sessionCacheSet(name, argsStr, result) {
  * @param {string|null} symbol  - The specific symbol that was modified, or null for global patches
  */
 export function invalidateCacheForPatch(filePath, symbol) {
-  const fileBasename = filePath
-    .replace(/\\/g, "/")
-    .split("/")
-    .pop()
-    .toLowerCase();
+  const fileBasename = filePath.replace(/\\/g, "/").split("/").pop().toLowerCase();
 
   let cleared = 0;
 
@@ -192,10 +175,7 @@ export function invalidateCacheForPatch(filePath, symbol) {
     const keyLower = key.toLowerCase();
 
     // Always clear find_route for this file — line numbers may have shifted
-    if (
-      keyLower.includes('"find_route"') &&
-      keyLower.includes(fileBasename.replace(".js", ""))
-    ) {
+    if (keyLower.includes('"find_route"') && keyLower.includes(fileBasename.replace(".js", ""))) {
       SESSION_TOOL_CACHE.delete(key);
       cleared++;
       continue;
@@ -204,10 +184,7 @@ export function invalidateCacheForPatch(filePath, symbol) {
     // If we know the specific symbol, only clear that symbol's cache entry
     if (symbol) {
       const symbolLower = symbol.toLowerCase();
-      if (
-        keyLower.includes('"find_symbol"') &&
-        keyLower.includes(`"${symbolLower}"`)
-      ) {
+      if (keyLower.includes('"find_symbol"') && keyLower.includes(`"${symbolLower}"`)) {
         SESSION_TOOL_CACHE.delete(key);
         cleared++;
       }
@@ -228,35 +205,31 @@ export function invalidateCacheForPatch(filePath, symbol) {
   if (cleared > 0) {
     console.log(
       `[Ghost Interceptor] 🗑️  Invalidated ${cleared} cache entries` +
-        (symbol ? ` for symbol '${symbol}'` : ` for file '${fileBasename}'`),
+        (symbol ? ` for symbol '${symbol}'` : ` for file '${fileBasename}'`)
     );
   }
 }
 
 /**
  * Surgical cache invalidation for external file modifications.
- * 
+ *
  * Called by the file watcher when a file is saved externally
  * (not via patch). Clears all cache entries for THIS file only.
- * 
+ *
  * Differs from invalidateCacheForPatch:
  *   - invalidateCacheForPatch: knows the specific symbol → ultra-surgical
  *   - invalidateCacheForFile: file changed externally → clear all symbols in this file
- * 
+ *
  * @param {string} filePath - The file that was modified
  */
 export function invalidateCacheForFile(filePath) {
-  const fileBasename = filePath
-    .replace(/\\/g, "/")
-    .split("/")
-    .pop()
-    .toLowerCase();
-  
+  const fileBasename = filePath.replace(/\\/g, "/").split("/").pop().toLowerCase();
+
   let cleared = 0;
-  
+
   for (const key of SESSION_TOOL_CACHE.keys()) {
     const keyLower = key.toLowerCase();
-    
+
     // Clear all graph queries for this file
     // (find_symbol, find_route, show_callers, etc.)
     if (keyLower.includes(fileBasename.replace(".js", ""))) {
@@ -264,10 +237,10 @@ export function invalidateCacheForFile(filePath) {
       cleared++;
     }
   }
-  
+
   // Clear all chunk cache entries for this file
   chunkCacheInvalidateFile(filePath);
-  
+
   if (cleared > 0) {
     console.log(
       `[Ghost Interceptor] 🗑️  Invalidated ${cleared} cache entries for file '${fileBasename}'`
@@ -310,18 +283,13 @@ class ToolInterceptor {
       return { intercepted: true, circuitBreakerTripped: true, toolCalls };
     }
 
-    const backgroundCalls = toolCalls.filter((tc) =>
-      this.isBackgroundTool(tc.function?.name),
-    );
+    const backgroundCalls = toolCalls.filter((tc) => this.isBackgroundTool(tc.function?.name));
     if (backgroundCalls.length === 0) return { intercepted: false };
 
     // ── Graph-only loop guard ─────────────────────────────────────────────
     const allAreGraphQueries = backgroundCalls.every((tc) => {
       const n = tc.function?.name || "";
-      return (
-        isGraphToolCall(n) &&
-        !normalizeGraphToolName(n).includes("contextforge_retrieve")
-      );
+      return isGraphToolCall(n) && !normalizeGraphToolName(n).includes("contextforge_retrieve");
     });
 
     if (allAreGraphQueries) {
@@ -329,7 +297,7 @@ class ToolInterceptor {
       if (this._graphOnlyRounds > MAX_GRAPH_ONLY_ROUNDS) {
         console.warn(
           `\n[Ghost Interceptor] ⚠️  Graph-only round ${this._graphOnlyRounds} — ` +
-            `LLM stuck in navigation loop. Letting through to force decision.`,
+            `LLM stuck in navigation loop. Letting through to force decision.`
         );
         return { intercepted: false };
       }
@@ -339,7 +307,7 @@ class ToolInterceptor {
 
     console.log(
       `\n[Ghost Interceptor] 🔍 Intercepted ${backgroundCalls.length} background tool(s) ` +
-        `(retry ${retryCount}/${MAX_GHOST_RETRIES})`,
+        `(retry ${retryCount}/${MAX_GHOST_RETRIES})`
     );
 
     const results = [];
@@ -353,9 +321,7 @@ class ToolInterceptor {
       // ── Session cache ──
       const cachedResult = sessionCacheGet(name, argsStr);
       if (cachedResult !== null) {
-        console.log(
-          `[Ghost Interceptor] ♻️ Session cache hit: ${name}("${argsStr.slice(0, 60)}")`,
-        );
+        console.log(`[Ghost Interceptor] ♻️ Session cache hit: ${name}("${argsStr.slice(0, 60)}")`);
         results.push({ tool_call_id: tc.id, name, content: cachedResult });
         continue;
       }
@@ -365,7 +331,7 @@ class ToolInterceptor {
         args = JSON.parse(argsStr);
       } catch (err) {
         console.error(
-          `[Ghost Interceptor] ⚠️ Args JSON malformed for ${name}: "${argsStr.slice(0, 120)}"`,
+          `[Ghost Interceptor] ⚠️ Args JSON malformed for ${name}: "${argsStr.slice(0, 120)}"`
         );
         results.push({
           tool_call_id: tc.id,
@@ -387,8 +353,9 @@ class ToolInterceptor {
         if (args.query_type && args.target !== undefined) {
           content = executeGraphQuery(args.query_type, args.target);
           console.log(
-            `[Ghost Interceptor] ✅ Graph: ${args.query_type}("${args.target}") → ${content.length} chars`,
+            `[Ghost Interceptor] ✅ Graph: ${args.query_type}("${args.target}") → ${content.length} chars`
           );
+          statsEmitter.recordAgentAction("graphLookups");
           toolSucceeded = true;
           isActionTool = false;
         } else {
@@ -398,32 +365,19 @@ class ToolInterceptor {
         }
       } else if (isReadFileChunkTool(name)) {
         // Check chunk cache first — avoids re-reading overlapping regions
-        const cachedChunk = chunkCacheGet(
-          args.file_path,
-          args.start_line,
-          args.end_line,
-        );
+        const cachedChunk = chunkCacheGet(args.file_path, args.start_line, args.end_line);
         if (cachedChunk !== null) {
           content = cachedChunk;
           console.log(
             `[Ghost Interceptor] ♻️ Chunk cache hit: ${args.file_path}` +
-              ` L${args.start_line}-${args.end_line} → ${content.length} chars`,
+              ` L${args.start_line}-${args.end_line} → ${content.length} chars`
           );
         } else {
-          content = executeReadFileChunk(
-            args.file_path,
-            args.start_line,
-            args.end_line,
-          );
-          chunkCacheSet(
-            args.file_path,
-            args.start_line,
-            args.end_line,
-            content,
-          );
+          content = executeReadFileChunk(args.file_path, args.start_line, args.end_line);
+          chunkCacheSet(args.file_path, args.start_line, args.end_line, content);
           console.log(
             `[Ghost Interceptor] 📖 Read chunk: ${args.file_path}` +
-              ` L${args.start_line}-${args.end_line} → ${content.length} chars`,
+              ` L${args.start_line}-${args.end_line} → ${content.length} chars`
           );
         }
         toolSucceeded = true;
@@ -432,25 +386,21 @@ class ToolInterceptor {
         isActionTool = true;
         content = await executePatchToolCall(argsStr, this.semanticCache);
         console.log(`[Ghost Interceptor] 🩹 Patch tool executed`);
+        statsEmitter.recordAgentAction("astPatches");
 
         try {
           const parsed = JSON.parse(content);
           toolSucceeded = parsed.success === true;
-           if (toolSucceeded) {
+          if (toolSucceeded) {
             console.log(`[Ghost Interceptor] ✅ Patch succeeded`);
-            // Surgical cache invalidation — only clears the patched symbol
-            // and route entries for this file. Untouched symbols stay cached.
             invalidateCacheForPatch(args.file_path, args.target_symbol || null);
-            // Record in workspace state for summary injection
             recordPatch(
               args.file_path,
               args.target_symbol || null,
-              parsed.lines_changed ?? parsed.lines_inserted ?? 0,
+              parsed.lines_changed ?? parsed.lines_inserted ?? 0
             );
           } else {
-            console.log(
-              `[Ghost Interceptor] ❌ Patch failed: ${parsed.error?.slice(0, 100)}`,
-            );
+            console.log(`[Ghost Interceptor] ❌ Patch failed: ${parsed.error?.slice(0, 100)}`);
           }
         } catch {
           toolSucceeded = false;
@@ -469,9 +419,7 @@ class ToolInterceptor {
               vaultedText =
                 `[Graph result for '${sq}' from ${hit.file} lines ${hit.start_line}–${hit.end_line}]\n\n` +
                 hit.body;
-              console.log(
-                `[Ghost Interceptor] 🗺️ Graph shortcut hit for '${sq}'`,
-              );
+              console.log(`[Ghost Interceptor] 🗺️ Graph shortcut hit for '${sq}'`);
             }
           } catch {}
         }
@@ -483,27 +431,22 @@ class ToolInterceptor {
               args.search_query || null,
               currentPayload.messages,
               this.semanticCache,
-              this.hybridRetriever,
+              this.hybridRetriever
             );
           } catch (err) {
-            console.error(
-              `[Ghost Interceptor] ⚠️ Vault retrieval failed: ${err.message}`,
-            );
+            console.error(`[Ghost Interceptor] ⚠️ Vault retrieval failed: ${err.message}`);
           }
         }
 
         if (vaultedText) {
           if (!this._retrievedVaultIds.has(args.vault_id)) {
             this._retrievedVaultIds.add(args.vault_id);
-            const { compressCodeOutput } =
-              await import("../compression/astCompressor.js");
+            const { compressCodeOutput } = await import("../compression/astCompressor.js");
             const compressed = compressCodeOutput(vaultedText, "", null, null);
             if (compressed.vaulted || compressed.kept !== vaultedText) {
               const reduction =
                 vaultedText.length > 0
-                  ? Math.round(
-                      (1 - compressed.kept.length / vaultedText.length) * 100,
-                    )
+                  ? Math.round((1 - compressed.kept.length / vaultedText.length) * 100)
                   : 0;
               vaultedText =
                 `[CF_VAULT:${args.vault_id}] Structure preview (${reduction}% smaller).\n` +
@@ -512,14 +455,15 @@ class ToolInterceptor {
                 compressed.kept;
               console.log(
                 `[Ghost Interceptor] 📦 Vault ${args.vault_id} compressed on first access: ` +
-                  `${vaultedText.length} chars (${reduction}% reduction)`,
+                  `${vaultedText.length} chars (${reduction}% reduction)`
               );
             }
           }
 
           recordCCRSuccess(currentPayload, args.vault_id);
+          statsEmitter.recordAgentAction("rawVaultOpens");
           console.log(
-            `[Ghost Interceptor] ✅ Vault ${args.vault_id} opened (${vaultedText.length} chars)`,
+            `[Ghost Interceptor] ✅ Vault ${args.vault_id} opened (${vaultedText.length} chars)`
           );
           content = vaultedText;
           toolSucceeded = true;
@@ -529,20 +473,16 @@ class ToolInterceptor {
         }
       } else if (hasMemoryToolCalls({ tool_calls: [tc] })) {
         isActionTool = true;
-        const userId =
-          this.req.headers["x-contextforge-user-id"] ?? "anonymous";
+        const userId = this.req.headers["x-contextforge-user-id"] ?? "anonymous";
         const workspace = this.req.headers["x-contextforge-workspace"] ?? "";
-        const toolResults = await executeMemoryToolCalls(
-          { tool_calls: [tc] },
-          this.memoryHandler,
-          { userId, workspace },
-        );
+        const toolResults = await executeMemoryToolCalls({ tool_calls: [tc] }, this.memoryHandler, {
+          userId,
+          workspace,
+        });
         if (toolResults.length > 0) {
           content = toolResults[0].content;
           toolSucceeded = true;
-          console.log(
-            "[Ghost Interceptor] 🧠 Memory tool executed successfully",
-          );
+          console.log("[Ghost Interceptor] 🧠 Memory tool executed successfully");
         } else {
           content = "Memory tool returned no results.";
           toolSucceeded = false;
@@ -601,15 +541,12 @@ export function createUpstreamHandler(ctx) {
     onnxEmbedder,
     memoryHandler,
     maxRetries,
+    mockUpstreamPort,
   } = ctx;
 
   const interceptor = new ToolInterceptor(ctx);
 
-  return function executeUpstreamRequest(
-    currentPayload,
-    retryCount = 0,
-    _acc = null,
-  ) {
+  return function executeUpstreamRequest(currentPayload, retryCount = 0, _acc = null) {
     // ── PATCH 1: hopCount added to acc ──
     const acc = _acc ?? {
       accumulatedInputTokens: 0,
@@ -619,9 +556,10 @@ export function createUpstreamHandler(ctx) {
     };
 
     return new Promise((resolve, reject) => {
-      currentPayload = { ...currentPayload, model: "minimax-m3:cloud" };
-      delete currentPayload.max_completion_tokens;
-      delete currentPayload.max_output_tokens;
+      const modelOverride = process.env.CF_MODEL_OVERRIDE;
+      if (modelOverride) {
+        currentPayload = { ...currentPayload, model: modelOverride };
+      }
 
       // ── Inject WorkspaceState summary ─────────────────────────────────
       // Tells the LLM what has already been patched this session so it
@@ -629,10 +567,7 @@ export function createUpstreamHandler(ctx) {
       const workspaceSummary = buildWorkspaceSummary();
       if (workspaceSummary && currentPayload.messages?.length > 0) {
         const msgs = currentPayload.messages;
-        const lastUserIdx = msgs.reduce(
-          (acc, m, i) => (m.role === "user" ? i : acc),
-          -1,
-        );
+        const lastUserIdx = msgs.reduce((acc, m, i) => (m.role === "user" ? i : acc), -1);
         if (lastUserIdx !== -1) {
           // Prepend workspace state to the last user message as a text block
           const lastUser = msgs[lastUserIdx];
@@ -654,7 +589,7 @@ export function createUpstreamHandler(ctx) {
         writeFileSync(
           path.join(__dirname, "../../debug_payload.json"),
           JSON.stringify(currentPayload, null, 2),
-          "utf-8",
+          "utf-8"
         );
         console.log("[Debug] Payload dumped to debug_payload.json");
       }
@@ -667,7 +602,7 @@ export function createUpstreamHandler(ctx) {
         acc.hopCount++;
         acc.ghostRetries = acc.hopCount - 1;
         console.log(
-          `\n[Wire Inspector] Transmitting ${hopTokens} tokens to LLM (Retry: ${retryCount})`,
+          `\n[Wire Inspector] Transmitting ${hopTokens} tokens to LLM (Retry: ${retryCount})`
         );
       } catch {
         console.log("\n[Wire Inspector] Transmitting payload...");
@@ -676,32 +611,40 @@ export function createUpstreamHandler(ctx) {
       const outboundBody = JSON.stringify(currentPayload);
       const outboundHeaders = provider.transformHeaders(req.headers);
 
-      if (process.env.NEMOTRON_CLOUD_API_KEY) {
-        outboundHeaders["authorization"] =
-          `Bearer ${process.env.NEMOTRON_CLOUD_API_KEY}`;
-      }
-
       outboundHeaders["content-length"] = Buffer.byteLength(outboundBody);
 
-      const outboundPath = "/v1/chat/completions";
+      // Ask the provider adapter to translate the route
+      const outboundPath =
+        typeof provider.transformPath === "function" ? provider.transformPath(req.url) : req.url;
+
+      // Use the mock port if it exists, otherwise use standard provider
+      const targetPort = ctx.mockUpstreamPort || provider.port;
+      const targetHost = ctx.mockUpstreamPort ? "127.0.0.1" : provider.hostname;
+
       const requestOptions = {
-        hostname: provider.hostname,
-        port: provider.port,
+        hostname: targetHost,
+        port: targetPort,
         path: outboundPath,
         method: "POST",
         headers: outboundHeaders,
       };
 
-      const requestModule = provider.port === 11434 ? http : https;
+      // If hitting the local mock provider, always use HTTP
+      const isHttp =
+        ctx.mockUpstreamPort ||
+        provider.protocol === "http" ||
+        provider.port === 11434 ||
+        provider.port === 80;
+      const requestModule = isHttp ? http : https;
+
+      const providerBase = provider.port
+        ? `${provider.hostname}:${provider.port}`
+        : provider.hostname;
 
       if (retryCount === 0) {
-        console.log(
-          `\n[Route] ${req.url} -> ${provider.hostname}${outboundPath}`,
-        );
+        console.log(`\n[Route] ${req.url} -> ${providerBase}${outboundPath}`);
       } else {
-        console.log(
-          `\n[Ghost Interceptor] Retry #${retryCount} -> ${provider.hostname}${outboundPath}`,
-        );
+        console.log(`\n[Ghost Interceptor] Retry #${retryCount} -> ${providerBase}${outboundPath}`);
       }
 
       const isStreamRequest = currentPayload.stream === true;
@@ -719,31 +662,47 @@ export function createUpstreamHandler(ctx) {
           currentToolIndex: -1,
         };
 
-        let messageId =
-          "msg_forge_" + Math.random().toString(36).substring(2, 15);
+        let messageId = "msg_forge_" + Math.random().toString(36).substring(2, 15);
         let isFirstChunk = true;
         let fullStreamedText = "";
         let toolCalls = [];
         let hasSeenToolCall = false;
         let heldEvents = [];
 
+        // SSE line buffer — handles chunks that split across TCP packets
+        let sseLineBuffer = "";
+
         proxyRes.on("data", (chunk) => {
           responseChunks.push(chunk);
+
+          if (proxyRes.statusCode >= 400) {
+            console.error(`\n[Upstream Error ${proxyRes.statusCode}] ->`, chunk.toString("utf-8"));
+          }
+
           if (!isStreamRequest) return;
 
           const rawSseText = chunk.toString("utf-8");
           sseBuffer += rawSseText;
 
           if (clientAdapter.name === "openai") {
-            if (!res.headersSent)
-              res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            if (!res.headersSent) res.writeHead(proxyRes.statusCode, proxyRes.headers);
             res.write(chunk);
             return;
           }
 
-          for (const line of rawSseText.split("\n")) {
+          // ── Buffered SSE line parser ──────────────────────────────────
+          // Google's API splits SSE events across multiple TCP chunks.
+          // We buffer incomplete lines and only process complete ones.
+          sseLineBuffer += rawSseText;
+          const lines = sseLineBuffer.split("\n");
+
+          // The last element is either empty (complete) or a partial line.
+          // Keep it in the buffer for the next chunk.
+          sseLineBuffer = lines.pop() ?? "";
+
+          for (const line of lines) {
             if (!line.startsWith("data: ")) continue;
-            const openAiData = line.substring(6).trim();
+            let openAiData = line.substring(6).trim();
             if (!openAiData) continue;
 
             try {
@@ -751,9 +710,17 @@ export function createUpstreamHandler(ctx) {
                 const parsed = JSON.parse(openAiData);
                 const delta = parsed.choices?.[0]?.delta;
 
+                // Strip Google's non-standard extra_content from tool calls
+                // before any downstream processing touches it
+                if (delta?.tool_calls) {
+                  for (const tc of delta.tool_calls) {
+                    delete tc.extra_content;
+                  }
+                  openAiData = JSON.stringify(parsed);
+                }
+
                 if (delta?.reasoning || delta?.content) {
-                  fullStreamedText +=
-                    (delta.reasoning || "") + (delta.content || "");
+                  fullStreamedText += (delta.reasoning || "") + (delta.content || "");
                 }
 
                 if (delta?.tool_calls) {
@@ -762,19 +729,14 @@ export function createUpstreamHandler(ctx) {
                     let idx = tc.index;
 
                     if (tc.id) {
-                      const existingIdx = toolCalls.findIndex(
-                        (t) => t?.id === tc.id,
-                      );
+                      const existingIdx = toolCalls.findIndex((t) => t?.id === tc.id);
                       if (existingIdx !== -1) {
                         idx = existingIdx;
                       } else {
                         idx = toolCalls.length;
                       }
                     } else if (tc.function?.name) {
-                      if (
-                        toolCalls.length > 0 &&
-                        toolCalls[toolCalls.length - 1].name
-                      ) {
+                      if (toolCalls.length > 0 && toolCalls[toolCalls.length - 1].name) {
                         idx = toolCalls.length;
                       } else {
                         idx = Math.max(0, toolCalls.length - 1);
@@ -788,13 +750,14 @@ export function createUpstreamHandler(ctx) {
                         id: tc.id || `call_cf_${Date.now()}_${idx}`,
                         name: "",
                         arguments: "",
+                        extra_content: null,
                       };
                     }
                     if (tc.id) toolCalls[idx].id = tc.id;
-                    if (tc.function?.name)
-                      toolCalls[idx].name += tc.function.name;
-                    if (tc.function?.arguments)
-                      toolCalls[idx].arguments += tc.function.arguments;
+                    if (tc.function?.name) toolCalls[idx].name += tc.function.name;
+                    if (tc.function?.arguments) toolCalls[idx].arguments += tc.function.arguments;
+                    // ── Preserve Gemini thought_signature for echo-back ──
+                    if (tc.extra_content) toolCalls[idx].extra_content = tc.extra_content;
                   }
                 }
               }
@@ -806,13 +769,10 @@ export function createUpstreamHandler(ctx) {
               openAiData,
               messageId,
               isFirstChunk,
-              toolState,
+              toolState
             );
 
-            if (
-              clientAdapter.name === "anthropic" ||
-              clientAdapter.name === "gemini"
-            ) {
+            if (clientAdapter.name === "anthropic" || clientAdapter.name === "gemini") {
               if (hasSeenToolCall) {
                 if (translatedEvents.length > 0) {
                   isFirstChunk = false;
@@ -823,10 +783,7 @@ export function createUpstreamHandler(ctx) {
             }
 
             if (!res.headersSent) {
-              res.writeHead(
-                proxyRes.statusCode,
-                clientAdapter.responseHeaders(true),
-              );
+              res.writeHead(proxyRes.statusCode, clientAdapter.responseHeaders(true));
             }
             if (translatedEvents.length > 0) {
               isFirstChunk = false;
@@ -839,11 +796,27 @@ export function createUpstreamHandler(ctx) {
           const hopEndTime = performance.now();
 
           try {
+            // 🚨 NEW: Catch upstream HTTP errors immediately, even on streams
+            if (proxyRes.statusCode >= 400) {
+              const fullResponseBuf = Buffer.concat(responseChunks);
+              console.error(
+                `\n[Upstream Error] Google Gemini Rejected the Request (HTTP ${proxyRes.statusCode}):`
+              );
+              console.error(fullResponseBuf.toString("utf-8"));
+
+              if (!res.headersSent) {
+                res.writeHead(proxyRes.statusCode, {
+                  "Content-Type": "application/json",
+                });
+              }
+              res.end(fullResponseBuf);
+              resolve({ hopEndTime, ...acc });
+              return;
+            }
+
             if (isStreamRequest && sseBuffer.length === 0) {
-              const resetSeconds =
-                parseFloat(proxyRes.headers["x-ratelimit-reset-tokens"]) || 60;
-              if (!res.headersSent)
-                res.writeHead(200, clientAdapter.responseHeaders(true));
+              const resetSeconds = parseFloat(proxyRes.headers["x-ratelimit-reset-tokens"]) || 60;
+              if (!res.headersSent) res.writeHead(200, clientAdapter.responseHeaders(true));
               res.write(clientAdapter.rateLimitSSE(resetSeconds));
               res.end();
               resolve({ hopEndTime, ...acc });
@@ -857,23 +830,31 @@ export function createUpstreamHandler(ctx) {
               if (hasSeenToolCall) {
                 const validToolCalls = toolCalls
                   .filter((tc) => tc.name)
-                  .map((tc) => ({
-                    id: tc.id,
-                    type: "function",
-                    function: { name: tc.name, arguments: tc.arguments },
-                  }));
+                  .map((tc) => {
+                    const call = {
+                      id: tc.id,
+                      type: "function",
+                      function: { name: tc.name, arguments: tc.arguments },
+                    };
+                    // Echo Gemini's thought_signature back — required for
+                    // multi-hop tool calls or Gemini throws HTTP 400
+                    if (tc.extra_content) {
+                      call.extra_content = tc.extra_content;
+                    }
+                    return call;
+                  });
 
                 if (validToolCalls.length > 0) {
                   const result = await interceptor.process(
                     validToolCalls,
                     currentPayload,
-                    retryCount,
+                    retryCount
                   );
 
                   if (result.intercepted) {
                     if (result.circuitBreakerTripped) {
                       console.warn(
-                        `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on streaming path.`,
+                        `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on streaming path.`
                       );
                       currentPayload.messages.push(
                         {
@@ -886,17 +867,17 @@ export function createUpstreamHandler(ctx) {
                           tool_call_id: tc.id,
                           name: tc.function.name,
                           content: `SYSTEM_ERROR: Background tool budget exhausted (${MAX_GHOST_RETRIES} hops used). Do not retry this tool. Summarise what you have found so far and proceed using only standard file tools.`,
-                        })),
+                        }))
                       );
-                      executeUpstreamRequest(currentPayload, 0, acc)
-                        .then(resolve)
-                        .catch(reject);
+                      executeUpstreamRequest(currentPayload, 0, acc).then(resolve).catch(reject);
                       return;
                     }
 
                     currentPayload.messages.push({
                       role: "assistant",
                       content: null,
+                      // Include extra_content (thought_signature) so Gemini
+                      // accepts the next hop without throwing HTTP 400
                       tool_calls: result.toolCalls,
                     });
 
@@ -909,11 +890,7 @@ export function createUpstreamHandler(ctx) {
                       });
                     }
 
-                    const nextRetry = computeNextRetry(
-                      result,
-                      retryCount,
-                      maxRetries,
-                    );
+                    const nextRetry = computeNextRetry(result, retryCount, maxRetries);
                     executeUpstreamRequest(currentPayload, nextRetry, acc)
                       .then(resolve)
                       .catch(reject);
@@ -927,10 +904,7 @@ export function createUpstreamHandler(ctx) {
               function _replayAndEnd() {
                 if (heldEvents.length > 0) {
                   if (!res.headersSent) {
-                    res.writeHead(
-                      proxyRes.statusCode,
-                      clientAdapter.responseHeaders(true),
-                    );
+                    res.writeHead(proxyRes.statusCode, clientAdapter.responseHeaders(true));
                   }
                   for (const event of heldEvents) res.write(event);
                 }
@@ -938,23 +912,17 @@ export function createUpstreamHandler(ctx) {
                 if (fullStreamedText.trim().length > 0) {
                   (async () => {
                     try {
-                      const tokenCount = Math.floor(
-                        fullStreamedText.length / 4,
-                      );
+                      const tokenCount = Math.floor(fullStreamedText.length / 4);
                       if (tokenCount >= 50) {
-                        const embedding =
-                          await onnxEmbedder.embed(fullStreamedText);
+                        const embedding = await onnxEmbedder.embed(fullStreamedText);
                         hybridRetriever.addDocumentWithEmbedding(
                           "IDX_" + crypto.randomUUID(),
                           fullStreamedText,
-                          embedding,
+                          embedding
                         );
                       }
                     } catch (err) {
-                      console.error(
-                        "[RAG Index] Indexing failed:",
-                        err.message,
-                      );
+                      console.error("[RAG Index] Indexing failed:", err.message);
                     }
                   })();
                 }
@@ -985,39 +953,19 @@ export function createUpstreamHandler(ctx) {
               return;
             }
 
-            if (proxyRes.statusCode >= 400) {
-              console.error(
-                `\n[Upstream Error] Status ${proxyRes.statusCode}:`,
-                jsonResponse?.error?.message || "Unknown error",
-              );
-              const { body } = clientAdapter.fromInternal(
-                jsonResponse,
-                proxyRes.statusCode,
-              );
-              if (!res.headersSent) {
-                res.writeHead(
-                  proxyRes.statusCode,
-                  clientAdapter.responseHeaders(false),
-                );
-              }
-              res.end(body);
-              resolve({ hopEndTime, ...acc });
-              return;
-            }
-
             const message = jsonResponse.choices?.[0]?.message;
 
             if (message?.tool_calls && message.tool_calls.length > 0) {
               const result = await interceptor.process(
                 message.tool_calls,
                 currentPayload,
-                retryCount,
+                retryCount
               );
 
               if (result.intercepted) {
                 if (result.circuitBreakerTripped) {
                   console.warn(
-                    `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on non-streaming path.`,
+                    `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on non-streaming path.`
                   );
                   currentPayload.messages.push(
                     {
@@ -1030,18 +978,26 @@ export function createUpstreamHandler(ctx) {
                       tool_call_id: tc.id,
                       name: tc.function.name,
                       content: `SYSTEM_ERROR: Background tool budget exhausted (${MAX_GHOST_RETRIES} hops used). Do not retry this tool. Summarise what you have found so far and proceed using only standard file tools.`,
-                    })),
+                    }))
                   );
-                  executeUpstreamRequest(currentPayload, 0, acc)
-                    .then(resolve)
-                    .catch(reject);
+                  executeUpstreamRequest(currentPayload, 0, acc).then(resolve).catch(reject);
                   return;
                 }
+
+                // Re-attach any provider-specific extra_content from the
+                // original message tool calls so Gemini accepts the next hop
+                const toolCallsWithMeta = result.toolCalls.map((tc) => {
+                  const original = message.tool_calls.find((orig) => orig.id === tc.id);
+                  if (original?.extra_content) {
+                    return { ...tc, extra_content: original.extra_content };
+                  }
+                  return tc;
+                });
 
                 currentPayload.messages.push({
                   role: "assistant",
                   content: message.content ?? null,
-                  tool_calls: result.toolCalls,
+                  tool_calls: toolCallsWithMeta,
                 });
 
                 for (const r of result.results) {
@@ -1054,16 +1010,14 @@ export function createUpstreamHandler(ctx) {
                 }
 
                 const nextRetry = computeNextRetry(result, retryCount);
-                executeUpstreamRequest(currentPayload, nextRetry, acc)
-                  .then(resolve)
-                  .catch(reject);
+                executeUpstreamRequest(currentPayload, nextRetry, acc).then(resolve).catch(reject);
                 return;
               }
             }
 
             const { body, statusCode: outStatus } = clientAdapter.fromInternal(
               jsonResponse,
-              proxyRes.statusCode,
+              proxyRes.statusCode
             );
 
             if (!res.headersSent) {
@@ -1072,10 +1026,7 @@ export function createUpstreamHandler(ctx) {
             res.write(body);
             res.end();
 
-            if (
-              proxyRes.statusCode === 200 &&
-              message?.content?.trim().length > 0
-            ) {
+            if (proxyRes.statusCode === 200 && message?.content?.trim().length > 0) {
               (async () => {
                 try {
                   const tokenCount = Math.floor(message.content.length / 4);
@@ -1084,7 +1035,7 @@ export function createUpstreamHandler(ctx) {
                     hybridRetriever.addDocumentWithEmbedding(
                       "IDX_" + crypto.randomUUID(),
                       message.content,
-                      embedding,
+                      embedding
                     );
                   }
                 } catch (e) {
@@ -1095,10 +1046,7 @@ export function createUpstreamHandler(ctx) {
 
             resolve({ hopEndTime, ...acc });
           } catch (handlerErr) {
-            console.error(
-              "[ProxyRes End] Unhandled error:",
-              handlerErr.message,
-            );
+            console.error("[ProxyRes End] Unhandled error:", handlerErr.message);
             reject(handlerErr);
           }
         });
@@ -1107,9 +1055,7 @@ export function createUpstreamHandler(ctx) {
       proxyReq.on("error", (err) => {
         if (!res.headersSent) {
           res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({ error: "Bad Gateway", details: err.message }),
-          );
+          res.end(JSON.stringify({ error: "Bad Gateway", details: err.message }));
         }
         reject(err);
       });

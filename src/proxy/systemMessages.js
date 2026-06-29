@@ -1,4 +1,5 @@
 ﻿import crypto from "node:crypto";
+
 // ============================================================
 // INLINE SYSTEM MESSAGE DEDUPLICATOR & PRUNER
 // ============================================================
@@ -13,14 +14,13 @@ export function deduplicateSystemMessages(payload) {
   const systemMessages = payload.messages.filter((m) => m.role === "system");
 
   // If there's only ONE system message, never touch it
-  // It contains the full behavioral context Nemotron needs
   if (systemMessages.length <= 1) {
     return payload;
   }
 
+  // First pass — handle skills list pruning in-place
   payload.messages = payload.messages.map((msg) => {
     if (msg.role === "system" && typeof msg.content === "string") {
-      // 1. Destroy the repetitive "Skills" manual injected by Claude Code
       if (
         msg.content.includes(
           "The following skills are available for use with the Skill tool:",
@@ -29,32 +29,37 @@ export function deduplicateSystemMessages(payload) {
         const parts = msg.content.split(
           "The following skills are available for use with the Skill tool:",
         );
-        // Keep whatever was before it (usually important context), but drop the massive list
         const cleanContent =
           parts[0].trim() +
           "\n[ContextForge: Repetitive skills list removed to save tokens]";
 
         if (cleanContent.length < msg.content.length) {
           charsSaved += msg.content.length - cleanContent.length;
-          msg.content = cleanContent;
           prunedCount++;
+          return { ...msg, content: cleanContent };
         }
-      }
-
-      // 2. Standard Deduplication: If we've seen this exact system prompt before, drop it
-      const promptHash = crypto
-        .createHash("sha256")
-        .update(msg.content)
-        .digest("hex");
-      if (seenSystemPrompts.has(promptHash)) {
-        charsSaved += msg.content.length;
-        msg.content = "[ContextForge: Redundant system prompt removed]";
-        prunedCount++;
-      } else {
-        seenSystemPrompts.add(promptHash);
       }
     }
     return msg;
+  });
+
+  // Second pass — remove duplicate system messages entirely
+  payload.messages = payload.messages.filter((msg) => {
+    if (msg.role !== "system" || typeof msg.content !== "string") return true;
+
+    const promptHash = crypto
+      .createHash("sha256")
+      .update(msg.content)
+      .digest("hex");
+
+    if (seenSystemPrompts.has(promptHash)) {
+      charsSaved += msg.content.length;
+      prunedCount++;
+      return false; // remove from array entirely
+    }
+
+    seenSystemPrompts.add(promptHash);
+    return true;
   });
 
   if (prunedCount > 0) {
@@ -62,10 +67,8 @@ export function deduplicateSystemMessages(payload) {
     console.log(
       `[SysPrompt Pruner] ✂️  Removed ${prunedCount} redundant system blocks (saved ~${tokensSaved} tokens)`,
     );
-    // FIX 8: Stamp savings onto payload for StageTimer observability
     payload._cf_sysPromptTokensSaved = tokensSaved;
   }
 
   return payload;
 }
-

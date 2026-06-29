@@ -1,45 +1,59 @@
-#!/bin/bash
-# scripts/setup-onnx.sh
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# setup-onnx.sh
+#
+# Downloads the ONNX model and tokenizer required by ContextForge.
+# Safe to run multiple times — skips download if files already exist.
+# ─────────────────────────────────────────────────────────────────────────────
 
-set -e
+set -euo pipefail
 
-DEST="native/vendor/onnxruntime"
-mkdir -p "$DEST"
+MODELS_DIR="./models"
+MODEL_FILE="${MODELS_DIR}/all-MiniLM-L6-v2-int8.onnx"
+TOKENIZER_FILE="${MODELS_DIR}/tokenizer.json"
 
-ORT_VERSION="1.20.1"
-ORT_PLATFORM="win-x64"
+MODEL_URL="https://huggingface.co/optimum/all-MiniLM-L6-v2/resolve/main/model.onnx"
+TOKENIZER_URL="https://huggingface.co/optimum/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  ContextForge — ONNX Model Setup"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
 
-echo "[2/3] Downloading nlohmann/json..."
+mkdir -p "${MODELS_DIR}"
 
-mkdir -p native/vendor/nlohmann
+# ── Download model ────────────────────────────────────────────────────────────
+if [ -f "${MODEL_FILE}" ]; then
+    echo "  ✅ ONNX model already exists — skipping download"
+else
+    echo "  ⬇️  Downloading ONNX model (~23MB)..."
+    if command -v curl &>/dev/null; then
+        curl -L --progress-bar "${MODEL_URL}" -o "${MODEL_FILE}"
+    elif command -v wget &>/dev/null; then
+        wget -q --show-progress "${MODEL_URL}" -O "${MODEL_FILE}"
+    else
+        echo "  ❌ ERROR: Neither curl nor wget found. Install one and retry."
+        exit 1
+    fi
+    echo "  ✅ ONNX model downloaded"
+fi
 
-curl -L \
-  "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp" \
-  -o native/vendor/nlohmann/json.hpp
+# ── Download tokenizer ────────────────────────────────────────────────────────
+if [ -f "${TOKENIZER_FILE}" ]; then
+    echo "  ✅ Tokenizer already exists — skipping download"
+else
+    echo "  ⬇️  Downloading tokenizer.json (~400KB)..."
+    if command -v curl &>/dev/null; then
+        curl -L --progress-bar "${TOKENIZER_URL}" -o "${TOKENIZER_FILE}"
+    elif command -v wget &>/dev/null; then
+        wget -q --show-progress "${TOKENIZER_URL}" -O "${TOKENIZER_FILE}"
+    else
+        echo "  ❌ ERROR: Neither curl nor wget found."
+        exit 1
+    fi
+    echo "  ✅ Tokenizer downloaded"
+fi
 
-echo "[3/3] Downloading MiniLM model..."
-
-mkdir -p models
-
-python -c "
-from huggingface_hub import hf_hub_download
-import shutil
-
-path = hf_hub_download(
-    repo_id='optimum/all-MiniLM-L6-v2',
-    filename='model_quantized.onnx'
-)
-shutil.copy(path, 'models/all-MiniLM-L6-v2-int8.onnx')
-
-path2 = hf_hub_download(
-    repo_id='sentence-transformers/all-MiniLM-L6-v2',
-    filename='tokenizer.json'
-)
-shutil.copy(path2, 'models/tokenizer.json')
-
-print('Models downloaded successfully')
-"
-
-echo
-echo 'Setup complete.'
-echo 'Run: cd native && npx node-gyp rebuild'
+echo ""
+echo "  🎉 ONNX setup complete!"
+echo ""

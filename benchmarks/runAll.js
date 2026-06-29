@@ -1,0 +1,558 @@
+// benchmarks/runAll.js
+//
+// ContextForge Benchmark Orchestrator
+//
+// Runs all benchmark suites in sequence and writes a markdown report to
+// benchmarks/benchmark-report.md.
+//
+// Usage:
+//   node benchmarks/runAll.js                    # mock mode, all suites
+//   CF_BENCHMARK_MODE=live node benchmarks/runAll.js  # live mode
+//   node benchmarks/runAll.js --only=compression # single suite
+//
+// Suites (in execution order):
+//   1. graph/startupIndex         — indexing speed across repo sizes
+//   2. planner/capabilitySelection — planner accuracy on labeled prompts
+//   3. compression/endToEndCompression — pipeline token savings
+//   4. workflows/renameFunction   — end-to-end developer workflow
+//
+// Report sections:
+//   - System information
+//   - Timestamp and run metadata
+//   - Per-suite formatted tables
+//   - Summary: pass/fail per suite
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { execSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+import { RESULTS_DIR } from "./benchmarkRunner.js";
+import { runAllIndexBenchmarks } from "./graph/startupIndex.bench.js";
+import { runCapabilitySelectionBenchmark } from "./planner/capabilitySelection.bench.js";
+import { runEndToEndCompressionBenchmarks } from "./compression/endToEndCompression.bench.js";
+import { runRenameFunctionBenchmark } from "./workflows/renameFunction.bench.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const REPORT_PATH = path.join(__dirname, "benchmark-report.md");
+const PROVIDER_MODE = process.env.CF_BENCHMARK_MODE || "mock";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI flags
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ONLY_ARG = process.argv
+  .find((a) => a.startsWith("--only="))
+  ?.split("=")[1]
+  ?.toLowerCase();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// System info
+// ─────────────────────────────────────────────────────────────────────────────
+
+function getSystemInfo() {
+  let gitCommit = "unknown";
+  let gitBranch = "unknown";
+
+  try {
+    gitCommit = execSync("git rev-parse --short HEAD", { stdio: "pipe" })
+      .toString()
+      .trim();
+    gitBranch = execSync("git rev-parse --abbrev-ref HEAD", { stdio: "pipe" })
+      .toString()
+      .trim();
+  } catch {
+    // not a git repo or git unavailable
+  }
+
+  const cpuInfo = os.cpus();
+
+  return {
+    node: process.version,
+    platform: process.platform,
+    arch: process.arch,
+    cpu_model: cpuInfo[0]?.model ?? "unknown",
+    cpu_cores: cpuInfo.length,
+    ram_gb: Math.round((os.totalmem() / 1024 ** 3) * 10) / 10,
+    provider_mode: PROVIDER_MODE,
+    git_commit: gitCommit,
+    git_branch: gitBranch,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Markdown report builder
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildMarkdownReport(sysInfo, suiteResults) {
+  const lines = [];
+
+  // ── Header ──
+  lines.push(`# ContextForge Benchmark Report`);
+  lines.push(``);
+  lines.push(
+    `> Generated: ${sysInfo.timestamp}  `
+  );
+  lines.push(
+    `> Mode: \`${sysInfo.provider_mode.toUpperCase()}\`  `
+  );
+  lines.push(
+    `> Commit: \`${sysInfo.git_commit}\` on \`${sysInfo.git_branch}\``
+  );
+  lines.push(``);
+
+  // ── System info ──
+  lines.push(`## System Information`);
+  lines.push(``);
+  lines.push(`| Property | Value |`);
+  lines.push(`|----------|-------|`);
+  lines.push(`| Node.js  | \`${sysInfo.node}\` |`);
+  lines.push(`| Platform | ${sysInfo.platform} / ${sysInfo.arch} |`);
+  lines.push(`| CPU      | ${sysInfo.cpu_model} (${sysInfo.cpu_cores} cores) |`);
+  lines.push(`| RAM      | ${sysInfo.ram_gb} GB |`);
+  lines.push(`| Git      | \`${sysInfo.git_commit}\` @ \`${sysInfo.git_branch}\` |`);
+  lines.push(``);
+
+  // ── Suite results ──
+  for (const suite of suiteResults) {
+    lines.push(`## ${suite.title}`);
+    lines.push(``);
+
+    if (suite.error) {
+      lines.push(`> ❌ Suite failed: ${suite.error}`);
+      lines.push(``);
+      continue;
+    }
+
+    if (suite.skipped) {
+      lines.push(`> ⏭ Suite skipped: ${suite.reason}`);
+      lines.push(``);
+      continue;
+    }
+
+    lines.push(...suite.markdownRows);
+    lines.push(``);
+  }
+
+  // ── Summary table ──
+  lines.push(`## Summary`);
+  lines.push(``);
+  lines.push(`| Suite | Status | Key Metric |`);
+  lines.push(`|-------|--------|------------|`);
+
+  for (const suite of suiteResults) {
+    const status = suite.error
+      ? "❌ FAILED"
+      : suite.skipped
+      ? "⏭ SKIPPED"
+      : suite.passed
+      ? "✅ PASSED"
+      : "⚠️  PARTIAL";
+
+    lines.push(`| ${suite.title} | ${status} | ${suite.keyMetric ?? "–"} |`);
+  }
+
+  lines.push(``);
+  lines.push(
+    `---`
+  );
+  lines.push(
+    `*Report generated by \`node benchmarks/runAll.js\`. ` +
+      `Re-run to refresh. Use \`CF_BENCHMARK_MODE=live\` for real provider results.*`
+  );
+  lines.push(``);
+
+  return lines.join("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite result adapters
+//
+// Each benchmark returns different result shapes. These adapters normalize
+// them into { title, markdownRows, keyMetric, passed, error, skipped }.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function adaptIndexResults(results) {
+  const rows = [];
+
+  rows.push(
+    `| Repo Size | Files Indexed | Nodes | Edges | Median Latency | Nodes/File | Memory Δ |`
+  );
+  rows.push(
+    `|-----------|---------------|-------|-------|----------------|------------|----------|`
+  );
+
+  let anyFailed = false;
+
+  for (const r of results) {
+    if (r.failed) {
+      anyFailed = true;
+      rows.push(`| — | ❌ \`${r.benchmark}\` failed: ${r.error} | | | | | |`);
+      continue;
+    }
+    const m = r.custom_metrics;
+    rows.push(
+      `| ${m.repo_size} | ${m.files_indexed} | ${m.nodes_extracted} | ${m.edges_extracted} | ${r.stats.median_ms} ms | ${m.nodes_per_file} | ${m.memory_delta_mb} MB |`
+    );
+  }
+
+  const largeResult = results.find((r) =>
+    r.benchmark?.includes("large")
+  );
+  const keyMetric = largeResult?.failed
+    ? "large repo FAILED"
+    : largeResult
+    ? `large: ${largeResult.stats?.median_ms ?? "–"} ms`
+    : "–";
+
+  return {
+    title: "Graph: Startup Index",
+    markdownRows: rows,
+    keyMetric,
+    passed: !anyFailed,
+  };
+}
+
+function adaptPlannerResults(result) {
+  const rows = [];
+
+  if (result.failed) {
+    return {
+      title: "Planner: Capability Selection",
+      markdownRows: [`> ❌ Benchmark failed: ${result.error}`],
+      keyMetric: "FAILED",
+      passed: false,
+    };
+  }
+
+  const m = result.custom_metrics;
+
+  rows.push(`### Capability Selection Accuracy`);
+  rows.push(``);
+  rows.push(`| Metric | Value | Threshold | Pass? |`);
+  rows.push(`|--------|-------|-----------|-------|`);
+  rows.push(
+    `| Overall Accuracy | ${m.accuracy_pct}% | ≥ 90% | ${m.meets_accuracy_threshold ? "✅" : "❌"} |`
+  );
+  rows.push(
+    `| All Intents ≥ 75% Precision | ${m.all_intents_above_75 ? "yes" : "no"} | required | ${m.all_intents_above_75 ? "✅" : "❌"} |`
+  );
+  rows.push(
+    `| Median Latency | ${m.median_latency_ms} ms | < 10 ms | ${m.median_latency_ok ? "✅" : "❌"} |`
+  );
+  rows.push(
+    `| False Positives | ${m.false_positives} | — | — |`
+  );
+  rows.push(
+    `| False Negatives | ${m.false_negatives} | — | — |`
+  );
+  rows.push(``);
+
+  // Per-intent table
+  if (m.intent_stats) {
+    rows.push(`### Per-Intent Precision / Recall`);
+    rows.push(``);
+    rows.push(`| Intent | Total | Correct | Precision | Recall |`);
+    rows.push(`|--------|-------|---------|-----------|--------|`);
+    for (const [intent, stats] of Object.entries(m.intent_stats)) {
+      rows.push(
+        `| ${intent} | ${stats.total} | ${stats.correct} | ${stats.precision}% | ${stats.recall}% |`
+      );
+    }
+  }
+
+  return {
+    title: "Planner: Capability Selection",
+    markdownRows: rows,
+    keyMetric: `accuracy: ${m.accuracy_pct}%`,
+    passed: m.success,
+  };
+}
+
+function adaptCompressionResults(results) {
+  const rows = [];
+
+  // Tool schema sub-benchmark
+  const toolResult = results.find((r) =>
+    r.benchmark?.includes("tool-schemas")
+  );
+  if (toolResult && !toolResult.failed) {
+    const m = toolResult.custom_metrics;
+    rows.push(`### Tool Schema Minimizer`);
+    rows.push(``);
+    rows.push(`| Tools | Tokens Before | Tokens After | Saved | Saved % | Latency |`);
+    rows.push(`|-------|---------------|--------------|-------|---------|---------|`);
+    if (m?.tool_schema_results) {
+      for (const r of m.tool_schema_results) {
+        rows.push(
+          `| ${r.tool_count} | ${r.tokens_before} | ${r.tokens_after} | ${r.tokens_saved} | ${r.saved_pct}% | ${r.latency_ms.toFixed(2)} ms |`
+        );
+      }
+    }
+    rows.push(``);
+  }
+
+  // Full pipeline sub-benchmark
+  const pipelineResult = results.find((r) =>
+    r.benchmark?.includes("end-to-end")
+  );
+  if (pipelineResult && !pipelineResult.failed) {
+    const m = pipelineResult.custom_metrics;
+    rows.push(`### Full Pipeline`);
+    rows.push(``);
+    rows.push(`| Metric | Value |`);
+    rows.push(`|--------|-------|`);
+    rows.push(`| Baseline Tokens | ${m.baseline_tokens} |`);
+    rows.push(`| Final Tokens | ${m.final_tokens} |`);
+    rows.push(`| Tokens Saved | ${m.tokens_saved} |`);
+    rows.push(`| Compression Ratio | ${m.compression_ratio_pct}% |`);
+    rows.push(`| Pipeline Latency | ${m.pipeline_latency_ms} ms |`);
+    rows.push(
+      `| Accounting Drift | ${m.accounting_drift_pct}% ${m.accounting_ok ? "✅" : "⚠️"} |`
+    );
+    rows.push(``);
+
+    if (m.stages) {
+      rows.push(`### Stage Breakdown`);
+      rows.push(``);
+      rows.push(`| Stage | Tokens Before | Tokens After | Saved | Latency | Status |`);
+      rows.push(`|-------|---------------|--------------|-------|---------|--------|`);
+      for (const s of m.stages) {
+        const status = s.skipped
+          ? "skipped"
+          : s.delta > 0
+          ? "✓"
+          : s.delta < 0
+          ? "⚠ inflated"
+          : "–";
+        rows.push(
+          `| ${s.stage} | ${s.tokens_before} | ${s.tokens_after} | ${s.delta} | ${s.latency_ms} ms | ${status} |`
+        );
+      }
+    }
+  }
+
+  const anyFailed = results.some((r) => r.failed);
+  const pipelineMetric = pipelineResult?.custom_metrics?.compression_ratio_pct;
+
+  return {
+    title: "Compression: End-to-End Pipeline",
+    markdownRows: rows,
+    keyMetric: pipelineMetric != null ? `${pipelineMetric}% compression` : "–",
+    passed: !anyFailed,
+  };
+}
+
+function adaptWorkflowResults(result) {
+  const rows = [];
+
+  if (result.failed) {
+    return {
+      title: "Workflow: Rename Function",
+      markdownRows: [`> ❌ Benchmark failed: ${result.error}`],
+      keyMetric: "FAILED",
+      passed: false,
+    };
+  }
+
+  const m = result.custom_metrics;
+
+  if (m?.skipped) {
+    return {
+      title: "Workflow: Rename Function",
+      markdownRows: [
+        `> ⏭ ${m.reason}`,
+        `>`,
+        `> Run with \`CF_BENCHMARK_MODE=live\` to record a session.`,
+      ],
+      keyMetric: "skipped (stub)",
+      passed: true, // stub is not a failure
+      skipped: true,
+      reason: m.reason,
+    };
+  }
+
+  rows.push(`### Rename Function Workflow`);
+  rows.push(``);
+  rows.push(`| Metric | Value |`);
+  rows.push(`|--------|-------|`);
+  rows.push(`| Repository | \`${m?.repo ?? "–"}\` |`);
+  rows.push(`| Function renamed | \`${m?.function_renamed}\` → \`${m?.new_name}\` |`);
+  rows.push(`| Mode | ${m?.mode ?? "–"} |`);
+  rows.push(`| LLM Requests | ${m?.llm_requests ?? "–"} |`);
+  rows.push(`| Total Latency | ${m?.total_latency_ms ?? "–"} ms |`);
+  rows.push(`| Tokens Before | ${m?.total_tokens_before ?? "–"} |`);
+  rows.push(`| Tokens After | ${m?.total_tokens_after ?? "–"} |`);
+  rows.push(`| Tokens Saved | ${m?.total_tokens_saved ?? "–"} |`);
+  rows.push(`| Compression | ${m?.overall_compression_pct ?? "–"}% |`);
+  rows.push(``);
+
+  if (m?.turns?.length > 0) {
+    rows.push(`### Turn-by-Turn Breakdown`);
+    rows.push(``);
+    rows.push(
+      `| Turn | Description | Tokens Before | Tokens After | Saved | Latency |`
+    );
+    rows.push(
+      `|------|-------------|---------------|--------------|-------|---------|`
+    );
+    for (const t of m.turns) {
+      rows.push(
+        `| ${t.turn} | ${t.description} | ${t.tokens_before ?? "–"} | ${t.tokens_after ?? "–"} | ${t.tokens_saved ?? "–"} | ${t.latency_ms} ms |`
+      );
+    }
+  }
+
+  return {
+    title: "Workflow: Rename Function",
+    markdownRows: rows,
+    keyMetric: m?.overall_compression_pct != null
+      ? `${m.overall_compression_pct}% compression over ${m.llm_requests} request(s)`
+      : "–",
+    passed: true,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite runner table
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ALL_SUITES = [
+  {
+    key: "index",
+    label: "Graph Startup Index",
+    run: async () => {
+      const results = await runAllIndexBenchmarks();
+      return adaptIndexResults(Array.isArray(results) ? results : [results]);
+    },
+  },
+  {
+    key: "planner",
+    label: "Planner Capability Selection",
+    run: async () => {
+      const result = await runCapabilitySelectionBenchmark();
+      return adaptPlannerResults(result);
+    },
+  },
+  {
+    key: "compression",
+    label: "Compression End-to-End",
+    run: async () => {
+      const results = await runEndToEndCompressionBenchmarks();
+      return adaptCompressionResults(Array.isArray(results) ? results : [results]);
+    },
+  },
+  {
+    key: "workflow",
+    label: "Rename Function Workflow",
+    run: async () => {
+      const result = await runRenameFunctionBenchmark();
+      return adaptWorkflowResults(result);
+    },
+  },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log("\n╔══════════════════════════════════════════════════════════╗");
+  console.log("║        ContextForge Benchmark Suite — runAll.js          ║");
+  console.log("╚══════════════════════════════════════════════════════════╝\n");
+
+  const sysInfo = getSystemInfo();
+
+  console.log(`Mode:      ${sysInfo.provider_mode.toUpperCase()}`);
+  console.log(`Node:      ${sysInfo.node}`);
+  console.log(`CPU:       ${sysInfo.cpu_model} (${sysInfo.cpu_cores} cores)`);
+  console.log(`RAM:       ${sysInfo.ram_gb} GB`);
+  console.log(`Commit:    ${sysInfo.git_commit} @ ${sysInfo.git_branch}`);
+  console.log(`Timestamp: ${sysInfo.timestamp}`);
+
+  if (ONLY_ARG) {
+    console.log(`\nFilter:    --only=${ONLY_ARG}`);
+  }
+
+  console.log("");
+
+  const suitesToRun = ONLY_ARG
+    ? ALL_SUITES.filter((s) => s.key === ONLY_ARG)
+    : ALL_SUITES;
+
+  if (suitesToRun.length === 0) {
+    console.error(
+      `❌ Unknown suite: "${ONLY_ARG}". Valid: ${ALL_SUITES.map((s) => s.key).join(", ")}`
+    );
+    process.exit(1);
+  }
+
+  const suiteResults = [];
+
+  for (const suite of suitesToRun) {
+    console.log(
+      `\n${"─".repeat(60)}`
+    );
+    console.log(`Running: ${suite.label}`);
+    console.log(`${"─".repeat(60)}`);
+
+    try {
+      const adapted = await suite.run();
+      suiteResults.push(adapted);
+      console.log(
+        `\n${adapted.passed ? "✅" : "❌"} ${suite.label} — ${adapted.keyMetric}`
+      );
+    } catch (err) {
+      console.error(`\n❌ ${suite.label} threw: ${err.message}`);
+      console.error(err.stack);
+      suiteResults.push({
+        title: suite.label,
+        markdownRows: [],
+        keyMetric: "EXCEPTION",
+        passed: false,
+        error: err.message,
+      });
+    }
+  }
+
+  // ── Generate report ──────────────────────────────────────────────────────
+
+  const report = buildMarkdownReport(sysInfo, suiteResults);
+  fs.writeFileSync(REPORT_PATH, report, "utf-8");
+
+  console.log(`\n${"═".repeat(60)}`);
+  console.log(`Benchmark Report → ${REPORT_PATH}`);
+  console.log(`${"═".repeat(60)}\n`);
+
+  // ── Final summary ────────────────────────────────────────────────────────
+
+  const passed = suiteResults.filter((s) => s.passed);
+  const failed = suiteResults.filter((s) => !s.passed && !s.skipped);
+  const skipped = suiteResults.filter((s) => s.skipped);
+
+  console.log(
+    `Results: ${passed.length} passed, ${failed.length} failed, ${skipped.length} skipped\n`
+  );
+
+  for (const s of suiteResults) {
+    const icon = s.error ? "❌" : s.skipped ? "⏭" : s.passed ? "✅" : "⚠️";
+    console.log(`  ${icon}  ${s.title.padEnd(42)} ${s.keyMetric}`);
+  }
+
+  console.log("");
+
+  // Non-zero exit if any suite failed (not skipped — stubs are acceptable)
+  if (failed.length > 0) {
+    process.exit(1);
+  }
+}
+
+main().catch((err) => {
+  console.error(`\n❌ runAll.js fatal error: ${err.message}`);
+  console.error(err.stack);
+  process.exit(1);
+});

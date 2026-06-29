@@ -12,6 +12,10 @@ export class NativeEmbedder {
   // Returns Promise<Float32Array>
   embed(text) {
     if (!text?.trim()) {
+      console.warn(
+        "[Embedder] ⚠️  Attempted to embed empty text — returning zero vector. " +
+        "This will cause search misses if the text was intended to be searchable."
+      );
       return Promise.resolve(new Float32Array(this.dim));
     }
     return this._emb.embed(text);

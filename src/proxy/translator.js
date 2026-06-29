@@ -1,4 +1,4 @@
-﻿import crypto from "node:crypto";
+import crypto from "node:crypto";
 // ========================================================
 // 1. INBOUND TRANSLATION: Anthropic JSON -> OpenAI JSON
 // ========================================================
@@ -404,7 +404,27 @@ function _translateMessage(msg) {
     return result;
   }
 
-  // ── Standard text-only flattening ──
+  // ── Standard formatting (Text + Images) ──
+  const hasImages = msg.content.some((b) => b.type === "image");
+  if (hasImages) {
+    const formattedContent = msg.content.map((b) => {
+      if (b.type === "text") return { type: "text", text: b.text };
+      if (b.type === "image") {
+        return {
+          type: "image_url",
+          image_url: {
+            url: `data:${b.source.media_type};base64,${b.source.data}`
+          }
+        };
+      }
+      return b; // passthrough unknown
+    });
+    result = { ...msg, content: formattedContent };
+    _cacheSet(msg, result);
+    return result;
+  }
+
+  // ── Text-only flattening ──
   const textContent = msg.content
     .filter((b) => b.type === "text")
     .map((b) => b.text)
@@ -630,7 +650,6 @@ const _toolSchemaCacheMap = new Map();
 // Wrap minimizeToolSchemas:
 export function minimizeToolSchemas(payload) {
   if (!payload.tools || payload.tools.length === 0) return payload;
-  console.log('Anuj is checking the engine');
 
   // Hash the current tools array
   const toolsJson = JSON.stringify(payload.tools);

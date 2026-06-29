@@ -92,7 +92,13 @@ export function countMessageTokens(msg) {
     }
   }
 
-  // Cache the result on the object reference
-  msg._cachedTokens = tokens;
+  // Cache the result on the object reference as non-enumerable
+  // so that object spread ({ ...msg }) in pipeline stages drops the cache.
+  Object.defineProperty(msg, "_cachedTokens", {
+    value: tokens,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
   return tokens;
 }

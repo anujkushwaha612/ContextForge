@@ -7,7 +7,7 @@ import { writeFileSync, readFileSync } from "node:fs";
 
 // ── ContextForge core ──
 import { detectAdapter } from "./adapters/index.js";
-import { OllamaAdapter } from "./providers/ollama.js";
+import { ProviderFactory } from "./providers/index.js";
 import {
   fetchFromVault,
   fetchVaultTextConcatenated,
@@ -15,6 +15,7 @@ import {
   resetEntireCache,
 } from "./logging/cacheDb.js";
 import { countTokens } from "./compression/compressionHelper.js";
+
 import { applySemanticDedup } from "./compression/semanticDedup.js";
 import { statsEmitter } from "./proxy/statsEmitter.js";
 
@@ -32,17 +33,13 @@ import { interceptAndVaultMassiveToolResults } from "./compression/fatCatch.js";
 import { scrubToolResults, tagToolResults } from "./compression/toolScrubber.js";
 import { pruneToolResults } from "./compression/pruner.js";
 import { sliceJsonToolResults } from "./compression/jsonSlicer.js";
-import { applyPredictiveInjection } from "./memory/predictiveInjection.js";
 import { deduplicateSystemMessages } from "./proxy/systemMessages.js";
 import { stripAnthropicSpecificFields } from "./proxy/translator.js";
 
 // ── Compression stages ──
 import { compressCodeToolResults } from "./compression/astCompressor.js";
 import { getPolicyForModel } from "./compression/compressionPolicy.js";
-import {
-  CompressionDecision,
-  getOptimizeFlag,
-} from "./proxy/compressionDecision.js";
+import { CompressionDecision, getOptimizeFlag } from "./proxy/compressionDecision.js";
 import { alignCachePrefix } from "./compression/cacheAligner.js";
 import { MemoryDecision, getMemoryMode } from "./proxy/memoryDecision.js";
 import { StageTimer, STAGES } from "./proxy/stageTimer.js";
@@ -56,18 +53,11 @@ import { injectMemoryTools } from "./memory/memoryTools.js";
 
 // ── Graph + Patch ──
 import { indexWorkspace, watchWorkspace } from "./graph/workspaceMapper.js";
-import {
-  injectGraphTool,
-  injectReadFileChunkTool,
-} from "./graph/graphTools.js";
+import { injectGraphTool, injectReadFileChunkTool } from "./graph/graphTools.js";
 import { injectPatchTool } from "./graph/patchTools.js";
 
 // ── Request Planner ──
-import {
-  initPlanner,
-  planPipeline,
-  CAPABILITIES,
-} from "./proxy/requestPlanner.js";
+import { initPlanner, planPipeline, CAPABILITIES } from "./proxy/requestPlanner.js";
 
 // ── Upstream handler ──
 import { createUpstreamHandler } from "./proxy/upstreamRequest.js";
@@ -79,10 +69,8 @@ const native = require("../native/build/Release/contextforge_native.node");
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ─────────────────────────────────────────────
-// Provider — single instance, always Ollama for now
-// ─────────────────────────────────────────────
-const provider = new OllamaAdapter();
+const providerName = process.env.CF_PROVIDER || "ollama";
+const provider = ProviderFactory.getAdapter(providerName);
 
 // ─────────────────────────────────────────────
 // Native module initialization
@@ -118,24 +106,24 @@ console.log("Initializing ContextForge Native Engine...");
   console.log("[Planner] ✅ Initialization complete");
 
   // ── Step 3: Start accepting requests ──────────────────────────────────
-  server.listen(3000, () => {
-    console.log("ContextForge Proxy routing engine active on port 3000");
+  const PORT = parseInt(process.env.CF_PORT || process.env.PORT || "3000", 10);
+  server.listen(PORT, () => {
+    console.log(
+      `ContextForge Proxy routing engine active on port ${PORT} [Provider: ${providerName}]`
+    );
   });
 })();
 
 const onnxEmbedder = new native.OnnxEmbedder(
   path.join(__dirname, "../models/all-MiniLM-L6-v2-int8.onnx"),
   path.join(__dirname, "../models/tokenizer.json"),
-  { dim: 384, cacheSize: 512, batchWaitMs: 1 },
+  { dim: 384, cacheSize: 512, batchWaitMs: 1 }
 );
 
 setEmbedder(onnxEmbedder);
 // Warmup and initialization moved to startup sequence
 
-const memoryStore = new native.PersistentMemoryStore(
-  path.join(__dirname, "./data/memory.db"),
-  384,
-);
+const memoryStore = new native.PersistentMemoryStore(path.join(__dirname, "./data/memory.db"), 384);
 
 const semanticCache = new native.SemanticCache(384);
 const hybridRetriever = new native.HybridRetriever(semanticCache, {
@@ -161,14 +149,12 @@ global.embeddingWorker = new Worker(workerPath, {
 });
 
 global.embeddingWorker.on("error", (err) =>
-  console.error(`\n[Background Thread] Fatal Error: ${err.message}`),
+  console.error(`\n[Background Thread] Fatal Error: ${err.message}`)
 );
 
 global.embeddingWorker.on("exit", (code) => {
   if (code !== 0) {
-    console.error(
-      `\n[Background Thread] Worker exited (code ${code}). RAG disabled.`,
-    );
+    console.error(`\n[Background Thread] Worker exited (code ${code}). RAG disabled.`);
     global.embeddingWorker = null;
   }
 });
@@ -248,14 +234,16 @@ const server = http.createServer((req, res) => {
       Connection: "keep-alive",
       "Access-Control-Allow-Origin": "*",
     });
-    res.write(
-      `event: snapshot\ndata: ${JSON.stringify(statsEmitter.getSnapshot("initial"))}\n\n`,
-    );
-    const listener = (snap) =>
-      res.write(`event: snapshot\ndata: ${JSON.stringify(snap)}\n\n`);
+    res.write(`event: snapshot\ndata: ${JSON.stringify(statsEmitter.getSnapshot("initial"))}\n\n`);
+    const listener = (snap) => res.write(`event: snapshot\ndata: ${JSON.stringify(snap)}\n\n`);
     statsEmitter.on("snapshot", listener);
     req.on("close", () => statsEmitter.off("snapshot", listener));
     return;
+  }
+
+  if (req.url === "/healthz" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ status: "ok", provider: providerName }));
   }
 
   // ── Dashboard ──
@@ -280,9 +268,7 @@ const server = http.createServer((req, res) => {
         semanticCache.invalidate(id);
         console.log(`\n[Cache Invalidation] 🗑️ Vector ${id} wiped.`);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({ success: true, message: `Invalidated ${id}` }),
-        );
+        res.end(JSON.stringify({ success: true, message: `Invalidated ${id}` }));
       } catch (e) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Invalid JSON or missing 'id'" }));
@@ -301,13 +287,11 @@ const server = http.createServer((req, res) => {
         JSON.stringify({
           success: true,
           message: "Entire cache has been reset.",
-        }),
+        })
       );
     } catch (e) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      return res.end(
-        JSON.stringify({ error: "Failed to reset cache", details: e.message }),
-      );
+      return res.end(JSON.stringify({ error: "Failed to reset cache", details: e.message }));
     }
   }
 
@@ -319,13 +303,10 @@ const server = http.createServer((req, res) => {
       return res.end(JSON.stringify({ error: "Invalid vault ID" }));
     }
     try {
-      const content =
-        fetchVaultTextConcatenated(vaultId) || fetchFromVault(vaultId);
+      const content = fetchVaultTextConcatenated(vaultId) || fetchFromVault(vaultId);
       if (!content) {
         res.writeHead(404, { "Content-Type": "application/json" });
-        return res.end(
-          JSON.stringify({ error: "Vault not found", vault_id: vaultId }),
-        );
+        return res.end(JSON.stringify({ error: "Vault not found", vault_id: vaultId }));
       }
       res.writeHead(200, {
         "Content-Type": "application/json",
@@ -337,19 +318,30 @@ const server = http.createServer((req, res) => {
           content,
           chars: content.length,
           tokens: Math.floor(content.length / 4),
-        }),
+        })
       );
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      return res.end(
-        JSON.stringify({ error: "Vault read failed", details: err.message }),
-      );
+      return res.end(JSON.stringify({ error: "Vault read failed", details: err.message }));
     }
   }
 
   if (req.method !== "POST") {
     res.writeHead(405, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ error: "Method Not Allowed" }));
+  }
+
+  // Fast fail for unknown routes
+  const ALLOWED_POST_ROUTES = [
+    "/v1/chat/completions",
+    "/v1/messages",
+    "/v1beta/models/",
+    "/count_tokens"
+  ];
+  const isAllowed = ALLOWED_POST_ROUTES.some(route => req.url.includes(route));
+  if (!isAllowed) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: "Not Found" }));
   }
 
   // ── Collect body ──
@@ -362,9 +354,10 @@ const server = http.createServer((req, res) => {
     totalBytes += chunk.length;
     if (totalBytes > MAX_BODY_SIZE) {
       destroyed = true;
-      res.writeHead(413, { "Content-Type": "application/json" });
+      res.writeHead(413, { "Content-Type": "application/json", "Connection": "close" });
       res.end(JSON.stringify({ error: "Payload Too Large" }));
-      req.destroy();
+      req.unpipe();
+      req.resume();
       return;
     }
     chunks.push(chunk);
@@ -397,10 +390,7 @@ const server = http.createServer((req, res) => {
 
     // ── Detect client format + normalize to OpenAI internal format ──
     const { adapter: clientAdapter } = detectAdapter(req.url, req.headers);
-    const { payload: normalizedPayload } = clientAdapter.toInternal(
-      payload,
-      req.headers,
-    );
+    const { payload: normalizedPayload } = clientAdapter.toInternal(payload, req.headers);
     payload = normalizedPayload;
 
     // Drives egress format — pipeline always sees OpenAI format internally
@@ -411,14 +401,10 @@ const server = http.createServer((req, res) => {
 
     // ── Parse per-request retry budget override ──
     const maxRetriesHeader = req.headers["x-cf-max-retries"];
-    const parsedMaxRetries = maxRetriesHeader
-      ? parseInt(maxRetriesHeader, 10)
-      : NaN;
+    const parsedMaxRetries = maxRetriesHeader ? parseInt(maxRetriesHeader, 10) : NaN;
     const maxRetries =
-      Number.isInteger(parsedMaxRetries) && parsedMaxRetries >= 0
-        ? parsedMaxRetries
-        : undefined;
-
+      Number.isInteger(parsedMaxRetries) && parsedMaxRetries >= 0 ? parsedMaxRetries : undefined;
+    const mockUpstreamPort = req.headers["x-cf-mock-port"] ? parseInt(req.headers["x-cf-mock-port"], 10) : null;
     // ── Bind upstream handler for this request ──
     const executeUpstreamRequest = createUpstreamHandler({
       req,
@@ -431,6 +417,7 @@ const server = http.createServer((req, res) => {
       onnxEmbedder,
       memoryHandler,
       maxRetries,
+      mockUpstreamPort, // <-- ADD THIS
     });
 
     // ─────────────────────────────────────────────
@@ -440,29 +427,37 @@ const server = http.createServer((req, res) => {
       payload = extractGeminiInlineContent(payload);
     }
 
-    // ─────────────────────────────────────────────
-    // TRUE BASELINE — before any pipeline stage runs
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────────
+    // TRUE BASELINE
+    //
+    // Measured AFTER clientAdapter.toInternal() normalizes the incoming request
+    // to OpenAI internal format. This is intentional — all downstream pipeline
+    // measurements (afterAlwaysOnTokens, finalTokens, wireTokens) are also in
+    // OpenAI internal format, so the delta (tokensSaved) is format-consistent.
+    //
+    // What this excludes from the baseline:
+    //   - Anthropic cache_control markers stripped during translation (~4 tokens
+    //     per block — typically <1% of total tokens)
+    //   - Gemini inline content restructuring (handled separately by
+    //     extractGeminiInlineContent before this measurement)
+    //
+    // For academic benchmarking: capture rawRequestBytes = Buffer.byteLength(rawBody)
+    // before JSON.parse as a format-independent baseline reference.
+    // ─────────────────────────────────────────────────────────────────────────────
     const trueBaselineTokens = countTokens(payload);
 
     // ── Always-on stages ──
     timer.time(STAGES.MINIMIZE_TOOLS, () => {
       payload = minimizeToolSchemas(payload);
       if (payload._cf_minimizeTokensSaved) {
-        timer.recordTokenSavings(
-          STAGES.MINIMIZE_TOOLS,
-          payload._cf_minimizeTokensSaved,
-        );
+        timer.recordTokenSavings(STAGES.MINIMIZE_TOOLS, payload._cf_minimizeTokensSaved);
         delete payload._cf_minimizeTokensSaved;
       }
     });
     timer.time(STAGES.DEDUPLICATE, () => {
       payload = deduplicateSystemMessages(payload);
       if (payload._cf_sysPromptTokensSaved) {
-        timer.recordTokenSavings(
-          STAGES.DEDUPLICATE,
-          payload._cf_sysPromptTokensSaved,
-        );
+        timer.recordTokenSavings(STAGES.DEDUPLICATE, payload._cf_sysPromptTokensSaved);
         delete payload._cf_sysPromptTokensSaved;
       }
     });
@@ -479,9 +474,7 @@ const server = http.createServer((req, res) => {
       // token count — so "Rename foo." (8 tokens) still gets tools.
       const originResult = detectMessageOrigin(payload.messages);
 
-      console.log(
-        `[Planner] Origin: ${originResult.origin} | Reason: ${originResult.reason}`,
-      );
+      console.log(`[Planner] Origin: ${originResult.origin} | Reason: ${originResult.reason}`);
 
       // Agent status updates and tool followups never need repository tools.
       // Short "Done." / "Patch applied." messages bypass immediately.
@@ -494,7 +487,7 @@ const server = http.createServer((req, res) => {
           bypass: true,
         };
         console.log(
-          `[Planner] ⏭️ Bypass — ${originResult.origin.toLowerCase()}, no repository work needed`,
+          `[Planner] ⏭️ Bypass — ${originResult.origin.toLowerCase()}, no repository work needed`
         );
         return;
       }
@@ -503,17 +496,17 @@ const server = http.createServer((req, res) => {
       plan = await planPipeline(
         payload,
         { hasPriorTools, trueBaselineTokens, originHint: originResult.origin },
-        onnxEmbedder,
+        onnxEmbedder
       );
 
       console.log(
         `[Planner] Intent: ${plan.intent} | Method: ${plan.method}` +
-          (plan.debug?.semanticScore !== undefined
+          (plan.debug?.semanticScore != null
             ? ` | Score: ${plan.debug.semanticScore.toFixed(3)}`
             : "") +
-          (plan.debug?.regexConfidence !== undefined
+          (plan.debug?.regexConfidence != null
             ? ` | Confidence: ${plan.debug.regexConfidence.toFixed(2)}`
-            : ""),
+            : "")
       );
       // NEW: structured evidence for debugging misclassifications
       if (plan.debug?.evidence?.length > 0) {
@@ -528,9 +521,7 @@ const server = http.createServer((req, res) => {
         if (plan.capabilities.has(CAPABILITIES.READ))
           payload.tools = injectReadFileChunkTool(payload.tools);
       } else {
-        console.log(
-          `[Planner] ⏭️ Bypass — '${plan.intent}' needs no file capabilities`,
-        );
+        console.log(`[Planner] ⏭️ Bypass — '${plan.intent}' needs no file capabilities`);
       }
     });
 
@@ -549,27 +540,39 @@ const server = http.createServer((req, res) => {
       precomputedTokens: trueBaselineTokens,
     });
 
-    if (!decision.shouldCompress) {
+    if (!decision.shouldCompress && req.headers["x-cf-dry-run"] !== "true") {
       const passthroughTokens = countTokens(payload);
       const computedAlwaysOnSaved = trueBaselineTokens - passthroughTokens;
       console.log(`[Pipeline] Passthrough: ${decision.passthroughReason}`);
       if (computedAlwaysOnSaved > 0) {
         console.log(
           `[Pipeline] Always-on saved: ${computedAlwaysOnSaved} tokens ` +
-            `(${((computedAlwaysOnSaved / trueBaselineTokens) * 100).toFixed(1)}% reduction before gate)`,
+            `(${((computedAlwaysOnSaved / trueBaselineTokens) * 100).toFixed(1)}% reduction before gate)`
         );
       }
       const passthroughMetrics = await executeUpstreamRequest(payload);
-      console.log(
-        `[Metrics] Total E2E Latency: ${(performance.now() - startTime).toFixed(2)}ms`,
-      );
-      if ((passthroughMetrics?.ghostRetries ?? 0) > 0) {
-        console.log(
-          `[Metrics] Ghost Retries:      ${passthroughMetrics.ghostRetries}`,
-        );
-        console.log(
-          `[Metrics] Total Wire Tokens:  ${passthroughMetrics.accumulatedInputTokens}`,
-        );
+      const passthroughWireTokens =
+        passthroughMetrics?.accumulatedInputTokens ?? countTokens(payload);
+      const passthroughGhostRetries = passthroughMetrics?.ghostRetries ?? 0;
+      const passthroughLatencyMs = performance.now() - startTime;
+
+      savingsTracker.recordRequest({
+        baselineTokens: trueBaselineTokens,
+        wireTokens: passthroughWireTokens,
+        tokensSaved: trueBaselineTokens - passthroughWireTokens,
+        ghostRetries: passthroughGhostRetries,
+      });
+      statsEmitter.recordRequest({
+        baselineTokens: trueBaselineTokens,
+        finalTokens: passthroughWireTokens,
+        pipelineLatency: 0,
+        upstreamLatency: passthroughLatencyMs,
+      });
+
+      console.log(`[Metrics] Total E2E Latency: ${passthroughLatencyMs.toFixed(2)}ms`);
+      if (passthroughGhostRetries > 0) {
+        console.log(`[Metrics] Ghost Retries:      ${passthroughGhostRetries}`);
+        console.log(`[Metrics] Total Wire Tokens:  ${passthroughWireTokens}`);
       }
       return;
     }
@@ -598,13 +601,11 @@ const server = http.createServer((req, res) => {
         !m._dedupVaultId &&
         !m._cf_deduped &&
         !m._compressedVaultId &&
-        !m.content.includes("[CF_VAULT:"),
+        !m.content.includes("[CF_VAULT:")
     );
 
     if (!hasCompressibleContent) {
-      console.log(
-        `[Pipeline] ⏭️ No compressible tool results — skipping content stages`,
-      );
+      console.log(`[Pipeline] ⏭️ No compressible tool results — skipping content stages`);
     }
 
     // 1. Inject Memory Tools
@@ -657,10 +658,7 @@ const server = http.createServer((req, res) => {
     // 8. Fat Catch / Vault Intercept
     if (hasCompressibleContent) {
       timer.time(STAGES.VAULT_INTERCEPT, () => {
-        payload = interceptAndVaultMassiveToolResults(
-          payload,
-          policy.singleMsgVaultThreshold,
-        );
+        payload = interceptAndVaultMassiveToolResults(payload, policy.singleMsgVaultThreshold);
       });
     }
 
@@ -675,12 +673,10 @@ const server = http.createServer((req, res) => {
     timer.time(STAGES.CCR_PIPELINE, () => {
       let ccrBaseline = baselineTokens;
       const hasVault = payload.messages?.some((m) => {
-        if (typeof m.content === "string" && m.content.includes("[CF_VAULT:"))
-          return true;
+        if (typeof m.content === "string" && m.content.includes("[CF_VAULT:")) return true;
         if (Array.isArray(m.content)) {
           return m.content.some(
-            (b) =>
-              typeof b.content === "string" && b.content.includes("[CF_VAULT:"),
+            (b) => typeof b.content === "string" && b.content.includes("[CF_VAULT:")
           );
         }
         return false;
@@ -705,19 +701,10 @@ const server = http.createServer((req, res) => {
       if (memDecision.inject) {
         const userId = req.headers["x-contextforge-user-id"];
         const workspace = req.headers["x-contextforge-workspace"] ?? "";
-        const ctx = await memoryHandler.searchAndFormatContext(
-          userId,
-          payload.messages,
-          workspace,
-        );
+        const ctx = await memoryHandler.searchAndFormatContext(userId, payload.messages, workspace);
         if (ctx) {
-          payload.messages = memoryHandler.appendContextToMessages(
-            payload.messages,
-            ctx,
-          );
-          console.log(
-            `[Memory] Injected ${ctx.length} chars for user=${userId}`,
-          );
+          payload.messages = memoryHandler.appendContextToMessages(payload.messages, ctx);
+          console.log(`[Memory] Injected ${ctx.length} chars for user=${userId}`);
         }
       }
     });
@@ -759,7 +746,7 @@ const server = http.createServer((req, res) => {
           stages,
           vault_ids: vaultIds,
           vault_id: vaultIds[0] ?? null,
-        }),
+        })
       );
     }
 
@@ -772,7 +759,7 @@ const server = http.createServer((req, res) => {
       if (result.deletedIds.length > 0) {
         console.log(
           `\n[State Monitor] 🚨 Mutation on '${mutatedFile}'. ` +
-            `Invalidated ${result.deletedIds.length} entries.`,
+            `Invalidated ${result.deletedIds.length} entries.`
         );
       }
     }
@@ -785,9 +772,9 @@ const server = http.createServer((req, res) => {
 
     // FIX F10: Use clientModel instead of mutated payload.model
     savingsTracker.recordRequest({
-      model: clientModel,
-      inputTokens: wireTokens,
-      tokensSaved: trueBaselineTokens * (ghostRetries + 1) - wireTokens,
+      baselineTokens: trueBaselineTokens,
+      wireTokens: wireTokens,
+      tokensSaved: trueBaselineTokens - wireTokens,
       ghostRetries: ghostRetries,
     });
     statsEmitter.recordRequest({
@@ -802,11 +789,11 @@ const server = http.createServer((req, res) => {
     console.log(`[Client]  ${clientAdapter.name}`);
     console.log(`[Metrics] True Baseline:      ${trueBaselineTokens}`);
     console.log(
-      `[Metrics] After Minimize+Dedup: ${afterAlwaysOnTokens} (saved ${alwaysOnSaved} tokens)`,
+      `[Metrics] After Minimize+Dedup: ${afterAlwaysOnTokens} (saved ${alwaysOnSaved} tokens)`
     );
     if (toolInjectionCost > 0) {
       console.log(
-        `[Metrics] Tool Injection Cost:  +${toolInjectionCost} tokens (graph+patch schemas)`,
+        `[Metrics] Tool Injection Cost:  +${toolInjectionCost} tokens (graph+patch schemas)`
       );
     }
     console.log(`[Metrics] After Always-On:    ${baselineTokens}`);
@@ -816,39 +803,37 @@ const server = http.createServer((req, res) => {
     const _tokenSavingsSnap = timer.tokenSummary();
     const _sysPromptSaved = _tokenSavingsSnap[STAGES.DEDUPLICATE] ?? 0;
     const _toolSchemaSaved = alwaysOnSaved - _sysPromptSaved;
-    console.log(
-      `          ├─ Tool Schemas:        ↓${_toolSchemaSaved} tokens`,
-    );
+    console.log(`          ├─ Tool Schemas:        ↓${_toolSchemaSaved} tokens`);
     console.log(`          ├─ System Prompt Dedup: ↓${_sysPromptSaved} tokens`);
     console.log(`          └─ Semantic/AST:        ↓${pipelineSaved} tokens`);
-    console.log(
-      `[Metrics] Total Saved:        ${totalSaved} tokens (vs true baseline)`,
-    );
+    console.log(`[Metrics] Total Saved:        ${totalSaved} tokens (vs true baseline)`);
 
     if (totalSaved < 0) {
-      console.warn(
-        `[Pipeline] ⚠️ Net-negative: pipeline inflated by ${-totalSaved} tokens`,
-      );
+      console.warn(`[Pipeline] ⚠️ Net-negative: pipeline inflated by ${-totalSaved} tokens`);
     }
 
     if (trueBaselineTokens > 0) {
       console.log(
-        `[Metrics] Compression:        ${((totalSaved / trueBaselineTokens) * 100).toFixed(1)}%`,
+        `[Metrics] Compression:        ${((totalSaved / trueBaselineTokens) * 100).toFixed(1)}%`
       );
     }
     if (ghostRetries > 0) {
       console.log(`[Metrics] Ghost Retries:      ${ghostRetries}`);
-      console.log(
-        `[Metrics] Total Wire Tokens:  ${wireTokens} (${ghostRetries + 1} LLM hops)`,
-      );
+      console.log(`[Metrics] Total Wire Tokens:  ${wireTokens} (${ghostRetries + 1} LLM hops)`);
     }
-    console.log(
-      `[Metrics] Pipeline Latency:   ${pipelineLatencyMs.toFixed(2)}ms`,
-    );
+    console.log(`[Metrics] Pipeline Latency:   ${pipelineLatencyMs.toFixed(2)}ms`);
     console.log(`[Metrics] Total E2E Latency:  ${totalLatencyMs.toFixed(2)}ms`);
     console.log(
-      `[Metrics] Content Stages:     ${hasCompressibleContent ? "ACTIVE" : "SKIPPED (no compressible content)"}`,
+      `[Metrics] Content Stages:     ${hasCompressibleContent ? "ACTIVE" : "SKIPPED (no compressible content)"}`
     );
+
+    const actions = statsEmitter.agentActions;
+    console.log(`\n[Repository Operations]`);
+    console.log(` ├─ Graph Lookups:    ${actions.graphLookups}`);
+    console.log(` ├─ Surgical Reads:   ${actions.surgicalReads}`);
+    console.log(` ├─ AST Patches:      ${actions.astPatches}`);
+    console.log(` └─ Raw Vault Opens:  ${actions.rawVaultOpens}`);
+
     console.log(`[Decision] ${decision}`);
 
     for (const [stage, ms] of Object.entries(stages)) {
@@ -872,8 +857,7 @@ const server = http.createServer((req, res) => {
 process.on("SIGINT", () => {
   console.log("\n🛑 Shutting down ContextForge Proxy...");
   if (global.embeddingWorker) global.embeddingWorker.terminate();
-  if (savingsTracker?.getSummary)
-    console.log("\n" + savingsTracker.getSummary());
+  if (savingsTracker?.getSummary) console.log("\n" + savingsTracker.getSummary());
   else console.log("\n[Stats] Session ended.");
   process.exit(0);
 });

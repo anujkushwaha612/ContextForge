@@ -35,11 +35,16 @@ Thumbs.db
 *.log
 
 # Markdown
+*.txt
 *.md
-report.txt
-terminal.txt
 
 test-*
+.devcontainer/
+.github/
+LICENSE
+.npmignore
+Dockerfile
+docker-compose.yml
 
 native/vendor/*
 native/tree-sitter-arc/*
@@ -47,3 +52,10 @@ native/tree-sitter-arc/*
 CF-savings/
 
 __pycache__/
+debug_payload.json
+benchmarks_old/
+benchmarks/fixtures/repositories/
+benchmarks/fixtures/payloads/
+benchmarks/fixtures/prompts/
+benchmarks/fixtures/sessions/
+benchmarks/results/

@@ -38,6 +38,14 @@ class StatsEmitter extends EventEmitter {
       cacheAligner: { hits: 0, misses: 0, rate: 0, streak: 0 },
     };
 
+    // ── Agent Repository Operations ──
+    this.agentActions = {
+      graphLookups: 0,
+      surgicalReads: 0,
+      astPatches: 0,
+      rawVaultOpens: 0,
+    };
+
     // ── Graph stats ──
     this.graph = {
       nodes: 0,
@@ -58,7 +66,12 @@ class StatsEmitter extends EventEmitter {
   // Recorders — called from pipeline
   // ─────────────────────────────────────────────
 
-  recordRequest({ baselineTokens, finalTokens, pipelineLatency, upstreamLatency }) {
+  recordRequest({
+    baselineTokens,
+    finalTokens,
+    pipelineLatency,
+    upstreamLatency,
+  }) {
     this.session.totalRequests++;
     this.session.tokensBefore += baselineTokens;
     this.session.tokensAfter += finalTokens;
@@ -144,6 +157,13 @@ class StatsEmitter extends EventEmitter {
     }
   }
 
+  recordAgentAction(actionType) {
+    if (this.agentActions[actionType] !== undefined) {
+      this.agentActions[actionType]++;
+      this.broadcast("agent_action");
+    }
+  }
+
   // ─────────────────────────────────────────────
   // Broadcast — emit current snapshot to listeners
   // ─────────────────────────────────────────────
@@ -161,6 +181,7 @@ class StatsEmitter extends EventEmitter {
       stages: { ...this.stages },
       cache: JSON.parse(JSON.stringify(this.cache)),
       graph: { ...this.graph },
+      agentActions: { ...this.agentActions },
       recentEvents: [...this.recentEvents],
       uptime: Date.now() - this.session.startedAt,
     };

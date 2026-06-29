@@ -14,66 +14,50 @@
  *
  * After toInternal(), these parts are concatenated into one giant user
  * message string. Every pipeline stage gates on role === "tool" and
- * skips user messages entirely — so the file content is invisible to:
- *   scrubToolResults, tagToolResults, pruneToolResults,
- *   interceptAndVaultMassiveToolResults, astCompressor, semanticDedup
+ * skips user messages entirely — so the file content is invisible to
+ * the compression pipeline.
  *
  * This extractor runs BEFORE those stages and converts inline file
  * content into synthetic role=tool messages so the full pipeline can
  * operate on them normally.
  *
- * For large files (> GEMINI_FAT_CATCH_THRESHOLD chars), it vaults the raw
- * content immediately and replaces the tool result with a short vault stub,
- * mimicking Claude Code's lazy-fetch behavior for maximum token savings.
+ * Fat Catch threshold:
+ *   5,000 chars — intentionally LOW.
+ *   Gemini CLI reads files client-side and injects them inline, but
+ *   ContextForge has graph tools that make reading the full file
+ *   unnecessary. By vaulting early we force the LLM to use
+ *   contextforge_query_graph(find_symbol) instead of reading the raw
+ *   file — which is faster, cheaper, and more precise.
+ *
+ *   The vault stub message explicitly instructs the LLM to prefer
+ *   graph tools over contextforge_retrieve, matching the Claude Code
+ *   workflow exactly.
  *
  * Input (after toInternal):
  *   { role: "user", content: "prompt\n--- Content from referenced files ---\n..." }
  *
  * Output:
- *   { role: "user", content: "prompt" }           ← user prompt only
- *   { role: "assistant", content: null,            ← synthetic tool call
- *     tool_calls: [{ id: "cf_inline_...", type: "function",
- *                    function: { name: "read_file",
- *                                arguments: '{"file_path":"filename.js"}' } }] }
- *   { role: "tool", tool_call_id: "cf_inline_...", ← synthetic tool result
- *     name: "read_file", content: "stub or compressed content" }
- *
- * The synthetic messages are injected immediately after the user message
- * that contained them. Conversation sequence integrity is preserved:
- *   user → assistant(tool_call) → tool → [next real message]
- *
- * On turns where no file content is embedded, this function is a no-op
- * and returns the payload unmodified.
- *
- * Only runs when clientAdapter.name === "gemini" (enforced at call site
- * in server.js).
+ *   { role: "user", content: "prompt" }
+ *   { role: "assistant", content: null, tool_calls: [{name: "read_file"}] }
+ *   { role: "tool", content: "[CF_VAULT:xxx] ... prefer graph tools" }
  */
 
 import { saveToVault } from "../logging/cacheDb.js";
-
 
 // ─────────────────────────────────────────────
 // Detection patterns
 // ─────────────────────────────────────────────
 
-// Gemini CLI file reference block delimiter
 const FILE_CONTENT_START = "--- Content from referenced files ---";
 const FILE_CONTENT_END   = "--- End of content ---";
 
-// Threshold for immediate vaulting (Fat Catch) of extracted files
-// 5,000 chars ≈ 1,250 tokens — everything above this goes straight to vault
-const GEMINI_FAT_CATCH_THRESHOLD = 5000;
+// 5,000 chars — same as before.
+// Files larger than this are vaulted so the LLM uses graph tools instead.
+// Files smaller than this (small configs, package.json) are fine inline.
+const GEMINI_FAT_CATCH_THRESHOLD = 5_000;
 
-// Header pattern: "Content from @filename.ext:" or "Content from filename.ext:"
-// Captures the filename including path separators and extensions.
 const FILE_HEADER_PATTERN = /^Content from @?(.+?):\s*$/m;
 
-/**
- * Check if a user message string contains Gemini CLI inline file content.
- *
- * @param {string} content
- * @returns {boolean}
- */
 function _hasInlineFileContent(content) {
   return (
     typeof content === "string" &&
@@ -81,21 +65,7 @@ function _hasInlineFileContent(content) {
   );
 }
 
-/**
- * Parse a file content block string (the text between FILE_CONTENT_START
- * and FILE_CONTENT_END) into individual file entries.
- *
- * Input example:
- *   "\nContent from @langraph-agent.js:\n// file content here\n\n--- End of content ---"
- *
- * Output:
- *   [{ filename: "langraph-agent.js", content: "// file content here" }]
- *
- * @param {string} block  — text from after FILE_CONTENT_START to end of message
- * @returns {Array<{ filename: string, content: string }>}
- */
 function _parseFileBlocks(block) {
-  // Strip the end delimiter if present
   const withoutEnd = block.includes(FILE_CONTENT_END)
     ? block.substring(0, block.lastIndexOf(FILE_CONTENT_END))
     : block;
@@ -103,14 +73,13 @@ function _parseFileBlocks(block) {
   const files  = [];
   const lines  = withoutEnd.split("\n");
 
-  let currentFile    = null;
-  let currentLines   = [];
+  let currentFile  = null;
+  let currentLines = [];
 
   for (const line of lines) {
     const headerMatch = line.match(FILE_HEADER_PATTERN);
 
     if (headerMatch) {
-      // Save previous file if any
       if (currentFile !== null) {
         files.push({
           filename: currentFile,
@@ -127,7 +96,6 @@ function _parseFileBlocks(block) {
     }
   }
 
-  // Save last file
   if (currentFile !== null && currentLines.length > 0) {
     files.push({
       filename: currentFile,
@@ -138,18 +106,6 @@ function _parseFileBlocks(block) {
   return files;
 }
 
-/**
- * Extract inline file content from a single user message string.
- *
- * Returns:
- *   { userPrompt, fileBlocks }
- *
- * userPrompt  — the user's actual question/instruction (before the delimiter)
- * fileBlocks  — array of { filename, content } extracted from the file section
- *
- * @param {string} content
- * @returns {{ userPrompt: string, fileBlocks: Array<{ filename: string, content: string }> }}
- */
 function _extractFromUserMessage(content) {
   const delimIdx = content.indexOf(FILE_CONTENT_START);
 
@@ -161,41 +117,46 @@ function _extractFromUserMessage(content) {
 }
 
 // ─────────────────────────────────────────────
+// Vault stub message
+//
+// The stub explicitly directs the LLM toward graph tools.
+// This is the key difference from the old stub which just said
+// "use contextforge_retrieve" — that caused the retrieve loop.
+//
+// With graph tools injected (fixed by messageOrigin), the LLM
+// will call find_symbol instead of retrieve, matching Claude Code.
+// ─────────────────────────────────────────────
+
+function _buildVaultStub(vaultId, filename, sizeChars) {
+  const tokens = Math.round(sizeChars / 4);
+  return (
+    `[CF_VAULT:${vaultId}] ${filename} (${tokens} tokens) is available but not loaded inline.\n` +
+    `PREFERRED: Use contextforge_query_graph with find_symbol to locate specific functions ` +
+    `without loading the full file — faster and cheaper.\n` +
+    `FALLBACK: Use contextforge_retrieve with vault_id="${vaultId}" only if you need ` +
+    `content that find_symbol cannot locate (e.g. inline route handlers, config objects).`
+  );
+}
+
+// ─────────────────────────────────────────────
 // Main export
 // ─────────────────────────────────────────────
 
-/**
- * Extract Gemini CLI inline file content from user messages and convert
- * to synthetic role=tool messages so the compression pipeline can process them.
- *
- * For files exceeding GEMINI_FAT_CATCH_THRESHOLD (5,000 chars), the raw content
- * is vaulted immediately and replaced with a short stub. This prevents large
- * files from ever reaching the LLM inline, boosting turn-1 compression to 80%+.
- *
- * This is a no-op for:
- *   - Non-user messages
- *   - User messages with no file content delimiter
- *   - Empty payloads
- *
- * @param {object} payload — OpenAI-format internal payload (after toInternal)
- * @returns {object}       — payload with inline file content extracted
- */
 export function extractGeminiInlineContent(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
-  // Fast path: no user messages with inline content → return unchanged
   const hasAny = payload.messages.some(
     (m) => m.role === "user" && _hasInlineFileContent(m.content),
   );
   if (!hasAny) return payload;
 
-  const newMessages = [];
+  const newMessages  = [];
   let extractedCount = 0;
   let extractedChars = 0;
-  let vaultedFiles = 0;
+  let vaultedFiles   = 0;
+  let inlineFiles    = 0;
 
   for (const msg of payload.messages) {
-    // ── Non-user or no inline content → pass through unchanged ──
     if (msg.role !== "user" || !_hasInlineFileContent(msg.content)) {
       newMessages.push(msg);
       continue;
@@ -204,40 +165,44 @@ export function extractGeminiInlineContent(payload) {
     const { userPrompt, fileBlocks } = _extractFromUserMessage(msg.content);
 
     if (fileBlocks.length === 0) {
-      // Delimiter found but no parseable files — pass through unchanged
       newMessages.push(msg);
       continue;
     }
 
-    // ── Push the user message with only the prompt text ──
-    // If userPrompt is empty (message was ONLY file content),
-    // keep a minimal placeholder so the conversation role sequence
-    // stays valid (cannot have two consecutive assistant messages).
     newMessages.push({
       ...msg,
       content: userPrompt || "[file reference]",
     });
 
-    // ── Push synthetic assistant + tool pairs for each file ──
     for (const file of fileBlocks) {
       const syntheticId = `cf_inline_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
       let toolContent = file.content;
+      let isVaulted   = false;
 
-      // ── Fat Catch vaulting for large extracted files ──
       if (file.content.length > GEMINI_FAT_CATCH_THRESHOLD) {
+        // ── Vault large files ──
+        // Use graph tools (find_symbol) instead of loading inline.
+        // The stub message explicitly tells the LLM to prefer graph tools.
         const vaultId = saveToVault(file.content);
         console.log(
           `[GeminiExtractor] 🗜️  Fat Catch: ${file.filename} ` +
-          `(${file.content.length} chars → Vault ${vaultId})`
+          `(${file.content.length} chars → Vault ${vaultId})`,
         );
-        toolContent =
-          `[CF_VAULT:${vaultId}] ${Math.round(file.content.length / 4)} tokens compressed. ` +
-          `Use tool call contextforge_retrieve with vault_id="${vaultId}" to read this content.`
+        toolContent = _buildVaultStub(vaultId, file.filename, file.content.length);
         vaultedFiles++;
+        isVaulted = true;
+      } else {
+        // ── Small files pass inline ──
+        // package.json, .env, small configs — no graph tools needed.
+        inlineFiles++;
+        console.log(
+          `[GeminiExtractor] 📄 Inline: ${file.filename} ` +
+          `(${file.content.length} chars)`,
+        );
       }
 
-      // Synthetic tool call (assistant turn)
+      // Synthetic tool call
       newMessages.push({
         role:    "assistant",
         content: null,
@@ -253,17 +218,16 @@ export function extractGeminiInlineContent(payload) {
         ],
       });
 
-      // Synthetic tool result — the file content goes here,
-      // now visible to every pipeline stage that gates on role=tool
+      // Synthetic tool result
       newMessages.push({
         role:         "tool",
         tool_call_id: syntheticId,
         name:         "read_file",
         content:      toolContent,
-        // Pre-populate metadata so tagToolResults backfill works immediately
         _filename:    file.filename,
         _toolName:    "read_file",
         _args:        { file_path: file.filename },
+        _vaulted:     isVaulted,
       });
 
       extractedCount++;
@@ -276,7 +240,8 @@ export function extractGeminiInlineContent(payload) {
       `[GeminiExtractor] 📄 Extracted ${extractedCount} inline file(s) ` +
       `(${extractedChars} chars, ~${Math.round(extractedChars / 4)} tokens) ` +
       `→ synthetic tool messages` +
-      (vaultedFiles > 0 ? ` (${vaultedFiles} vaulted via Fat Catch)` : "")
+      (inlineFiles  > 0 ? ` (${inlineFiles} inline)`  : "") +
+      (vaultedFiles > 0 ? ` (${vaultedFiles} vaulted → use graph tools)` : ""),
     );
   }
 

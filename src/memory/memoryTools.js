@@ -201,7 +201,9 @@ export async function executeMemoryToolCalls(
     let args = {};
     try {
       args = JSON.parse(tc.function?.arguments || "{}");
-    } catch (_) {}
+    } catch (err) {
+      console.warn(`[Memory] ⚠️  Malformed JSON args for ${name}:`, err.message);
+    }
 
     const callId = tc.id;
     let content = "";
@@ -214,11 +216,19 @@ export async function executeMemoryToolCalls(
           content: args.content || "",
           importance: args.importance ?? 0.5,
         });
-        content = JSON.stringify({
-          status: "saved",
-          memory_id: id,
-          content: (args.content || "").slice(0, 100),
-        });
+        
+        if (!id) {
+          content = JSON.stringify({
+            status: "error",
+            error: "Failed to save — content was empty",
+          });
+        } else {
+          content = JSON.stringify({
+            status: "saved",
+            memory_id: id,
+            content: (args.content || "").slice(0, 100),
+          });
+        }
       } else if (name === "memory_search") {
         const found = await memoryHandler.search({
           userId,

@@ -10,13 +10,16 @@
 import Database from "better-sqlite3";
 import path from "node:path";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 let _db = null;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export function getGraphDb(dbPath = null) {
   if (_db) return _db;
 
-  const resolvedPath = dbPath || path.join(process.cwd(), "graph.db");
+  const resolvedPath = dbPath || path.join(__dirname, "../data/graph.db");
   _db = new Database(resolvedPath);
 
   _db.exec("PRAGMA journal_mode = WAL");
@@ -258,13 +261,9 @@ function stmts() {
 
 export function writeFileGraph(fileData) {
   const db = getGraphDb();
-  const s  = stmts();
+  const s = stmts();
 
-  const fileId = crypto
-    .createHash("sha256")
-    .update(fileData.filePath)
-    .digest("hex")
-    .slice(0, 16);
+  const fileId = crypto.createHash("sha256").update(fileData.filePath).digest("hex").slice(0, 16);
 
   const writeTransaction = db.transaction(() => {
     s.upsertFile.run(
@@ -273,7 +272,7 @@ export function writeFileGraph(fileData) {
       fileData.language,
       fileData.lastModified,
       Date.now(),
-      fileData.nodes.length,
+      fileData.nodes.length
     );
 
     s.deleteFileNodes.run(fileId);
@@ -290,9 +289,9 @@ export function writeFileGraph(fileData) {
         node.startLine,
         node.endLine,
         node.isExported ? 1 : 0,
-        node.isAsync    ? 1 : 0,
+        node.isAsync ? 1 : 0,
         node.complexity || 0,
-        node.bodyText   || null,
+        node.bodyText || null
       );
     }
 
@@ -301,9 +300,12 @@ export function writeFileGraph(fileData) {
         .createHash("sha256")
         .update(
           fileData.filePath +
-          "|" + (edge.sourceSymbol || "") +
-          "|" + edge.targetSymbol +
-          "|" + edge.relation,
+            "|" +
+            (edge.sourceSymbol || "") +
+            "|" +
+            edge.targetSymbol +
+            "|" +
+            edge.relation
         )
         .digest("hex")
         .slice(0, 16);
@@ -311,11 +313,11 @@ export function writeFileGraph(fileData) {
       s.insertEdge.run(
         edgeId,
         fileData.filePath,
-        edge.targetFile   || null,
+        edge.targetFile || null,
         edge.sourceSymbol || null,
         edge.targetSymbol,
         edge.relation,
-        edge.sourceLine   ?? null,   // ← new: null for non-route edges
+        edge.sourceLine ?? null // ← new: null for non-route edges
       );
     }
   });
@@ -381,7 +383,9 @@ export function getAllIndexedFiles() {
 }
 
 export function getAllNodeNames() {
-  return stmts().allNodeNames.all().map((r) => r.name);
+  return stmts()
+    .allNodeNames.all()
+    .map((r) => r.name);
 }
 
 export function getFileRecord(filePath) {
@@ -396,7 +400,25 @@ function normalizeFilePath(filePath) {
 export function closeGraphDb() {
   if (_db) {
     _db.close();
-    _db    = null;
+    _db = null;
     _stmts = null;
   }
+}
+
+/**
+ * Wipe all graph data from the database without closing the connection.
+ * Used by benchmarks to ensure each repo is measured in isolation.
+ *
+ * Does NOT drop tables — preserves schema and prepared statements.
+ * Faster than closeGraphDb + delete file + reopen.
+ */
+export function clearGraph() {
+  const db = getGraphDb();
+  db.exec(`
+    DELETE FROM edges;
+    DELETE FROM nodes;
+    DELETE FROM files;
+  `);
+  // Reset prepared statement cache — stmts hold references to the same DB
+  // so they remain valid, but sqlite3 internal page cache is cleared
 }

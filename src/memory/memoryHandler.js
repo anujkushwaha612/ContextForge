@@ -111,7 +111,10 @@ export class MemoryHandler {
     importance = 0.5,
     metadata = {},
   }) {
-    if (!content?.trim()) return null;
+    if (!content?.trim()) {
+      console.warn("[Memory] ⚠️  Attempted to save empty content — skipping.");
+      return null;
+    }
 
     const id = "mem_" + crypto.randomBytes(8).toString("hex");
     const embedding = await this._embed(content); // now async
@@ -143,6 +146,11 @@ export class MemoryHandler {
   // ─────────────────────────────────────────────
 
   async search({ userId, workspace = "", query, topK = 10, minScore = null }) {
+    if (!query?.trim()) {
+      console.warn("[Memory] ⚠️  Empty search query — returning no results.");
+      return [];
+    }
+
     const floor = minScore ?? this._minScore;
     const embedding = await this._embed(query); // now async
 
@@ -196,7 +204,10 @@ export class MemoryHandler {
   // ─────────────────────────────────────────────
 
   async update({ id, content }) {
-    if (!content?.trim()) return false;
+    if (!content?.trim()) {
+      console.warn("[Memory] ⚠️  Attempted to update with empty content — skipping.");
+      return false;
+    }
     const embedding = await this._embed(content); // now async
     const ok = this._store.update({ id, content, embedding });
     if (ok) {
@@ -207,7 +218,10 @@ export class MemoryHandler {
     return ok;
   }
 
-  // REPLACE searchAndFormatContext():
+  // ─────────────────────────────────────────────
+  // Search and format context for injection
+  // ─────────────────────────────────────────────
+
   async searchAndFormatContext(userId, messages, workspace = "") {
     if (!userId) return null;
 
@@ -285,7 +299,15 @@ export class MemoryHandler {
       return updated;
     }
 
-    return messages;
+    // Fallback: no user message found → inject as new user message
+    console.warn(
+      "[Memory] ⚠️  No user message found in conversation history — " +
+      "injecting memory context as new user message at end of array."
+    );
+    return [
+      ...messages,
+      { role: "user", content: contextText }
+    ];
   }
 
   // ─────────────────────────────────────────────

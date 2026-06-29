@@ -71,10 +71,15 @@ const INTENT_PATTERNS = [
   // ── PATCH signals (targeted edits — scope is known) ──────────────────────
   {
     intent: "PATCH",
+    weight: 4,
+    regex: /\brename\b|\binstead of\b|\bmake\b.*\baccept\b/i,
+  },
+  {
+    intent: "PATCH",
     weight: 2,
     regex: /\bfix\s+(typo|spelling|indent|format)/i,
   },
-  { intent: "PATCH", weight: 2, regex: /\brename\b|\bchange\s+\w+\s+to\b/i },
+  { intent: "PATCH", weight: 2, regex: /\bchange\b|\bsplit\b|\bextract\b|\brefactor\b|\bconvert\b|\binline\b/i },
   {
     intent: "PATCH",
     weight: 2,
@@ -114,8 +119,13 @@ const INTENT_PATTERNS = [
   { intent: "DEBUG", weight: 1, regex: /\bdebug\b|\btrace\b|\bdiagnose\b/i },
   {
     intent: "DEBUG",
-    weight: 1,
-    regex: /\bwhat's wrong\b|\bsomething\s+(weird|off)\b/i,
+    weight: 4,
+    regex: /not being called|not running|dropping|memory leak|cors error|stale data|slower/i,
+  },
+  {
+    intent: "DEBUG",
+    weight: 2,
+    regex: /\bwhat's wrong\b|\bsomething\s+(is\s+)?(weird|off|wrong)\b/i,
   },
   {
     intent: "DEBUG",
@@ -127,11 +137,12 @@ const INTENT_PATTERNS = [
   // ── SEARCH signals ────────────────────────────────────────────────────────
   { intent: "SEARCH", weight: 2, regex: /\bfind\b|\blocate\b|\bwhere\b/i },
   { intent: "SEARCH", weight: 2, regex: /which file|show me|list all/i },
+  { intent: "SEARCH", weight: 2, regex: /\bcall\b|\bdepend\b|\binternally\b/i },
   { intent: "SEARCH", weight: 1, regex: /\bsymbol\b|\broute\b|\bendpoint\b/i },
   {
     intent: "SEARCH",
     weight: 1,
-    regex: /\bdefined\b|\bdeclared\b|\bimported\b/i,
+    regex: /\bdefined\b|\bdeclared\b|\bimported\b|\bimport\b|\bexport\b/i,
   },
 
   // ── CREATE signals ────────────────────────────────────────────────────────
@@ -141,7 +152,7 @@ const INTENT_PATTERNS = [
     regex: /\bcreate\b|\bgenerate\b|\bscaffold\b/i,
   },
   { intent: "CREATE", weight: 2, regex: /\bbuild\b|\bimplement\b|\bwrite\b/i },
-  { intent: "CREATE", weight: 1, regex: /make a new|add a new|start a new/i },
+  { intent: "CREATE", weight: 3, regex: /make a .*new|add a .*new|start a .*new/i },
 
   // ── CHAT signals (low weight — only wins when nothing else matches) ────────
   {
@@ -155,6 +166,16 @@ const INTENT_PATTERNS = [
     regex: /\btranslate\b|\bwhat does\b|\bhow does\b/i,
   },
   { intent: "CHAT", weight: 1, regex: /tell me about|what is the difference/i },
+  {
+    intent: "CHAT",
+    weight: 1,
+    regex: /\bok\b|\bthanks\b|\bthank you\b|\bgood job\b|\bdone\b|\bperfect\b/i,
+  },
+  {
+    intent: "CHAT",
+    weight: 1,
+    regex: /looks good|that works|exactly right|got it|never mind|try again|not quite/i,
+  },
 ];
 
 /**
@@ -280,6 +301,12 @@ const SEMANTIC_ANCHORS = {
     "translate this text",
     "summarize this document",
     "describe the architecture",
+    "ok thanks",
+    "looks good to me",
+    "that is perfect",
+    "never mind",
+    "can you try again",
+    "no that is not right",
   ],
 };
 
