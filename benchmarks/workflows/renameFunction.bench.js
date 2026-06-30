@@ -202,25 +202,31 @@ async function executeRenameWorkflow() {
     messages: [
       {
         role: "user",
-        content: `Find all usages of the function \`${FUNCTION_TO_RENAME}\` in this codebase. List every file and line number where it is defined or called.`,
+        content: `Find all usages of the function \`${FUNCTION_TO_RENAME}\` strictly in the src folder. List every file and line number where it is defined or called.`,
       },
     ],
   });
 
   const turn1Latency = performance.now() - turn1Start;
 
-  // Extract pipeline metrics from dry-run response body
-  const t1metrics = turn1Response.body ?? {};
+  // Extract pipeline metrics from custom HTTP headers
+  const h1 = turn1Response.headers ?? {};
+  const t1Before = h1["x-cf-tokens-before"] ? parseInt(h1["x-cf-tokens-before"], 10) : null;
+  const t1After = h1["x-cf-tokens-after"] ? parseInt(h1["x-cf-tokens-after"], 10) : null;
+  const t1Saved = h1["x-cf-tokens-saved"] ? parseInt(h1["x-cf-tokens-saved"], 10) : null;
+  const t1Ratio = h1["x-cf-compression-ratio"] ? parseFloat(h1["x-cf-compression-ratio"]) : null;
+  const t1Ms = h1["x-cf-pipeline-ms"] ? parseFloat(h1["x-cf-pipeline-ms"]) : null;
+
   turnMetrics.push({
     turn: 1,
     description: "find all usages",
     status: turn1Response.status,
     latency_ms: parseFloat(turn1Latency.toFixed(2)),
-    tokens_before: t1metrics.tokens_before ?? null,
-    tokens_after: t1metrics.tokens_after ?? null,
-    tokens_saved: t1metrics.tokens_saved ?? null,
-    compression_ratio: t1metrics.compression_ratio ?? null,
-    pipeline_ms: t1metrics.pipeline_ms ?? null,
+    tokens_before: t1Before,
+    tokens_after: t1After,
+    tokens_saved: t1Saved,
+    compression_ratio: t1Ratio,
+    pipeline_ms: t1Ms,
   });
 
   // ── Turn 2: Apply rename across all files ────────────────────────────────
@@ -237,7 +243,7 @@ async function executeRenameWorkflow() {
     messages: [
       {
         role: "user",
-        content: `Find all usages of the function \`${FUNCTION_TO_RENAME}\` in this codebase. List every file and line number where it is defined or called.`,
+        content: `Find all usages of the function \`${FUNCTION_TO_RENAME}\` strictly in the src folder. List every file and line number where it is defined or called.`,
       },
       {
         role: "assistant",
@@ -246,7 +252,7 @@ async function executeRenameWorkflow() {
       {
         role: "user",
         content:
-          `Rename the function \`${FUNCTION_TO_RENAME}\` to \`${NEW_FUNCTION_NAME}\` everywhere — ` +
+          `Rename the function \`${FUNCTION_TO_RENAME}\` to \`${NEW_FUNCTION_NAME}\` everywhere in the src folder — ` +
           `the definition and all call sites. Apply the changes using the patch tool.`,
       },
     ],
@@ -254,17 +260,23 @@ async function executeRenameWorkflow() {
 
   const turn2Latency = performance.now() - turn2Start;
   const t2metrics = turn2Response.body ?? {};
+  const h2 = turn2Response.headers ?? {};
+  const t2Before = h2["x-cf-tokens-before"] ? parseInt(h2["x-cf-tokens-before"], 10) : null;
+  const t2After = h2["x-cf-tokens-after"] ? parseInt(h2["x-cf-tokens-after"], 10) : null;
+  const t2Saved = h2["x-cf-tokens-saved"] ? parseInt(h2["x-cf-tokens-saved"], 10) : null;
+  const t2Ratio = h2["x-cf-compression-ratio"] ? parseFloat(h2["x-cf-compression-ratio"]) : null;
+  const t2Ms = h2["x-cf-pipeline-ms"] ? parseFloat(h2["x-cf-pipeline-ms"]) : null;
 
   turnMetrics.push({
     turn: 2,
     description: "apply rename",
     status: turn2Response.status,
     latency_ms: parseFloat(turn2Latency.toFixed(2)),
-    tokens_before: t2metrics.tokens_before ?? null,
-    tokens_after: t2metrics.tokens_after ?? null,
-    tokens_saved: t2metrics.tokens_saved ?? null,
-    compression_ratio: t2metrics.compression_ratio ?? null,
-    pipeline_ms: t2metrics.pipeline_ms ?? null,
+    tokens_before: t2Before,
+    tokens_after: t2After,
+    tokens_saved: t2Saved,
+    compression_ratio: t2Ratio,
+    pipeline_ms: t2Ms,
   });
 
   const totalLatency = performance.now() - workflowStart;

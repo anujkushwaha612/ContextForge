@@ -21,13 +21,14 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { statsEmitter } from "../proxy/statsEmitter.js";
 import { extractSymbols, getLanguageForFile } from "./symbolExtractor.js";
-import {
-  writeFileGraph,
-  getAllIndexedFiles,
-  getGraphStats,
-  getAllNodeNames,
-} from "./graphDb.js";
+import { writeFileGraph, getAllIndexedFiles, getGraphStats, getAllNodeNames } from "./graphDb.js";
 import { invalidateCacheForFile } from "../proxy/upstreamRequest.js";
+import {
+  extractLiterals,
+  buildNodeSummaries,
+  buildRetrievalDocuments,
+} from "./literalExtractor.js";
+import { setGraphEmbedder } from "./semanticResolver.js";
 
 // ─────────────────────────────────────────────
 // Directory ignore list
@@ -51,13 +52,103 @@ const IGNORE_DIRS = new Set([
   "models",
 ]);
 
-const IGNORE_PATTERNS = [
-  /\.min\.(js|css)$/,
-  /\.bundle\.js$/,
-  /\.d\.ts$/,
-  /\.map$/,
-  /\.lock$/,
-];
+const IGNORE_PATTERNS = [/\.min\.(js|css)$/, /\.bundle\.js$/, /\.d\.ts$/, /\.map$/, /\.lock$/];
+
+// ─────────────────────────────────────────────
+// Symbol embedding registry
+//
+// Holds the embedder + retriever injected from server.js after startup.
+// workspaceMapper needs these to index symbols into HNSW during
+// indexWorkspace and watchWorkspace re-index calls.
+//
+// Set via setSymbolEmbedder() called from server.js after OnnxEmbedder
+// warms up. If not set, symbol embedding is silently skipped —
+// SQLite indexes still work, only semantic fallback is unavailable.
+// ─────────────────────────────────────────────
+
+let _symbolEmbedder = null;
+let _symbolRetriever = null;
+
+/**
+ * Wire the embedder and retriever into the workspace mapper.
+ * Called once from server.js after OnnxEmbedder warmup completes.
+ *
+ * @param {Object} embedder  - OnnxEmbedder instance
+ * @param {Object} retriever - HybridRetriever instance (separate from vault retriever)
+ */
+export function setSymbolEmbedder(embedder, retriever) {
+  _symbolEmbedder = embedder;
+  _symbolRetriever = retriever;
+  setGraphEmbedder(embedder, retriever);  // ← wire resolver too
+  console.log("[GraphMapper] 🧠 Symbol embedding pipeline ready");
+}
+
+// ─────────────────────────────────────────────
+// Symbol embedding pipeline
+//
+// Embeds rich retrieval documents into HybridRetriever (HNSW + BM25).
+// Uses addDocumentWithEmbedding so both dense (HNSW) and sparse (BM25)
+// indexes are populated in one call.
+//
+// Stable ID format: "filePath:startLine:name"
+// This matches queryNodeByStableId in graphDb.js so HNSW hits can be
+// resolved back to full node records without a separate name lookup.
+//
+// Called at end of indexWorkspace (awaited) and from watchWorkspace
+// (fire-and-forget via setImmediate to avoid blocking re-index).
+// ─────────────────────────────────────────────
+
+const EMBED_BATCH_SIZE = 16;
+
+/**
+ * Embed retrieval documents for a batch of nodes into HNSW + BM25.
+ *
+ * @param {Array<{ stableId, name, document }>} docs
+ * @returns {Promise<number>} count of successfully embedded documents
+ */
+async function embedRetrievalDocuments(docs) {
+  if (!_symbolEmbedder || !_symbolRetriever || docs.length === 0) return 0;
+
+  let embedded = 0;
+
+  for (let i = 0; i < docs.length; i += EMBED_BATCH_SIZE) {
+    const batch = docs.slice(i, i + EMBED_BATCH_SIZE);
+
+    try {
+      const texts = batch.map((d) => d.document);
+      const vectors = await _symbolEmbedder.embedBatch(texts);
+
+      for (let j = 0; j < batch.length; j++) {
+        const { stableId, document } = batch[j];
+        const vector = vectors[j];
+
+        if (!vector) continue;
+
+        // Float32Array check — embedBatch may return regular arrays
+        const float32 = vector instanceof Float32Array ? vector : new Float32Array(vector);
+        
+        try {
+          // addDocumentWithEmbedding populates both HNSW (dense) and BM25 (sparse)
+          _symbolRetriever.addDocumentWithEmbedding(stableId, document, float32);
+          embedded++;
+        } catch (err) {
+          if (process.env.CF_DEBUG_GRAPH === "1") {
+            console.warn(`[GraphMapper] ⚠️ Failed to embed ${stableId}: ${err.message}`);
+          }
+        }
+      }
+    } catch (err) {
+      if (process.env.CF_DEBUG_GRAPH === "1") {
+        console.warn(`[GraphMapper] ⚠️ Batch embedding failed (batch ${i}): ${err.message}`);
+      }
+    }
+
+    // Yield between batches — keeps event loop responsive during large workspaces
+    await new Promise((r) => setImmediate(r));
+  }
+
+  return embedded;
+}
 
 // ─────────────────────────────────────────────
 // File hash cache — used by watchWorkspace to
@@ -99,8 +190,7 @@ const ROUTE_PATTERN =
 // http.createServer style: req.url === '/path' or req.url.startsWith('/path')
 // This is what server.js uses — completely missed by ROUTE_PATTERN above.
 // Captures the URL string literal from bare conditional checks.
-const BARE_URL_PATTERN =
-  /req\.url\s*(?:===|!==|startsWith\s*\()\s*['"`]([^'"`]+)['"`]/g;
+const BARE_URL_PATTERN = /req\.url\s*(?:===|!==|startsWith\s*\()\s*['"`]([^'"`]+)['"`]/g;
 
 // ─────────────────────────────────────────────
 // Call expression patterns
@@ -256,11 +346,9 @@ function extractRouteEdges(source, filePath) {
     // Detect HTTP method from context — look for req.method === "X" nearby
     const contextWindow = source.slice(
       Math.max(0, match.index - 10),
-      match.index + match[0].length + 100,
+      match.index + match[0].length + 100
     );
-    const methodMatch = contextWindow.match(
-      /req\.method\s*===\s*['"`]([A-Z]+)['"`]/,
-    );
+    const methodMatch = contextWindow.match(/req\.method\s*===\s*['"`]([A-Z]+)['"`]/);
     const method = methodMatch ? methodMatch[1] : "ANY";
 
     routeEdges.push({
@@ -361,19 +449,21 @@ export async function indexWorkspace(workspacePath, options = {}) {
       const { nodes, edges } = extractSymbols(source, filePath);
 
       // G7: warn for JS/TS files with no named declarations
-      const isSynthetic =
-        nodes.length === 1 && nodes[0].name.startsWith("__module_");
+      const isSynthetic = nodes.length === 1 && nodes[0].name.startsWith("__module_");
       if (isSynthetic && source.length > 1000) {
         const lang = getLanguageForFile(filePath)?.language;
-        const isJsTs =
-          lang === "javascript" || lang === "typescript" || lang === "tsx";
+        const isJsTs = lang === "javascript" || lang === "typescript" || lang === "tsx";
         if (isJsTs) {
           console.warn(
             `[GraphMapper] ⚠️  ${path.basename(filePath)} has no named declarations ` +
-              `(${source.length} chars) — synthetic __module node created.`,
+              `(${source.length} chars) — synthetic __module node created.`
           );
         }
       }
+
+      const { literals, configRefs } = extractLiterals(source, filePath, nodes);
+      const summaries = buildNodeSummaries(nodes, literals, configRefs, filePath);
+      const retrievalDocs = buildRetrievalDocuments(nodes, literals, configRefs, filePath);
 
       const routeEdges = extractRouteEdges(source, filePath);
       const pass1Edges = [...edges, ...routeEdges];
@@ -384,9 +474,21 @@ export async function indexWorkspace(workspacePath, options = {}) {
         lastModified: mtime,
         nodes,
         edges: pass1Edges,
+        literals, // ← new
+        configRefs, // ← new
+        summaries, // ← new
       });
 
-      fileData.set(filePath, { source, nodes, mtime });
+      // ── NEW: include literals/configRefs in fileData for Pass 2 ──
+      fileData.set(filePath, {
+        source,
+        nodes,
+        mtime,
+        literals,
+        configRefs,
+        summaries,
+        retrievalDocs,
+      });
       stats.indexed++;
 
       if (onProgress && i % 10 === 0) {
@@ -401,28 +503,19 @@ export async function indexWorkspace(workspacePath, options = {}) {
     } catch (err) {
       stats.errors++;
       if (process.env.CF_DEBUG_GRAPH === "1") {
-        console.warn(
-          `[GraphMapper] ⚠️ Failed to index ${filePath}: ${err.message}`,
-        );
+        console.warn(`[GraphMapper] ⚠️ Failed to index ${filePath}: ${err.message}`);
       }
     }
   }
 
-  console.log(`[GraphMapper] Pass 2/2 — computing cross-file call edges…`);
+  console.log(`[GraphMapper] Pass 2/3 — computing cross-file call edges…`);
 
   const allKnownSymbols = new Set(getAllNodeNames());
-  console.log(
-    `[GraphMapper] Global symbol set: ${allKnownSymbols.size} symbols`,
-  );
+  console.log(`[GraphMapper] Global symbol set: ${allKnownSymbols.size} symbols`);
 
-  for (const [filePath, { source, nodes, mtime }] of fileData) {
+  for (const [filePath, { source, nodes, mtime, literals, configRefs, summaries }] of fileData) {
     try {
-      const callEdges = extractCallEdges(
-        source,
-        filePath,
-        nodes,
-        allKnownSymbols,
-      );
+      const callEdges = extractCallEdges(source, filePath, nodes, allKnownSymbols);
       if (callEdges.length === 0) continue;
 
       const { edges: symbolEdges } = extractSymbols(source, filePath);
@@ -435,15 +528,34 @@ export async function indexWorkspace(workspacePath, options = {}) {
         lastModified: mtime,
         nodes,
         edges: allEdges,
+        literals, // ← new (pass through from fileData)
+        configRefs, // ← new
+        summaries, // ← new
       });
     } catch (err) {
       if (process.env.CF_DEBUG_GRAPH === "1") {
-        console.warn(
-          `[GraphMapper] ⚠️ Pass 2 failed for ${filePath}: ${err.message}`,
-        );
+        console.warn(`[GraphMapper] ⚠️ Pass 2 failed for ${filePath}: ${err.message}`);
       }
     }
     await new Promise((r) => setImmediate(r));
+  }
+
+  // ── Pass 3: Symbol embedding into HNSW + BM25 ──────────────────────────
+  // Runs after Pass 2 so all call edges are committed to SQLite first.
+  // Awaited (not fire-and-forget) so the workspace is fully ready before
+  // server starts accepting requests — avoids the race condition where
+  // a user queries immediately after startup before embeddings are flushed.
+  if (_symbolEmbedder && _symbolRetriever) {
+    const allDocs = [];
+    for (const [, { retrievalDocs }] of fileData) {
+      if (retrievalDocs) allDocs.push(...retrievalDocs);
+    }
+
+    if (allDocs.length > 0) {
+      console.log(`[GraphMapper] 🧠 Pass 3/3 — embedding ${allDocs.length} symbols into HNSW…`);
+      const embedded = await embedRetrievalDocuments(allDocs);
+      console.log(`[GraphMapper] ✅ Embedded ${embedded}/${allDocs.length} symbols`);
+    }
   }
 
   const elapsed = Date.now() - startTime;
@@ -454,7 +566,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
       `Files: ${stats.indexed} indexed, ${stats.skipped} skipped, ${stats.errors} errors | ` +
       `Graph: ${graphStats.node_count} nodes, ${graphStats.edge_count} edges ` +
       `(${graphStats.calls_count} calls, ${graphStats.imports_count} imports, ` +
-      `${graphStats.routes_count} routes)`,
+      `${graphStats.routes_count} routes)`
   );
 
   statsEmitter.updateGraphStats({
@@ -498,7 +610,7 @@ export function watchWorkspace(workspacePath) {
     if (process.env.CF_DEBUG_GRAPH === "1") {
       console.log(
         `[GraphMapper] 🔄 processChanges triggered for ${files.length} file(s): ` +
-          files.map((f) => path.basename(f)).join(", "),
+          files.map((f) => path.basename(f)).join(", ")
       );
     }
 
@@ -516,9 +628,7 @@ export function watchWorkspace(workspacePath) {
       // SHA-256 hashes we only re-index when content actually changed.
       if (!hasFileChanged(filePath)) {
         if (process.env.CF_DEBUG_GRAPH === "1") {
-          console.log(
-            `[GraphMapper] ⏭️  Skipped ${path.basename(filePath)} (content unchanged)`,
-          );
+          console.log(`[GraphMapper] ⏭️  Skipped ${path.basename(filePath)} (content unchanged)`);
         }
         continue;
       }
@@ -529,9 +639,7 @@ export function watchWorkspace(workspacePath) {
         const source = fs.readFileSync(filePath, "utf-8");
 
         if (source.length === 0) {
-          console.warn(
-            `[GraphMapper] ⚠️  ${path.basename(filePath)} read as empty — skipping`,
-          );
+          console.warn(`[GraphMapper] ⚠️  ${path.basename(filePath)} read as empty — skipping`);
           // Remove stale hash so next watch event retries
           fileHashes.delete(filePath);
           continue;
@@ -539,25 +647,22 @@ export function watchWorkspace(workspacePath) {
 
         const { nodes, edges } = extractSymbols(source, filePath);
 
-        const isSynthetic =
-          nodes.length === 1 && nodes[0].name.startsWith("__module_");
+        const isSynthetic = nodes.length === 1 && nodes[0].name.startsWith("__module_");
         if (isSynthetic && source.length > 1000) {
           const lang = getLanguageForFile(filePath)?.language;
-          const isJsTs =
-            lang === "javascript" || lang === "typescript" || lang === "tsx";
+          const isJsTs = lang === "javascript" || lang === "typescript" || lang === "tsx";
           if (isJsTs) {
             console.warn(
-              `[GraphMapper] ⚠️  ${path.basename(filePath)} re-indexed with synthetic __module node`,
+              `[GraphMapper] ⚠️  ${path.basename(filePath)} re-indexed with synthetic __module node`
             );
           }
         }
 
-        const callEdges = extractCallEdges(
-          source,
-          filePath,
-          nodes,
-          allKnownSymbols,
-        );
+        // ── NEW: re-extract literals on file change ──
+        const { literals, configRefs } = extractLiterals(source, filePath, nodes);
+        const summaries = buildNodeSummaries(nodes, literals, configRefs, filePath);
+
+        const callEdges = extractCallEdges(source, filePath, nodes, allKnownSymbols);
         const routeEdges = extractRouteEdges(source, filePath);
         const allEdges = [...edges, ...callEdges, ...routeEdges];
 
@@ -567,11 +672,39 @@ export function watchWorkspace(workspacePath) {
           lastModified: stat.mtimeMs,
           nodes,
           edges: allEdges,
+          literals,
+          configRefs,
+          summaries,
         });
 
+        // ADD immediately after writeFileGraph call:
+        // ── Re-embed changed file's symbols (fire-and-forget) ──
+        // Not awaited — re-indexing must not block the watch debounce loop.
+        // The 200ms write-flush wait above ensures file is fully written.
+        if (_symbolEmbedder && _symbolRetriever) {
+          const retrievalDocs = buildRetrievalDocuments(
+            nodes,
+            literals,
+            configRefs,
+            filePath.replace(/\\/g, "/")
+          );
+          if (retrievalDocs.length > 0) {
+            embedRetrievalDocuments(retrievalDocs)
+              .then((count) => {
+                if (process.env.CF_DEBUG_GRAPH === "1") {
+                  console.log(
+                    `[GraphMapper] 🧠 Re-embedded ${count} symbols from ${path.basename(filePath)}`
+                  );
+                }
+              })
+              .catch(() => {
+                // Non-critical — SQLite indexes still valid
+              });
+          }
+        }
         console.log(
           `[GraphMapper] 🔄 Re-indexed: ${path.relative(workspacePath, filePath)} ` +
-            `(${nodes.length} nodes, ${allEdges.length} edges, ${callEdges.length} call edges)`,
+            `(${nodes.length} nodes, ${allEdges.length} edges, ${callEdges.length} call edges)`
         );
 
         // Surgical invalidation — only clears cache entries for this file.
@@ -593,7 +726,7 @@ export function watchWorkspace(workspacePath) {
         if (err.code !== "ENOENT") {
           console.warn(
             `[GraphMapper] ⚠️  Re-index failed for ${path.basename(filePath)}: ` +
-              `${err.code || err.message}`,
+              `${err.code || err.message}`
           );
         }
         // Remove stale hash on error so next watch event retries
@@ -602,27 +735,21 @@ export function watchWorkspace(workspacePath) {
     }
   };
 
-  const watcher = fs.watch(
-    workspacePath,
-    { recursive: true },
-    (event, filename) => {
-      if (!filename) return;
-      const fullPath = path.join(workspacePath, filename).replace(/\\/g, "/");
-      if ([...IGNORE_DIRS].some((d) => fullPath.includes(d))) return;
-      if (!getLanguageForFile(fullPath)) return;
-      if (IGNORE_PATTERNS.some((p) => p.test(path.basename(fullPath)))) return;
+  const watcher = fs.watch(workspacePath, { recursive: true }, (event, filename) => {
+    if (!filename) return;
+    const fullPath = path.join(workspacePath, filename).replace(/\\/g, "/");
+    if ([...IGNORE_DIRS].some((d) => fullPath.includes(d))) return;
+    if (!getLanguageForFile(fullPath)) return;
+    if (IGNORE_PATTERNS.some((p) => p.test(path.basename(fullPath)))) return;
 
-      if (process.env.CF_DEBUG_GRAPH === "1") {
-        console.log(
-          `[GraphMapper] 👁️  Watch event: ${event} → ${path.basename(fullPath)}`,
-        );
-      }
+    if (process.env.CF_DEBUG_GRAPH === "1") {
+      console.log(`[GraphMapper] 👁️  Watch event: ${event} → ${path.basename(fullPath)}`);
+    }
 
-      pendingFiles.add(fullPath);
-      clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(processChanges, 800);
-    },
-  );
+    pendingFiles.add(fullPath);
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(processChanges, 800);
+  });
 
   console.log(`[GraphMapper] 👁️  Watching: ${workspacePath}`);
 

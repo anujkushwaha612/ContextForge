@@ -22,10 +22,13 @@ import {
   querySymbolDependencies,
   queryFindRoutes,
   getGraphStats,
+  queryFindLiteralsByFn,
+  queryFindConfigByFn,
 } from "./graphDb.js";
 import { statsEmitter } from "../proxy/statsEmitter.js";
 import fs from "node:fs";
 import path from "node:path";
+import { resolve, resolveWithEmbeddings } from "./semanticResolver.js";
 
 export const GRAPH_TOOL_NAME = "contextforge_query_graph";
 
@@ -37,9 +40,7 @@ const GRAPH_TOOL_ALIASES = new Set([
 
 export function normalizeGraphToolName(name) {
   if (!name) return name;
-  const match = name.match(
-    /(?:mcp__\w+__|[\w]+__)?(contextforge_query_graph)$/,
-  );
+  const match = name.match(/(?:mcp__\w+__|[\w]+__)?(contextforge_query_graph)$/);
   return match ? match[1] : name;
 }
 
@@ -48,6 +49,12 @@ export function normalizeGraphToolName(name) {
 // ─────────────────────────────────────────────
 
 const BODY_CHAR_LIMIT = 1500;
+
+// ADD after it:
+// Configurable confidence threshold for semantic fallback.
+// Below this value, resolveWithEmbeddings() is invoked.
+// Override via CF_GRAPH_CONFIDENCE env var.
+const CONFIDENCE_THRESHOLD = parseFloat(process.env.CF_GRAPH_CONFIDENCE ?? "0.4");
 
 function capBodyText(bodyText, symbolName) {
   if (!bodyText) return null;
@@ -116,12 +123,13 @@ export function getGraphToolDefinition() {
         "Results are pre-indexed and return instantly at zero token cost. " +
         "\n\nWORKFLOW:" +
         "\n  1. what_does_this_export('src/path/to/file.js') — list all exported symbols" +
-        "\n  2. find_symbol('specificFunctionName') — get file path, line numbers, and up to 1500 chars of body text" +
-        "\n  3. If the body is truncated, use read_file_chunk with the given start_line/end_line to get the exact raw text" +
-        "\n  4. Use the raw text (from step 2 or 3) to build patches or understand the code" +
+        "\n  2. find('specificFunctionName') — returns metadata and signature only — call read_function(name) if you need the implementation" +
+        "\n  3. read_function('specificFunctionName') — get the exact full function body and related context" +
+        "\n  4. Use read_file_chunk if you need more surrounding code." +
         "\n  NEVER search for class names — always search for function or method names (e.g. 'decide', not 'CompressionDecision')." +
         "\n\nSpatial queries:" +
-        "\n  find_symbol           — locate any function, class, or variable by name" +
+        "\n  find                  — locate any function, class, variable, literal, config, or route" +
+        "\n  read_function         — read the full body of a function/symbol" +
         "\n  who_imports_this      — find all files that import a symbol" +
         "\n  what_does_this_export — list a file's exports without reading it" +
         "\n  what_does_this_import — list everything a file imports" +
@@ -138,6 +146,8 @@ export function getGraphToolDefinition() {
           query_type: {
             type: "string",
             enum: [
+              "find",
+              "read_function",
               "who_imports_this",
               "what_does_this_export",
               "find_symbol",
@@ -149,7 +159,9 @@ export function getGraphToolDefinition() {
               "find_route",
             ],
             description:
-              "Spatial: who_imports_this, what_does_this_export, find_symbol, " +
+              "\n  find — unified search across symbols, literals, routes, env vars, and config. Returns metadata only." +
+              "\n  read_function — read the exact full body of a symbol by name, plus related context." +
+              "\n  Spatial: who_imports_this, what_does_this_export, find_symbol, " +
               "what_does_this_import, who_depends_on_file. " +
               "Relational: show_callers (who calls X), show_dependencies (what X calls), " +
               "analyze_impact (full 2-hop call chain for refactoring safety), " +
@@ -180,7 +192,7 @@ export function getGraphToolDefinition() {
 // Query executor
 // ─────────────────────────────────────────────
 
-export function executeGraphQuery(queryType, target) {
+export async function executeGraphQuery(queryType, target) {
   if (target === undefined || target === null) {
     return JSON.stringify({ error: "target is required" });
   }
@@ -223,7 +235,7 @@ export function executeGraphQuery(queryType, target) {
             count: rows.length,
           },
           null,
-          2,
+          2
         );
         break;
       }
@@ -234,7 +246,7 @@ export function executeGraphQuery(queryType, target) {
           result = JSON.stringify({
             file: cleanTarget,
             result: "not_found",
-            message: `No exports found for '${cleanTarget}'. Check the file path or run a graph re-index.`,
+            message: `No exports found for '${cleanTarget}'. Check the file path or run a graph re-index. If you know the file exists but it might be unindexed or a procedural script, use read_file_chunk(file_path: '${cleanTarget}', start_line: 1, end_line: 99999) to read the full file.`,
           });
           break;
         }
@@ -253,7 +265,7 @@ export function executeGraphQuery(queryType, target) {
               "Use find_symbol with one of the exported names above to get the body and line numbers.",
           },
           null,
-          2,
+          2
         );
         break;
       }
@@ -273,7 +285,8 @@ export function executeGraphQuery(queryType, target) {
             result: "not_found",
             message:
               `Symbol '${cleanTarget}' not found in the graph index. ` +
-              `Try who_imports_this or what_does_this_export on the file you expect it to live in.`,
+              `Try who_imports_this or what_does_this_export on the file you expect it to live in. ` +
+              `If you know the file it lives in, but it lacks named declarations, use read_file_chunk with start_line=1 and end_line=99999 to read the full file directly.`,
           });
           break;
         }
@@ -301,7 +314,7 @@ export function executeGraphQuery(queryType, target) {
             tip: "If body shows truncation ('... N more lines'), use read_file_chunk with the start_line/end_line above to get the complete raw text.",
           },
           null,
-          2,
+          2
         );
         break;
       }
@@ -326,7 +339,7 @@ export function executeGraphQuery(queryType, target) {
             count: rows.length,
           },
           null,
-          2,
+          2
         );
         break;
       }
@@ -348,7 +361,7 @@ export function executeGraphQuery(queryType, target) {
             count: rows.length,
           },
           null,
-          2,
+          2
         );
         break;
       }
@@ -423,7 +436,7 @@ export function executeGraphQuery(queryType, target) {
               "and to build search_string values for patches.",
           },
           null,
-          2,
+          2
         );
         break;
       }
@@ -450,7 +463,7 @@ export function executeGraphQuery(queryType, target) {
             count: rows.length,
           },
           null,
-          2,
+          2
         );
         break;
       }
@@ -492,8 +505,188 @@ export function executeGraphQuery(queryType, target) {
                   : "Low impact. No cascading changes required.",
           },
           null,
-          2,
+          2
         );
+        break;
+      }
+
+      // In executeGraphQuery, add new case:
+
+      case "find": {
+        // ── Tier 1: SQLite candidate-and-rank ──
+        const resolution = resolve(cleanTarget);
+
+        // ── Tier 2: Semantic fallback (HNSW + BM25) ──
+        // Runs when SQLite confidence is low OR found nothing.
+        // Results are merged with SQLite results and re-ranked.
+        let semanticResults = [];
+        let semanticStrategy = null;
+
+        if (resolution.needsSemanticFallback || !resolution.found) {
+          try {
+            const embResult = await resolveWithEmbeddings(cleanTarget);
+            semanticResults = embResult.results;
+            semanticStrategy = embResult.strategy;
+          } catch (err) {
+            // Non-critical — SQLite results still returned
+            if (process.env.CF_DEBUG_GRAPH === "1") {
+              console.warn(`[GraphQuery] Semantic fallback error: ${err.message}`);
+            }
+          }
+        }
+
+        // ── Unified ranking: merge SQLite + semantic ──
+        // Each candidate gets a unified_score combining both signals.
+        // SQLite exact matches dominate (weight 0.7), semantic augments (weight 0.3).
+        const allCandidates = new Map(); // dedupKey → candidate
+
+        // Add SQLite results
+        for (const r of resolution.results) {
+          const key = `${r.name || r.value || r.key || r.route}|${r.file || ""}|${r.startLine ?? r.line ?? 0}|${r.kind || r.type || ""}`;
+          allCandidates.set(key, {
+            ...r,
+            _sqliteScore: r._score ?? 0,
+            _semanticScore: 0,
+          });
+        }
+
+        // Merge semantic results — boost existing or add new
+        for (const r of semanticResults) {
+          const key = `${r.name}|${r.file}|${r.startLine ?? 0}|${r.kind || ""}`;
+          if (allCandidates.has(key)) {
+            // Boost existing SQLite result with semantic score
+            allCandidates.get(key)._semanticScore = r._semanticScore ?? 0;
+          } else {
+            // New result from semantic — add with zero SQLite score
+            allCandidates.set(key, {
+              ...r,
+              _sqliteScore: 0,
+              _semanticScore: r._semanticScore ?? 0,
+            });
+          }
+        }
+
+        // Compute unified score and sort
+        const unified = [...allCandidates.values()]
+          .map((c) => ({
+            ...c,
+            _unifiedScore: c._sqliteScore * 0.7 + c._semanticScore * 0.3,
+          }))
+          .sort((a, b) => b._unifiedScore - a._unifiedScore);
+
+        // Strip internal scoring fields before sending to LLM
+        const finalResults = unified.map(
+          ({ _sqliteScore, _semanticScore, _unifiedScore, _score, _semanticScore: _s, ...rest }) =>
+            rest
+        );
+
+        const totalFound = finalResults.length > 0;
+
+        if (!totalFound) {
+          result = JSON.stringify({
+            query: cleanTarget,
+            result: "not_found",
+            strategy_used: resolution.strategy,
+            confidence: resolution.confidence ?? 0,
+            message:
+              `'${cleanTarget}' not found in any index (SQLite + semantic searched). ` +
+              `Try what_does_this_export on the file you expect contains this.`,
+          });
+          break;
+        }
+
+        // Cap any fn_body that came through from literal/config 1-hop join
+        const cappedResults = finalResults.map((r) => {
+          if (r.containing_function?.body) {
+            r.containing_function.body = capBodyText(
+              r.containing_function.body,
+              r.containing_function.name
+            );
+          }
+          return r;
+        });
+
+        const usedStrategies = [resolution.strategy];
+        if (semanticStrategy) usedStrategies.push(semanticStrategy);
+
+        result = JSON.stringify(
+          {
+            query: cleanTarget,
+            strategy_used: usedStrategies.join(" + "),
+            confidence: resolution.confidence ?? 0,
+            kind: resolution.kind,
+            results: cappedResults,
+            count: cappedResults.length,
+            hint: "Call read_function('name') to get the full body implementation of any symbol.",
+          },
+          null,
+          2
+        );
+        break;
+      }
+
+      case "read_function": {
+        let rows = queryFindSymbol(cleanTarget);
+        if (rows.length === 0) {
+          result = JSON.stringify({
+            symbol: cleanTarget,
+            result: "not_found",
+            message: `Symbol '${cleanTarget}' not found. Try find('${cleanTarget}') first.`,
+          });
+          break;
+        }
+
+        // Take the first definition
+        const sym = rows[0];
+
+        // More robust resolution matching executeReadFileChunk's pattern:
+        let resolvedPath = sym.file_path;
+        // Handle both relative and absolute (including Windows D:/ after normalization)
+        if (!path.isAbsolute(resolvedPath) && !resolvedPath.match(/^[A-Za-z]:\//)) {
+          resolvedPath = path.resolve(process.cwd(), resolvedPath);
+        } else {
+          // Convert forward slashes back to OS path separators on Windows
+          resolvedPath = resolvedPath.replace(/\//g, path.sep);
+        }
+
+        let bodyLines = [];
+        try {
+          const content = fs.readFileSync(resolvedPath, "utf-8");
+          const allLines = content.replace(/\r\n/g, "\n").split("\n");
+          bodyLines = allLines.slice(sym.start_line - 1, sym.end_line);
+        } catch (e) {
+          result = JSON.stringify({ error: "Failed to read file", message: e.message });
+          break;
+        }
+
+        // Fetch literals and configs
+        const literals = queryFindLiteralsByFn(cleanTarget, sym.file_path);
+        const configs = queryFindConfigByFn(cleanTarget, sym.file_path);
+
+        const relatedContext = [];
+        if (configs.length > 0) {
+          relatedContext.push("Environment Variables:");
+          configs.forEach((c) => relatedContext.push(`  - ${c.key} (${c.raw_text})`));
+        }
+        if (literals.length > 0) {
+          relatedContext.push("Literals:");
+          literals.forEach((l) => relatedContext.push(`  - "${l.value}" (${l.kind})`));
+        }
+
+        const readFnResponse = {
+          symbol: cleanTarget,
+          file: sym.file_path,
+          startLine: sym.start_line,
+          endLine: sym.end_line,
+          relatedContext: relatedContext.length > 0 ? relatedContext.join("\n") : "None",
+          body: bodyLines.join("\n"),
+        };
+
+        if (rows.length > 1) {
+          readFnResponse.note = `${rows.length} definitions found — showing the exported/most complex one. Use find('${cleanTarget}') to see all.`;
+        }
+
+        result = JSON.stringify(readFnResponse, null, 2);
         break;
       }
 
@@ -527,7 +720,7 @@ export function executeGraphQuery(queryType, target) {
             count: rows.length,
           },
           null,
-          2,
+          2
         );
         break;
       }
@@ -537,6 +730,8 @@ export function executeGraphQuery(queryType, target) {
           error: "unknown_query_type",
           query_type: queryType,
           valid_types: [
+            "find",
+            "read_function",
             "who_imports_this",
             "what_does_this_export",
             "find_symbol",
@@ -566,10 +761,7 @@ export function executeGraphQuery(queryType, target) {
 // ─────────────────────────────────────────────
 
 export function isGraphToolCall(toolName) {
-  return (
-    GRAPH_TOOL_ALIASES.has(toolName) ||
-    normalizeGraphToolName(toolName) === GRAPH_TOOL_NAME
-  );
+  return GRAPH_TOOL_ALIASES.has(toolName) || normalizeGraphToolName(toolName) === GRAPH_TOOL_NAME;
 }
 
 let _graphInjectedOnce = false;
@@ -588,9 +780,7 @@ export function injectGraphTool(tools) {
     try {
       const stats = getGraphStats();
       const nodeCount = stats?.node_count ?? 0;
-      console.log(
-        `[GraphInject] ✅ Graph tool active — ${nodeCount} nodes indexed`,
-      );
+      console.log(`[GraphInject] ✅ Graph tool active — ${nodeCount} nodes indexed`);
     } catch (err) {
       console.log(`[GraphInject] ⚠️  graphDb not ready (${err.message})`);
     }
@@ -608,10 +798,7 @@ export const READ_FILE_CHUNK_TOOL_NAME = "read_file_chunk";
 
 export function isReadFileChunkTool(toolName) {
   if (!toolName) return false;
-  return (
-    toolName === READ_FILE_CHUNK_TOOL_NAME ||
-    toolName.includes(READ_FILE_CHUNK_TOOL_NAME)
-  );
+  return toolName === READ_FILE_CHUNK_TOOL_NAME || toolName.includes(READ_FILE_CHUNK_TOOL_NAME);
 }
 
 export function executeReadFileChunk(filePath, startLine, endLine) {
@@ -649,10 +836,7 @@ export function executeReadFileChunk(filePath, startLine, endLine) {
     const actualEnd = Math.min(end, allLines.length);
     const chunk = allLines.slice(start - 1, actualEnd);
 
-    const searchHint =
-      chunk.length > 0 && chunk[0].trim()
-        ? chunk[0].trim().substring(0, 40)
-        : "";
+    const searchHint = chunk.length > 0 && chunk[0].trim() ? chunk[0].trim().substring(0, 40) : "";
 
     const result = {
       file: filePath,

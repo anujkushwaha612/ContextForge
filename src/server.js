@@ -52,7 +52,7 @@ import { setEmbedder } from "./memory/embedder.js";
 import { injectMemoryTools } from "./memory/memoryTools.js";
 
 // ── Graph + Patch ──
-import { indexWorkspace, watchWorkspace } from "./graph/workspaceMapper.js";
+import { indexWorkspace, watchWorkspace, setSymbolEmbedder } from "./graph/workspaceMapper.js";
 import { injectGraphTool, injectReadFileChunkTool } from "./graph/graphTools.js";
 import { injectPatchTool } from "./graph/patchTools.js";
 
@@ -78,10 +78,61 @@ const provider = ProviderFactory.getAdapter(providerName);
 
 console.log("Initializing ContextForge Native Engine...");
 
+// ── Declare native instances BEFORE the async IIFE ──
+// const declarations are not hoisted — the IIFE executes immediately
+// and would hit ReferenceError if these are declared below it.
+
+const onnxEmbedder = new native.OnnxEmbedder(
+  path.join(__dirname, "../models/all-MiniLM-L6-v2-int8.onnx"),
+  path.join(__dirname, "../models/tokenizer.json"),
+  { dim: 384, cacheSize: 512, batchWaitMs: 1 }
+);
+
+setEmbedder(onnxEmbedder);
+
+const memoryStore = new native.PersistentMemoryStore(path.join(__dirname, "./data/memory.db"), 384);
+
+const semanticCache = new native.SemanticCache(384);
+
+const hybridRetriever = new native.HybridRetriever(semanticCache, {
+  dimension: 384,
+  denseWeight: 0.3, // vault retrieval: BM25-heavy
+});
+
+// ── Symbol retriever — separate from vault retriever ──
+// denseWeight: 0.7 (dense-heavy) because symbol names + rich documents
+// benefit from semantic similarity more than BM25 token matching.
+const symbolSemanticCache = new native.SemanticCache(384);
+const symbolRetriever = new native.HybridRetriever(symbolSemanticCache, {
+  dimension: 384,
+  denseWeight: 0.7, // symbol retrieval: dense-heavy
+});
+
+const memoryHandler = new MemoryHandler(memoryStore, hybridRetriever, {
+  maxTokens: 1024,
+  maxEntries: 10,
+  minScore: 0.3,
+});
+
+console.log("[Memory] PersistentMemoryStore ready");
+
 (async () => {
   const workspacePath = process.env.CF_WORKSPACE_PATH || process.cwd();
 
-  // ── Step 1: Index workspace ────────────────────────────────────────────
+  // ── Step 1: Initialize embedder first ─────────────────────────────────
+  // Embedder must warm up BEFORE indexWorkspace so Pass 3 (symbol
+  // embedding) can run during initial indexing.
+  await onnxEmbedder.embed("warmup");
+  console.log("[Embedder] Ready");
+  console.log("[Embedder] Stats:", onnxEmbedder.getStats());
+
+  // ── Step 2: Wire symbol embedder into workspace mapper ─────────────────
+  // Must happen after embedder warmup and before indexWorkspace.
+  // setSymbolEmbedder also calls setGraphEmbedder in semanticResolver
+  // so the async resolveWithEmbeddings() fallback is ready immediately.
+  setSymbolEmbedder(onnxEmbedder, symbolRetriever);
+
+  // ── Step 3: Index workspace (now includes Pass 3 symbol embedding) ─────
   try {
     await indexWorkspace(workspacePath, {
       force: false,
@@ -97,15 +148,11 @@ console.log("Initializing ContextForge Native Engine...");
     console.error(`[GraphMapper] ❌ Failed to index workspace: ${err.message}`);
   }
 
-  // ── Step 2: Initialize embedder and planner ───────────────────────────
-  await onnxEmbedder.embed("warmup");
-  console.log("[Embedder] Ready");
-  console.log("[Embedder] Stats:", onnxEmbedder.getStats());
-
+  // ── Step 4: Initialize planner ─────────────────────────────────────────
   await initPlanner(onnxEmbedder, semanticCache);
   console.log("[Planner] ✅ Initialization complete");
 
-  // ── Step 3: Start accepting requests ──────────────────────────────────
+  // ── Step 5: Start accepting requests ───────────────────────────────────
   const PORT = parseInt(process.env.CF_PORT || process.env.PORT || "3000", 10);
   server.listen(PORT, () => {
     console.log(
@@ -113,31 +160,6 @@ console.log("Initializing ContextForge Native Engine...");
     );
   });
 })();
-
-const onnxEmbedder = new native.OnnxEmbedder(
-  path.join(__dirname, "../models/all-MiniLM-L6-v2-int8.onnx"),
-  path.join(__dirname, "../models/tokenizer.json"),
-  { dim: 384, cacheSize: 512, batchWaitMs: 1 }
-);
-
-setEmbedder(onnxEmbedder);
-// Warmup and initialization moved to startup sequence
-
-const memoryStore = new native.PersistentMemoryStore(path.join(__dirname, "./data/memory.db"), 384);
-
-const semanticCache = new native.SemanticCache(384);
-const hybridRetriever = new native.HybridRetriever(semanticCache, {
-  dimension: 384,
-  denseWeight: 0.3,
-});
-
-const memoryHandler = new MemoryHandler(memoryStore, hybridRetriever, {
-  maxTokens: 1024,
-  maxEntries: 10,
-  minScore: 0.3,
-});
-
-console.log("[Memory] PersistentMemoryStore ready");
 
 // ─────────────────────────────────────────────
 // Embedding worker
@@ -336,9 +358,9 @@ const server = http.createServer((req, res) => {
     "/v1/chat/completions",
     "/v1/messages",
     "/v1beta/models/",
-    "/count_tokens"
+    "/count_tokens",
   ];
-  const isAllowed = ALLOWED_POST_ROUTES.some(route => req.url.includes(route));
+  const isAllowed = ALLOWED_POST_ROUTES.some((route) => req.url.includes(route));
   if (!isAllowed) {
     res.writeHead(404, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ error: "Not Found" }));
@@ -354,7 +376,7 @@ const server = http.createServer((req, res) => {
     totalBytes += chunk.length;
     if (totalBytes > MAX_BODY_SIZE) {
       destroyed = true;
-      res.writeHead(413, { "Content-Type": "application/json", "Connection": "close" });
+      res.writeHead(413, { "Content-Type": "application/json", Connection: "close" });
       res.end(JSON.stringify({ error: "Payload Too Large" }));
       req.unpipe();
       req.resume();
@@ -404,7 +426,9 @@ const server = http.createServer((req, res) => {
     const parsedMaxRetries = maxRetriesHeader ? parseInt(maxRetriesHeader, 10) : NaN;
     const maxRetries =
       Number.isInteger(parsedMaxRetries) && parsedMaxRetries >= 0 ? parsedMaxRetries : undefined;
-    const mockUpstreamPort = req.headers["x-cf-mock-port"] ? parseInt(req.headers["x-cf-mock-port"], 10) : null;
+    const mockUpstreamPort = req.headers["x-cf-mock-port"]
+      ? parseInt(req.headers["x-cf-mock-port"], 10)
+      : null;
     // ── Bind upstream handler for this request ──
     const executeUpstreamRequest = createUpstreamHandler({
       req,
@@ -445,6 +469,40 @@ const server = http.createServer((req, res) => {
     // before JSON.parse as a format-independent baseline reference.
     // ─────────────────────────────────────────────────────────────────────────────
     const trueBaselineTokens = countTokens(payload);
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // PASSTHROUGH MODE (CF_MODE=passthrough)
+    // ─────────────────────────────────────────────────────────────────────────────
+    if (process.env.CF_MODE === "passthrough" && req.headers["x-cf-dry-run"] !== "true") {
+      console.log(`[Pipeline] Passthrough: CF_MODE=passthrough (All optimizations disabled)`);
+      const passthroughMetrics = await executeUpstreamRequest(payload);
+      const passthroughWireTokens =
+        passthroughMetrics?.accumulatedInputTokens ?? trueBaselineTokens;
+      const passthroughGhostRetries = passthroughMetrics?.ghostRetries ?? 0;
+      const passthroughCacheReadTokens = passthroughMetrics?.accumulatedCacheReadTokens ?? 0;
+      const passthroughLatencyMs = performance.now() - startTime;
+
+      savingsTracker.recordRequest({
+        baselineTokens: trueBaselineTokens,
+        wireTokens: passthroughWireTokens,
+        tokensSaved: trueBaselineTokens - passthroughWireTokens,
+        ghostRetries: passthroughGhostRetries,
+        cacheReadTokens: passthroughCacheReadTokens,
+      });
+      statsEmitter.recordRequest({
+        baselineTokens: trueBaselineTokens,
+        finalTokens: passthroughWireTokens,
+        pipelineLatency: 0,
+        upstreamLatency: passthroughLatencyMs,
+      });
+
+      console.log(`[Metrics] Total E2E Latency: ${passthroughLatencyMs.toFixed(2)}ms`);
+      if (passthroughGhostRetries > 0) {
+        console.log(`[Metrics] Ghost Retries:      ${passthroughGhostRetries}`);
+        console.log(`[Metrics] Total Wire Tokens:  ${passthroughWireTokens}`);
+      }
+      return;
+    }
 
     // ── Always-on stages ──
     timer.time(STAGES.MINIMIZE_TOOLS, () => {
@@ -554,6 +612,7 @@ const server = http.createServer((req, res) => {
       const passthroughWireTokens =
         passthroughMetrics?.accumulatedInputTokens ?? countTokens(payload);
       const passthroughGhostRetries = passthroughMetrics?.ghostRetries ?? 0;
+      const passthroughCacheReadTokens = passthroughMetrics?.accumulatedCacheReadTokens ?? 0;
       const passthroughLatencyMs = performance.now() - startTime;
 
       savingsTracker.recordRequest({
@@ -561,6 +620,7 @@ const server = http.createServer((req, res) => {
         wireTokens: passthroughWireTokens,
         tokensSaved: trueBaselineTokens - passthroughWireTokens,
         ghostRetries: passthroughGhostRetries,
+        cacheReadTokens: passthroughCacheReadTokens,
       });
       statsEmitter.recordRequest({
         baselineTokens: trueBaselineTokens,
@@ -764,11 +824,24 @@ const server = http.createServer((req, res) => {
       }
     }
 
+    // ── Expose metrics to client via HTTP headers ──
+    // This allows benchmarks and IDE clients to observe pipeline performance
+    // during a live run without altering the upstream LLM JSON body.
+    res.setHeader("x-cf-tokens-before", trueBaselineTokens);
+    res.setHeader("x-cf-tokens-after", finalTokens);
+    res.setHeader("x-cf-tokens-saved", totalSaved);
+    res.setHeader("x-cf-pipeline-ms", pipelineLatencyMs.toFixed(2));
+    res.setHeader(
+      "x-cf-compression-ratio",
+      trueBaselineTokens > 0 ? parseFloat(((totalSaved / trueBaselineTokens) * 100).toFixed(1)) : 0
+    );
+
     const upstreamMetrics = await executeUpstreamRequest(payload);
     const totalLatencyMs = performance.now() - startTime;
 
     const wireTokens = upstreamMetrics?.accumulatedInputTokens ?? finalTokens;
     const ghostRetries = upstreamMetrics?.ghostRetries ?? 0;
+    const cacheReadTokens = upstreamMetrics?.accumulatedCacheReadTokens ?? 0;
 
     // FIX F10: Use clientModel instead of mutated payload.model
     savingsTracker.recordRequest({
@@ -776,6 +849,7 @@ const server = http.createServer((req, res) => {
       wireTokens: wireTokens,
       tokensSaved: trueBaselineTokens - wireTokens,
       ghostRetries: ghostRetries,
+      cacheReadTokens: cacheReadTokens,
     });
     statsEmitter.recordRequest({
       baselineTokens: trueBaselineTokens,

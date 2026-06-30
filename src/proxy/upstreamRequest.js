@@ -351,7 +351,7 @@ class ToolInterceptor {
 
       if (isGraphToolCall(name)) {
         if (args.query_type && args.target !== undefined) {
-          content = executeGraphQuery(args.query_type, args.target);
+          content = await executeGraphQuery(args.query_type, args.target);
           console.log(
             `[Ghost Interceptor] ✅ Graph: ${args.query_type}("${args.target}") → ${content.length} chars`
           );
@@ -412,7 +412,7 @@ class ToolInterceptor {
 
         if (sq && /^[\w$]+$/.test(sq)) {
           try {
-            const graphHits = executeGraphQuery("find_symbol", sq);
+            const graphHits = await executeGraphQuery("find_symbol", sq);
             const parsed = JSON.parse(graphHits);
             if (parsed.definitions?.length > 0 && parsed.definitions[0].body) {
               const hit = parsed.definitions[0];
@@ -526,6 +526,40 @@ function computeNextRetry(result, retryCount, maxRetries = MAX_GHOST_RETRIES) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Unified Usage Normalizer
+// ─────────────────────────────────────────────────────────────────────────────
+
+function normalizeUsage(rawUsage) {
+  if (!rawUsage) {
+    return { input: 0, cacheRead: 0, output: 0 };
+  }
+
+  // 1. Anthropic Format
+  if (rawUsage.cache_read_input_tokens !== undefined) {
+    return {
+      input: (rawUsage.input_tokens || 0) + (rawUsage.cache_creation_input_tokens || 0),
+      cacheRead: rawUsage.cache_read_input_tokens || 0,
+      output: rawUsage.output_tokens || 0
+    };
+  }
+
+  // 2. OpenAI / Ollama Format
+  if (rawUsage.prompt_tokens !== undefined) {
+    const totalPrompt = rawUsage.prompt_tokens || 0;
+    const cacheRead = rawUsage.prompt_tokens_details?.cached_tokens || 0;
+    return {
+      // In OpenAI, prompt_tokens includes the cached tokens. 
+      // We subtract them to find the "active" input tokens that cost full price.
+      input: Math.max(0, totalPrompt - cacheRead), 
+      cacheRead: cacheRead,
+      output: rawUsage.completion_tokens || 0
+    };
+  }
+
+  return { input: 0, cacheRead: 0, output: 0 };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Upstream Handler Factory
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -551,6 +585,7 @@ export function createUpstreamHandler(ctx) {
     const acc = _acc ?? {
       accumulatedInputTokens: 0,
       accumulatedBaselineTokens: 0,
+      accumulatedCacheReadTokens: 0,
       ghostRetries: 0,
       hopCount: 0,
     };
@@ -1042,6 +1077,15 @@ export function createUpstreamHandler(ctx) {
                   console.error("[RAG Index] Indexing failed:", e.message);
                 }
               })();
+            }
+
+            // ── Extract Usage Tokens ──
+            if (jsonResponse.usage) {
+              const normalizedUsage = normalizeUsage(jsonResponse.usage);
+              // Replace the locally estimated 'hopTokens' with the true input from the LLM
+              acc.accumulatedInputTokens -= hopTokens;
+              acc.accumulatedInputTokens += (normalizedUsage.input + normalizedUsage.cacheRead);
+              acc.accumulatedCacheReadTokens += normalizedUsage.cacheRead;
             }
 
             resolve({ hopEndTime, ...acc });

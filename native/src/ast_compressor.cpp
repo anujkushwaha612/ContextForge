@@ -31,6 +31,8 @@ ASTCompressor::SIGNATURE_TYPES = {
     "lexical_declaration",      // const/let at module level
     "variable_declaration",     // var at module level
     "expression_statement",     // module.exports = ...
+    "pair",                     // object literal methods
+    "assignment_expression",    // assigned functions
   }},
   {"typescript", {
     "function_declaration",
@@ -49,6 +51,9 @@ ASTCompressor::SIGNATURE_TYPES = {
     "abstract_class_declaration",
     "lexical_declaration",
     "variable_declaration",
+    "pair",
+    "assignment_expression",
+    "internal_module",
   }},
   {"python", {
     "function_definition",
@@ -68,6 +73,8 @@ ASTCompressor::SIGNATURE_TYPES = {
     "const_declaration",
     "var_declaration",
     "short_var_declaration",
+    "func_literal",
+    "assignment_statement",
   }},
   {"rust", {
     "function_item",
@@ -80,6 +87,7 @@ ASTCompressor::SIGNATURE_TYPES = {
     "const_item",
     "type_item",
     "macro_definition",
+    "closure_expression",
   }},
   {"java", {
     "method_declaration",
@@ -90,6 +98,7 @@ ASTCompressor::SIGNATURE_TYPES = {
     "constructor_declaration",
     "annotation_type_declaration",
     "enum_declaration",
+    "record_declaration",
   }},
 };
 
@@ -270,21 +279,112 @@ std::string ASTCompressor::getNodeText(TSNode node, const std::string& source) {
 // ─────────────────────────────────────────────
 
 std::string ASTCompressor::extractName(TSNode node, const std::string& source) {
-  // Try to find a child named "name" or "identifier"
+  std::string ntype = ts_node_type(node);
+
+  // ── 1. Direct "name" field ──
+  TSNode name_field = ts_node_child_by_field_name(node, "name", 4);
+  if (!ts_node_is_null(name_field)) {
+    std::string name_type = ts_node_type(name_field);
+    if (name_type == "identifier" || name_type == "property_identifier") {
+      return getNodeText(name_field, source);
+    }
+  }
+
+  // ── 2. Specific node types ──
+  if (ntype == "pair") {
+    TSNode key = ts_node_child_by_field_name(node, "key", 3);
+    if (!ts_node_is_null(key)) return getNodeText(key, source);
+  }
+
+  if (ntype == "assignment_expression" ||
+      ntype == "assignment" ||
+      ntype == "assignment_statement" ||
+      ntype == "short_var_declaration") {
+    TSNode left = ts_node_child_by_field_name(node, "left", 4);
+    if (!ts_node_is_null(left)) return getNodeText(left, source);
+  }
+
+  if (ntype == "export_statement") {
+    TSNode decl = ts_node_child_by_field_name(node, "declaration", 11);
+    if (!ts_node_is_null(decl)) {
+      std::string inner = extractName(decl, source);
+      if (!inner.empty()) return inner;
+    }
+  }
+
+  if (ntype == "lexical_declaration" || ntype == "variable_declaration") {
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t j = 0; j < count; j++) {
+      TSNode child = ts_node_named_child(node, j);
+      std::string ctype = ts_node_type(child);
+      if (ctype == "variable_declarator") {
+        std::string inner = extractName(child, source);
+        if (!inner.empty()) return inner;
+      }
+      if (ctype == "identifier") return getNodeText(child, source);
+    }
+  }
+
+  if (ntype == "variable_declarator") {
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t k = 0; k < count; k++) {
+      TSNode child = ts_node_named_child(node, k);
+      std::string ctype = ts_node_type(child);
+      if (ctype == "identifier" || ctype == "property_identifier") {
+        return getNodeText(child, source);
+      }
+    }
+  }
+
+  // ── 3. Fallback: Search immediate children for an identifier ──
   uint32_t child_count = ts_node_named_child_count(node);
   for (uint32_t i = 0; i < child_count; i++) {
     TSNode child = ts_node_named_child(node, i);
-    std::string child_type = ts_node_type(child);
-    if (child_type == "identifier" || child_type == "property_identifier" ||
-        child_type == "name") {
+    std::string ctype = ts_node_type(child);
+    if (ctype == "identifier" || ctype == "property_identifier") {
       return getNodeText(child, source);
     }
+    
+    // Fallback recursion for nested wrappers if not caught above
+    if (ctype == "export_statement" ||
+        ctype == "lexical_declaration" ||
+        ctype == "variable_declaration" ||
+        ctype == "function_declaration" ||
+        ctype == "class_declaration" ||
+        ctype == "generator_function_declaration") {
+      std::string inner = extractName(child, source);
+      if (!inner.empty()) return inner;
+    }
   }
-  // Try field "name"
-  TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
-  if (!ts_node_is_null(name_node)) {
-    return getNodeText(name_node, source);
+
+  return "";
+}
+
+// ─────────────────────────────────────────────
+// Helper: deep search for function-like initializer type
+// ─────────────────────────────────────────────
+
+std::string ASTCompressor::extractInitializerType(TSNode node, int depth) {
+  if (ts_node_is_null(node) || depth > 5) return "";
+  
+  std::string ntype = ts_node_type(node);
+  
+  // Known function types across supported languages
+  if (ntype == "arrow_function" ||
+      ntype == "function_expression" ||
+      ntype == "lambda" ||
+      ntype == "func_literal" ||
+      ntype == "closure_expression" ||
+      ntype == "generator_function") {
+    return ntype;
   }
+  
+  uint32_t count = ts_node_named_child_count(node);
+  for (uint32_t i = 0; i < count; i++) {
+    std::string res = extractInitializerType(ts_node_named_child(node, i), depth + 1);
+    if (!res.empty()) return res;
+  }
+  
   return "";
 }
 
@@ -463,10 +563,13 @@ void ASTCompressor::walkNode(
     // ── Only record nodes with meaningful size ──
     // Filters out single-line const declarations, tiny expressions, etc.
     // that would never qualify for body compression anyway.
+    // EXCEPT for root/module-level declarations (depth <= 2), which we 
+    // ALWAYS extract so the JavaScript layer can index global constants.
     int node_lines = (int)(anode.end_line - anode.start_line);
-    if (node_lines >= 2) {
+    if (node_lines >= 2 || depth <= 2) {
 
       anode.name = extractName(node, source);
+      anode.initializer_type = extractInitializerType(node);
 
       TSNode body = findBodyNode(node);
         if (!ts_node_is_null(body)) {
@@ -872,6 +975,7 @@ Napi::Object ASTCompressorNAPI::NodeToJS(Napi::Env env, const ASTNode& node) {
   obj.Set("complexity",     Napi::Number::New(env, node.complexity));
   obj.Set("depth",          Napi::Number::New(env, node.depth));
   obj.Set("has_error_handler", Napi::Boolean::New(env, node.has_error_handler));
+  obj.Set("initializer_type", Napi::String::New(env, node.initializer_type));
 
   return obj;
 }

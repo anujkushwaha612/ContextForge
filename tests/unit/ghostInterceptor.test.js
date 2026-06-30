@@ -170,7 +170,7 @@ async function processToolCalls(toolCalls, retryCount = 0) {
 
     if (isGraphToolCall(name)) {
       if (args.query_type && args.target !== undefined) {
-        content = executeGraphQuery(args.query_type, args.target);
+        content = await executeGraphQuery(args.query_type, args.target);
         toolSucceeded = true;
         isActionTool = false;
       } else {

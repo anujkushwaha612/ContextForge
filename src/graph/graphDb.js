@@ -70,17 +70,93 @@ export function getGraphDb(dbPath = null) {
     CREATE INDEX IF NOT EXISTS idx_edges_relation  ON edges(relation);
     CREATE INDEX IF NOT EXISTS idx_edges_caller    ON edges(source_symbol);
     CREATE INDEX IF NOT EXISTS idx_files_path      ON files(file_path);
-  `);
 
-  // ── Migration: add source_line to existing graph.db instances ──
-  // CREATE TABLE IF NOT EXISTS won't add new columns to an existing table.
-  // This try/catch is the standard SQLite migration pattern — it's a no-op
-  // if the column already exists.
-  try {
-    _db.exec(`ALTER TABLE edges ADD COLUMN source_line INTEGER`);
-    console.log("[GraphDb] ✅ Migrated edges table: added source_line column");
-  } catch {
-    // Column already exists — normal on every run after first migration
+  CREATE TABLE IF NOT EXISTS literals (
+    literal_id    TEXT PRIMARY KEY,
+    file_path     TEXT NOT NULL,
+    value         TEXT NOT NULL,        -- "content-length", "multipart/form-data"
+    kind          TEXT NOT NULL,        -- 'string', 'regex', 'env_var', 'magic_number'
+    containing_fn TEXT,                 -- getS3SignedUrl (nullable)
+    start_line    INTEGER NOT NULL,
+    FOREIGN KEY (file_path) REFERENCES files(file_path) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS config_refs (
+    config_id     TEXT PRIMARY KEY,
+    file_path     TEXT NOT NULL,
+    key           TEXT NOT NULL,        -- STORAGE_QUOTA, AWS_BUCKET_NAME
+    raw_text      TEXT NOT NULL,        -- process.env.STORAGE_QUOTA
+    containing_fn TEXT,
+    start_line    INTEGER NOT NULL,
+    FOREIGN KEY (file_path) REFERENCES files(file_path) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS summaries (
+    node_id       TEXT PRIMARY KEY,     -- same as nodes.node_id
+    file_path     TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    signature     TEXT,                 -- "async (req, res, next) =>"
+    dependencies  TEXT,                 -- JSON: ["STORAGE_QUOTA","content-length","S3Client"]
+    env_refs      TEXT,                 -- JSON: ["AWS_BUCKET_NAME"]
+    literal_refs  TEXT,                 -- JSON: ["content-length","multipart/form-data"]
+    call_summary  TEXT,                 -- JSON: ["createPresignedPost","Directory.findById"]
+    FOREIGN KEY (node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_literals_value    ON literals(value);
+  CREATE INDEX IF NOT EXISTS idx_literals_file     ON literals(file_path);
+  CREATE INDEX IF NOT EXISTS idx_literals_fn       ON literals(containing_fn);
+  CREATE INDEX IF NOT EXISTS idx_config_key        ON config_refs(key);
+  CREATE INDEX IF NOT EXISTS idx_config_fn         ON config_refs(containing_fn);
+  CREATE INDEX IF NOT EXISTS idx_summaries_name    ON summaries(name);
+`);
+
+  // ADD THIS BLOCK:
+  // ── Migrations for existing graph.db instances ──
+  // CREATE TABLE IF NOT EXISTS won't add new tables to an existing DB.
+  // These try/catch blocks are the standard SQLite migration pattern.
+  const migrations = [
+    `CREATE TABLE IF NOT EXISTS literals (
+    literal_id TEXT PRIMARY KEY,
+    file_path  TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    containing_fn TEXT,
+    start_line INTEGER NOT NULL,
+    FOREIGN KEY (file_path) REFERENCES files(file_path) ON DELETE CASCADE)`,
+    `CREATE TABLE IF NOT EXISTS config_refs (
+    config_id  TEXT PRIMARY KEY,
+    file_path  TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    raw_text   TEXT NOT NULL,
+    containing_fn TEXT,
+    start_line INTEGER NOT NULL,
+    FOREIGN KEY (file_path) REFERENCES files(file_path) ON DELETE CASCADE)`,
+    `CREATE TABLE IF NOT EXISTS summaries (
+    node_id      TEXT PRIMARY KEY,
+    file_path    TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    signature    TEXT,
+    dependencies TEXT,
+    env_refs     TEXT,
+    literal_refs TEXT,
+    call_summary TEXT,
+    FOREIGN KEY (node_id) REFERENCES nodes(node_id) ON DELETE CASCADE)`,
+    `CREATE INDEX IF NOT EXISTS idx_literals_value ON literals(value)`,
+    `CREATE INDEX IF NOT EXISTS idx_literals_file  ON literals(file_path)`,
+    `CREATE INDEX IF NOT EXISTS idx_literals_fn    ON literals(containing_fn)`,
+    `CREATE INDEX IF NOT EXISTS idx_config_key     ON config_refs(key)`,
+    `CREATE INDEX IF NOT EXISTS idx_config_fn      ON config_refs(containing_fn)`,
+    `CREATE INDEX IF NOT EXISTS idx_summaries_name ON summaries(name)`,
+    `ALTER TABLE edges ADD COLUMN source_line INTEGER`,
+  ];
+
+  for (const sql of migrations) {
+    try {
+      _db.exec(sql);
+    } catch {
+      /* already exists — normal after first run */
+    }
   }
 
   return _db;
@@ -107,6 +183,26 @@ function stmts() {
       SELECT * FROM files WHERE file_path = ?
     `),
 
+    getNodeByFileAndLine: db.prepare(`
+  SELECT n.file_path, n.name, n.kind, n.start_line, n.end_line,
+         n.complexity, n.body_text, n.is_exported,
+         s.literal_refs, s.env_refs, s.call_summary
+  FROM   nodes n
+  LEFT JOIN summaries s ON n.node_id = s.node_id
+  WHERE  n.file_path = ?
+    AND  n.start_line = ?
+  LIMIT 1
+`),
+
+    getRetrievalDocument: db.prepare(`
+  SELECT n.name, n.kind, n.file_path, n.start_line, n.end_line,
+         n.is_async, n.complexity, n.body_text,
+         s.signature, s.env_refs, s.literal_refs, s.call_summary
+  FROM   nodes n
+  LEFT JOIN summaries s ON n.node_id = s.node_id
+  WHERE  n.node_id = ?
+`),
+
     deleteFileNodes: db.prepare(`
       DELETE FROM nodes WHERE file_id = ?
     `),
@@ -114,6 +210,10 @@ function stmts() {
     deleteFileEdges: db.prepare(`
       DELETE FROM edges WHERE source_file = ?
     `),
+
+    deleteSummariesByFile: db.prepare(`
+  DELETE FROM summaries WHERE file_path = ?
+`),
 
     insertNode: db.prepare(`
       INSERT OR IGNORE INTO nodes
@@ -147,18 +247,22 @@ function stmts() {
     `),
 
     findSymbol: db.prepare(`
-      SELECT file_path, name, kind, start_line, end_line, complexity, body_text
-      FROM   nodes
-      WHERE  name = ?
-      ORDER BY is_exported DESC, complexity DESC
+      SELECT n.file_path, n.name, n.kind, n.start_line, n.end_line, n.complexity, n.body_text,
+             s.literal_refs, s.env_refs, s.call_summary
+      FROM   nodes n
+      LEFT JOIN summaries s ON n.node_id = s.node_id
+      WHERE  n.name = ?
+      ORDER BY n.is_exported DESC, n.complexity DESC
     `),
 
     findSymbolFuzzy: db.prepare(`
-      SELECT file_path, name, kind, start_line, end_line, complexity, body_text
-      FROM   nodes
-      WHERE  name LIKE '%' || ? || '%'
-        AND  name != ?
-      ORDER BY is_exported DESC, complexity DESC
+      SELECT n.file_path, n.name, n.kind, n.start_line, n.end_line, n.complexity, n.body_text,
+             s.literal_refs, s.env_refs, s.call_summary
+      FROM   nodes n
+      LEFT JOIN summaries s ON n.node_id = s.node_id
+      WHERE  n.name LIKE '%' || ? || '%'
+        AND  n.name != ?
+      ORDER BY n.is_exported DESC, n.complexity DESC
       LIMIT 10
     `),
 
@@ -247,6 +351,68 @@ function stmts() {
         (SELECT COUNT(*) FROM edges WHERE relation = 'defines_route') AS routes_count
     `),
 
+    findLiteral: db.prepare(`
+  SELECT l.value, l.kind, l.file_path, l.start_line, l.containing_fn,
+         n.start_line as fn_start_line, n.end_line as fn_end_line, n.complexity as fn_complexity, n.body_text as fn_body
+  FROM   literals l
+  LEFT JOIN nodes n ON n.name = l.containing_fn AND n.file_path = l.file_path
+  WHERE  l.value LIKE '%' || ? || '%'
+  ORDER BY
+    CASE WHEN l.value = ? THEN 0 ELSE 1 END,  -- exact first
+    length(l.value)                             -- shorter = more specific
+  LIMIT 10
+`),
+
+    findConfig: db.prepare(`
+  SELECT c.key, c.raw_text, c.file_path, c.start_line, c.containing_fn,
+         n.start_line as fn_start_line, n.end_line as fn_end_line, n.complexity as fn_complexity, n.body_text as fn_body
+  FROM   config_refs c
+  LEFT JOIN nodes n ON n.name = c.containing_fn AND n.file_path = c.file_path
+  WHERE  c.key = ? OR c.key LIKE '%' || ? || '%'
+  ORDER BY
+    CASE WHEN c.key = ? THEN 0 ELSE 1 END
+  LIMIT 10
+`),
+
+    findLiteralsByFn: db.prepare(`
+      SELECT value, kind, start_line
+      FROM literals
+      WHERE containing_fn = ? AND file_path = ?
+    `),
+
+    findConfigByFn: db.prepare(`
+      SELECT key, raw_text, start_line
+      FROM config_refs
+      WHERE containing_fn = ? AND file_path = ?
+    `),
+
+    insertLiteral: db.prepare(`
+  INSERT OR IGNORE INTO literals
+    (literal_id, file_path, value, kind, containing_fn, start_line)
+  VALUES (?, ?, ?, ?, ?, ?)
+`),
+
+    insertConfigRef: db.prepare(`
+  INSERT OR IGNORE INTO config_refs
+    (config_id, file_path, key, raw_text, containing_fn, start_line)
+  VALUES (?, ?, ?, ?, ?, ?)
+`),
+
+    upsertSummary: db.prepare(`
+  INSERT OR REPLACE INTO summaries
+    (node_id, file_path, name, signature, dependencies,
+     env_refs, literal_refs, call_summary)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`),
+
+    deleteLiterals: db.prepare(`
+  DELETE FROM literals WHERE file_path = ?
+`),
+
+    deleteConfigRefs: db.prepare(`
+  DELETE FROM config_refs WHERE file_path = ?
+`),
+
     allFiles: db.prepare(`
       SELECT file_path, last_modified FROM files
     `),
@@ -277,6 +443,9 @@ export function writeFileGraph(fileData) {
 
     s.deleteFileNodes.run(fileId);
     s.deleteFileEdges.run(fileData.filePath);
+    s.deleteLiterals.run(fileData.filePath);
+    s.deleteConfigRefs.run(fileData.filePath);
+    s.deleteSummariesByFile.run(fileData.filePath);
 
     for (const node of fileData.nodes) {
       const nodeId = fileId + ":" + node.name + ":" + node.startLine;
@@ -319,6 +488,49 @@ export function writeFileGraph(fileData) {
         edge.relation,
         edge.sourceLine ?? null // ← new: null for non-route edges
       );
+    }
+
+    if (fileData.literals) {
+      let i = 0;
+      for (const lit of fileData.literals) {
+        s.insertLiteral.run(
+          `${fileId}:lit:${i++}`,
+          lit.filePath,
+          lit.value,
+          lit.kind,
+          lit.containingFn,
+          lit.startLine
+        );
+      }
+    }
+
+    if (fileData.configRefs) {
+      let i = 0;
+      for (const ref of fileData.configRefs) {
+        s.insertConfigRef.run(
+          `${fileId}:cfg:${i++}`,
+          ref.filePath,
+          ref.key,
+          ref.rawText,
+          ref.containingFn,
+          ref.startLine
+        );
+      }
+    }
+
+    if (fileData.summaries) {
+      for (const sum of fileData.summaries) {
+        s.upsertSummary.run(
+          sum.nodeId,
+          sum.filePath,
+          sum.name,
+          sum.signature,
+          sum.dependencies,
+          sum.envRefs,
+          sum.literalRefs,
+          sum.callSummary
+        );
+      }
     }
   });
 
@@ -374,6 +586,73 @@ export function queryFindRoutes(routeFilter = null) {
   return stmts().findRoutes.all(routeFilter, routeFilter);
 }
 
+export function queryFindLiteral(value) {
+  return stmts().findLiteral.all(value, value);
+}
+
+export function queryFindConfig(key) {
+  return stmts().findConfig.all(key, key, key);
+}
+
+export function queryFindLiteralsByFn(fnName, filePath) {
+  return stmts().findLiteralsByFn.all(fnName, filePath);
+}
+
+export function queryFindConfigByFn(fnName, filePath) {
+  return stmts().findConfigByFn.all(fnName, filePath);
+}
+
+// ADD after queryFindConfigByFn:
+
+/**
+ * Resolve a stable embedding ID back to a node record.
+ * Stable ID format: "file_path:start_line:name"
+ * e.g. "controllers/s3-upload.controller.js:9:getS3SignedUrl"
+ */
+export function queryNodeByStableId(stableId) {
+  const parts = stableId.split(":");
+  if (parts.length < 3) return null;
+
+  // Last part is name, second-to-last is line, rest is file path
+  // Handle Windows paths like "D:/foo/bar.js:9:fnName"
+  const name = parts[parts.length - 1];
+  const line = parseInt(parts[parts.length - 2], 10);
+  const filePath = parts.slice(0, parts.length - 2).join(":");
+
+  if (isNaN(line)) return null;
+
+  return stmts().getNodeByFileAndLine.get(normalizeFilePath(filePath), line);
+}
+
+/**
+ * Get all data needed to build a rich retrieval document for a node.
+ * Used during indexing to build the text fed to the embedder.
+ */
+export function queryRetrievalDocument(nodeId) {
+  return stmts().getRetrievalDocument.get(nodeId);
+}
+
+/**
+ * Get all embeddable nodes across the entire workspace.
+ * Used to rebuild the HNSW index on startup if needed.
+ */
+export function queryAllEmbeddableNodes() {
+  return getGraphDb()
+    .prepare(
+      `
+    SELECT n.node_id, n.file_path, n.name, n.kind, n.start_line,
+           n.is_async, n.complexity, n.body_text,
+           s.signature, s.env_refs, s.literal_refs, s.call_summary
+    FROM   nodes n
+    LEFT JOIN summaries s ON n.node_id = s.node_id
+    WHERE  n.kind IN ('function', 'method', 'arrow_function', 'class')
+      AND  n.name NOT LIKE '__module_%'
+    ORDER BY n.file_path, n.start_line
+  `
+    )
+    .all();
+}
+
 export function getGraphStats() {
   return stmts().stats.get();
 }
@@ -418,7 +697,8 @@ export function clearGraph() {
     DELETE FROM edges;
     DELETE FROM nodes;
     DELETE FROM files;
+    DELETE FROM literals;
+    DELETE FROM config_refs;
+    DELETE FROM summaries;
   `);
-  // Reset prepared statement cache — stmts hold references to the same DB
-  // so they remain valid, but sqlite3 internal page cache is cleared
 }

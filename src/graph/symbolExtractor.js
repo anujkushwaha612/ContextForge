@@ -35,7 +35,7 @@ function getNative() {
       preserveTypeAnnotations: true,
       preserveDecorators: true,
       vaultOnCompress: false, // graph extraction — no vaulting
-      docstringMode: 2,       // REMOVE — we don't need docstrings
+      docstringMode: 2, // REMOVE — we don't need docstrings
       maxBodyLines: 0,
       minTokensToCompress: 0,
     });
@@ -50,9 +50,7 @@ function getNative() {
 // Language routing
 // ─────────────────────────────────────────────
 
-const TREESITTER_EXTENSIONS = new Set([
-  "js", "mjs", "cjs", "ts", "tsx", "py", "go", "rs", "java",
-]);
+const TREESITTER_EXTENSIONS = new Set(["js", "mjs", "cjs", "ts", "tsx", "py", "go", "rs", "java"]);
 
 const REGEX_EXTENSIONS = new Set(["cpp", "cc", "cxx", "h", "hpp", "hh"]);
 
@@ -61,14 +59,14 @@ export function getLanguageForFile(filePath) {
 
   if (TREESITTER_EXTENSIONS.has(ext)) {
     const map = {
-      js:   "javascript",
-      mjs:  "javascript",
-      cjs:  "javascript",
-      ts:   "typescript",
-      tsx:  "tsx",
-      py:   "python",
-      go:   "go",
-      rs:   "rust",
+      js: "javascript",
+      mjs: "javascript",
+      cjs: "javascript",
+      ts: "typescript",
+      tsx: "tsx",
+      py: "python",
+      go: "go",
+      rs: "rust",
       java: "java",
     };
     return { method: "treesitter", language: map[ext] || ext };
@@ -92,9 +90,7 @@ function treesitterExtract(source, language, filePath) {
   try {
     rawNodes = _compressor.extractNodes(source, language);
   } catch (err) {
-    console.warn(
-      `[GraphExtractor] extractNodes failed on ${filePath}: ${err.message}`,
-    );
+    console.warn(`[GraphExtractor] extractNodes failed on ${filePath}: ${err.message}`);
     return { nodes: [], edges: [] };
   }
 
@@ -104,14 +100,45 @@ function treesitterExtract(source, language, filePath) {
   const MAX_BODY_LINES = 100;
 
   for (const raw of rawNodes) {
-    const kind = mapNodeTypeToKind(raw.type, language);
+    let kind = mapNodeTypeToKind(raw.type, language);
     if (!kind) continue;
     if (!raw.name || raw.name.trim() === "") continue;
 
-    const startLine     = raw.start_line      ?? 0;
-    const endLine       = raw.end_line        ?? startLine;
+    // ── Upgrade "const" → "arrow_function" for function-valued declarations ──
+    // The C++ extractor now recursively checks the right-hand side and populates initializer_type.
+    if (kind === "const") {
+      const initType = raw.initializer_type || "";
+      const isFunctionInit = [
+        "arrow_function",
+        "function_expression",
+        "generator_function",
+        "lambda",
+        "func_literal",
+        "closure_expression"
+      ].includes(initType);
+
+      const isAsyncDecl = raw.is_async === true;
+
+      if (isFunctionInit || isAsyncDecl) {
+        kind = (initType === "arrow_function" || initType === "closure_expression" || initType === "lambda") 
+               ? "arrow_function" : "function";
+      } else {
+        // Keep non-function constants ONLY if they are at the module root level.
+        // Depth 1 is usually the root of the module (child of 'program').
+        // Depth 2 might be if it's wrapped in an export_statement.
+        if ((raw.depth || Infinity) <= 2) {
+          kind = "const";
+        } else {
+          // Local variable — not useful in the call graph
+          continue;
+        }
+      }
+    }
+
+    const startLine = raw.start_line ?? 0;
+    const endLine = raw.end_line ?? startLine;
     const bodyStartLine = raw.body_start_line ?? startLine;
-    const bodyEndLine   = raw.body_end_line   ?? endLine;
+    const bodyEndLine = raw.body_end_line ?? endLine;
 
     // ── Signature lines: from node start up to body start ──
     const signatureLines = sourceLines.slice(startLine, bodyStartLine);
@@ -119,39 +146,37 @@ function treesitterExtract(source, language, filePath) {
     // ── Body lines: capped at MAX_BODY_LINES ──
     const bodyLines = sourceLines.slice(
       bodyStartLine,
-      Math.min(bodyEndLine + 1, bodyStartLine + MAX_BODY_LINES),
+      Math.min(bodyEndLine + 1, bodyStartLine + MAX_BODY_LINES)
     );
 
     // ── Truncation marker ──
     const actualBodyLines = bodyEndLine - bodyStartLine + 1;
-    const wasTruncated    = actualBodyLines > MAX_BODY_LINES;
-    const truncationNote  = wasTruncated
-      ? [`// ... ${actualBodyLines - MAX_BODY_LINES} more lines — use contextforge_retrieve for full body`]
+    const wasTruncated = actualBodyLines > MAX_BODY_LINES;
+    const truncationNote = wasTruncated
+      ? [
+          `// ... ${actualBodyLines - MAX_BODY_LINES} more lines — use contextforge_retrieve for full body`,
+        ]
       : [];
 
-    const bodyText = [
-      ...signatureLines,
-      ...bodyLines,
-      ...truncationNote,
-    ].join("\n").trimEnd();
+    const bodyText = [...signatureLines, ...bodyLines, ...truncationNote].join("\n").trimEnd();
 
     nodes.push({
-      name:       raw.name,
+      name: raw.name,
       kind,
       startLine,
       endLine,
       isExported: raw.is_exported || false,
-      isAsync:    raw.is_async    || false,
-      complexity: raw.complexity  || 0,
+      isAsync: raw.is_async || false,
+      complexity: raw.complexity || 0,
       bodyText,
     });
 
     if (raw.is_exported) {
       edges.push({
         targetSymbol: raw.name,
-        targetFile:   filePath,
+        targetFile: filePath,
         sourceSymbol: null,
-        relation:     "exports",
+        relation: "exports",
       });
     }
   }
@@ -174,14 +199,14 @@ function treesitterExtract(source, language, filePath) {
   if (nodes.length === 0 && source.length > 200 && source.includes("(")) {
     const baseName = path.basename(filePath, path.extname(filePath));
     nodes.push({
-      name:       `__module_${baseName}`,
-      kind:       "function",
-      startLine:  0,
-      endLine:    sourceLines.length - 1,
+      name: `__module_${baseName}`,
+      kind: "function",
+      startLine: 0,
+      endLine: sourceLines.length - 1,
       isExported: false,
-      isAsync:    false,
+      isAsync: false,
       complexity: 0,
-      bodyText:   null,
+      bodyText: null,
     });
   }
 
@@ -194,42 +219,54 @@ function treesitterExtract(source, language, filePath) {
 function mapNodeTypeToKind(nodeType, language) {
   const map = {
     // JavaScript/TypeScript
-    function_declaration:           "function",
-    function_expression:            "function",
-    arrow_function:                 "function",
-    method_definition:              "function",
-    generator_function:             "function",
+    function_declaration: "function",
+    function_expression: "function",
+    arrow_function: "arrow_function",
+    method_definition: "method",
+    generator_function: "function",
     generator_function_declaration: "function",
-    class_declaration:              "class",
-    class_expression:               "class",
-    lexical_declaration:            "const",
-    variable_declaration:           "const",
-    export_statement:               null,
-    import_statement:               "import",
+    class_declaration: "class",
+    class_expression: "class",
+    // ── KEY CHANGE: lexical/variable declarations map to "const" ──
+    // but treesitterExtract will upgrade to "arrow_function" when
+    // the value is a function. See the upgrade logic below.
+    lexical_declaration: "const",
+    variable_declaration: "const",
+    assignment_expression: "const",
+    pair: "const",
+    internal_module: "namespace",
+    export_statement: null,
+    import_statement: "import",
 
     // Python
-    function_definition:            "function",
-    async_function_definition:      "function",
-    class_definition:               "class",
-    decorated_definition:           "function",
+    function_definition: "function",
+    async_function_definition: "function",
+    class_definition: "class",
+    decorated_definition: "function",
+    assignment: "const",
 
     // Go
-    function_declaration_go:        "function",
-    method_declaration:             "function",
-    type_declaration:               "class",
+    function_declaration_go: "function",
+    method_declaration: "method",
+    type_declaration: "class",
+    assignment_statement: "const",
+    short_var_declaration: "const",
+    func_literal: "function",
 
     // Rust
-    function_item:                  "function",
-    impl_item:                      "class",
-    struct_item:                    "class",
-    enum_item:                      "class",
-    trait_item:                     "class",
+    function_item: "function",
+    impl_item: "class",
+    struct_item: "class",
+    enum_item: "class",
+    trait_item: "class",
+    closure_expression: "arrow_function",
 
     // Java
-    method_declaration:             "function",
-    class_declaration_java:         "class",
-    interface_declaration:          "class",
-    enum_declaration:               "class",
+    method_declaration: "method",
+    class_declaration_java: "class",
+    interface_declaration: "class",
+    enum_declaration: "class",
+    record_declaration: "class",
   };
 
   return map[nodeType] ?? null;
@@ -246,30 +283,17 @@ const IMPORT_PATTERNS = {
     /(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
     /(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
   ],
-  python: [
-    /from\s+([\w.]+)\s+import\s+([^#\n]+)/g,
-    /^import\s+([\w.]+)/gm,
-  ],
-  go: [
-    /import\s+"([^"]+)"/g,
-    /"([\w./]+)"/g,
-  ],
-  rust: [
-    /use\s+([\w:]+)::(\w+)/g,
-    /use\s+([\w:]+)::\{([^}]+)\}/g,
-  ],
-  cpp: [
-    /#include\s+"([^"]+)"/g,
-    /#include\s+<([^>]+)>/g,
-  ],
+  python: [/from\s+([\w.]+)\s+import\s+([^#\n]+)/g, /^import\s+([\w.]+)/gm],
+  go: [/import\s+"([^"]+)"/g, /"([\w./]+)"/g],
+  rust: [/use\s+([\w:]+)::(\w+)/g, /use\s+([\w:]+)::\{([^}]+)\}/g],
+  cpp: [/#include\s+"([^"]+)"/g, /#include\s+<([^>]+)>/g],
 };
 
 function extractImportEdges(source, language, filePath) {
   const edges = [];
-  const lang =
-    language === "typescript" || language === "tsx" ? "javascript" : language;
+  const lang = language === "typescript" || language === "tsx" ? "javascript" : language;
   const patterns = IMPORT_PATTERNS[lang] || IMPORT_PATTERNS.javascript;
-  const fileDir  = path.dirname(filePath);
+  const fileDir = path.dirname(filePath);
 
   for (const pattern of patterns) {
     pattern.lastIndex = 0;
@@ -279,11 +303,8 @@ function extractImportEdges(source, language, filePath) {
         const symbolsStr = match[1];
         const importPath = match[2];
 
-        const isRelative =
-          importPath.startsWith(".") || importPath.startsWith("/");
-        const targetFile = isRelative
-          ? resolveImportPath(fileDir, importPath)
-          : null;
+        const isRelative = importPath.startsWith(".") || importPath.startsWith("/");
+        const targetFile = isRelative ? resolveImportPath(fileDir, importPath) : null;
 
         const symbols = symbolsStr
           .split(",")
@@ -295,7 +316,7 @@ function extractImportEdges(source, language, filePath) {
             targetSymbol: sym,
             targetFile,
             sourceSymbol: null,
-            relation:     "imports",
+            relation: "imports",
           });
         }
       } else if (lang === "python") {
@@ -308,28 +329,31 @@ function extractImportEdges(source, language, filePath) {
         for (const sym of symbols) {
           edges.push({
             targetSymbol: sym,
-            targetFile:   null,
+            targetFile: null,
             sourceSymbol: null,
-            relation:     "imports",
+            relation: "imports",
           });
         }
       } else if (lang === "rust") {
         const pathStr = match[1];
         const symbols = match[2]
-          ? match[2].split(",").map((s) => s.trim()).filter(Boolean)
+          ? match[2]
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean)
           : [pathStr.split("::").pop()];
 
         for (const sym of symbols) {
           edges.push({
             targetSymbol: sym,
-            targetFile:   null,
+            targetFile: null,
             sourceSymbol: null,
-            relation:     "imports",
+            relation: "imports",
           });
         }
       } else if (lang === "cpp") {
         const includePath = match[1];
-        const targetFile  = includePath.startsWith("/")
+        const targetFile = includePath.startsWith("/")
           ? includePath
           : resolveImportPath(fileDir, "./" + includePath);
 
@@ -337,7 +361,7 @@ function extractImportEdges(source, language, filePath) {
           targetSymbol: includePath,
           targetFile,
           sourceSymbol: null,
-          relation:     "imports",
+          relation: "imports",
         });
       }
     }
@@ -348,7 +372,7 @@ function extractImportEdges(source, language, filePath) {
 
 function resolveImportPath(fromDir, importPath) {
   try {
-    const clean  = importPath.split("?")[0].split("#")[0];
+    const clean = importPath.split("?")[0].split("#")[0];
     const hasExt = /\.\w{1,4}$/.test(clean);
     const withExt = hasExt ? clean : clean + ".js";
     return path.resolve(fromDir, withExt).replace(/\\/g, "/");
@@ -364,8 +388,7 @@ function resolveImportPath(fromDir, importPath) {
 const CPP_PATTERNS = {
   function:
     /^(?!.*(?:if|for|while|switch|catch)\s*\()[\w:*&<>]+\s+(\w+)\s*\([^)]*\)\s*(?:const|override|noexcept)?\s*\{/gm,
-  class:
-    /^(?:class|struct)\s+(\w+)(?:\s*:\s*(?:public|private|protected)\s+\w+)?/gm,
+  class: /^(?:class|struct)\s+(\w+)(?:\s*:\s*(?:public|private|protected)\s+\w+)?/gm,
   namespace: /^namespace\s+(\w+)\s*\{/gm,
 };
 
@@ -395,23 +418,20 @@ function regexExtract(source, filePath) {
   CPP_PATTERNS.function.lastIndex = 0;
   let match;
   while ((match = CPP_PATTERNS.function.exec(source)) !== null) {
-    const name      = match[1];
+    const name = match[1];
     const startLine = charToLine(match.index);
-    const endLine   = Math.min(startLine + 50, lines.length - 1);
+    const endLine = Math.min(startLine + 50, lines.length - 1);
 
-    const bodyLines = lines.slice(
-      startLine,
-      Math.min(endLine + 1, startLine + MAX_BODY_LINES),
-    );
+    const bodyLines = lines.slice(startLine, Math.min(endLine + 1, startLine + MAX_BODY_LINES));
     const bodyText = bodyLines.join("\n").trimEnd();
 
     nodes.push({
       name,
-      kind:       "function",
+      kind: "function",
       startLine,
       endLine,
       isExported: true,
-      isAsync:    false,
+      isAsync: false,
       complexity: 1,
       bodyText,
     });
@@ -419,23 +439,20 @@ function regexExtract(source, filePath) {
 
   CPP_PATTERNS.class.lastIndex = 0;
   while ((match = CPP_PATTERNS.class.exec(source)) !== null) {
-    const name      = match[1];
+    const name = match[1];
     const startLine = charToLine(match.index);
-    const endLine   = Math.min(startLine + 100, lines.length - 1);
+    const endLine = Math.min(startLine + 100, lines.length - 1);
 
-    const bodyLines = lines.slice(
-      startLine,
-      Math.min(endLine + 1, startLine + MAX_BODY_LINES),
-    );
+    const bodyLines = lines.slice(startLine, Math.min(endLine + 1, startLine + MAX_BODY_LINES));
     const bodyText = bodyLines.join("\n").trimEnd();
 
     nodes.push({
       name,
-      kind:       "class",
+      kind: "class",
       startLine,
       endLine,
       isExported: true,
-      isAsync:    false,
+      isAsync: false,
       complexity: 0,
       bodyText,
     });

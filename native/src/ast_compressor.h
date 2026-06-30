@@ -41,6 +41,7 @@ namespace contextforge
     bool has_error_handler; // contains try/catch
     int complexity;         // cyclomatic complexity estimate
     int depth;              // nesting depth in the tree
+    std::string initializer_type; // e.g. "arrow_function", "lambda"
   };
 
   // ─────────────────────────────────────────────
@@ -141,6 +142,9 @@ namespace contextforge
 
     // Extract identifier name from a node
     std::string extractName(TSNode node, const std::string &source);
+
+    // Deep search for a function-like initializer on the RHS
+    std::string extractInitializerType(TSNode node, int depth = 0);
 
     // Get source slice for a node
     std::string getNodeText(TSNode node, const std::string &source);

@@ -77,6 +77,7 @@ function emptyDisplaySession() {
     tokens_after: 0,         // sum of wireTokens for this session
     tokens_saved: 0,         // tokens_before − tokens_after (can be negative)
     compression_ratio: 0,    // tokens_saved / tokens_before * 100 (can be negative)
+    cache_read_tokens: 0,
     started_at: null,
     last_activity_at: null,
     ghost_retries: 0,
@@ -90,6 +91,7 @@ function defaultLifetime() {
     tokens_before: 0,        // sum of all trueBaselineTokens
     tokens_after: 0,         // sum of all wireTokens
     tokens_saved: 0,         // tokens_before − tokens_after (can be negative)
+    cache_read_tokens: 0,
     ghost_retries: 0,
     requests_with_retries: 0,
   };
@@ -140,6 +142,7 @@ export class SavingsTracker {
     tokensSaved,
     timestamp = null,
     ghostRetries = 0,
+    cacheReadTokens = 0,
   }) {
     const ts = timestamp ? new Date(timestamp) : utcNow();
 
@@ -156,6 +159,7 @@ export class SavingsTracker {
     lt.tokens_before  += deltaBaseline;
     lt.tokens_after   += deltaWire;
     lt.tokens_saved   += deltaSaved;   // intentionally allows negative accumulation
+    lt.cache_read_tokens += (cacheReadTokens || 0);
 
     if (ghostRetries > 0) {
       lt.ghost_retries          += ghostRetries;
@@ -163,7 +167,7 @@ export class SavingsTracker {
     }
 
     // ── Display session ─────────────────────────────────────────────────────
-    this._updateDisplaySession({ ts, deltaBaseline, deltaWire, deltaSaved, ghostRetries });
+    this._updateDisplaySession({ ts, deltaBaseline, deltaWire, deltaSaved, ghostRetries, cacheReadTokens });
 
     // ── History — always push, including net-negative requests ──────────────
     // Dropping net-negative points would make the time series dishonest.
@@ -184,7 +188,7 @@ export class SavingsTracker {
   // ───────────────────────────────────────────────────────────────────────────
   // _updateDisplaySession
   // ───────────────────────────────────────────────────────────────────────────
-  _updateDisplaySession({ ts, deltaBaseline, deltaWire, deltaSaved, ghostRetries }) {
+  _updateDisplaySession({ ts, deltaBaseline, deltaWire, deltaSaved, ghostRetries, cacheReadTokens = 0 }) {
     let session = this._state.display_session;
 
     const lastActivity = session.last_activity_at
@@ -204,6 +208,7 @@ export class SavingsTracker {
     session.tokens_before   += deltaBaseline;
     session.tokens_after    += deltaWire;
     session.tokens_saved    += deltaSaved;
+    session.cache_read_tokens += (cacheReadTokens || 0);
     session.last_activity_at = toUtcIso(ts);
 
     if (ghostRetries > 0) {
@@ -299,6 +304,11 @@ export class SavingsTracker {
 
     // Pad helper — handles negative numbers which need the sign included
     const pad = (val) => String(val).padEnd(20);
+    
+    let cacheRow = "";
+    if (lt.cache_read_tokens > 0) {
+      cacheRow = `\n│ Cache Read         │ ${pad(lt.cache_read_tokens.toLocaleString())} │`;
+    }
 
     return `
 ┌───────────────────────────────────────────┐
@@ -308,7 +318,7 @@ export class SavingsTracker {
 │ Tokens Before      │ ${pad(lt.tokens_before.toLocaleString())} │
 │ Tokens After       │ ${pad(lt.tokens_after.toLocaleString())} │
 │ Tokens Saved       │ ${pad(lt.tokens_saved.toLocaleString())} │
-│ Compression Ratio  │ ${pad(ratio + "%")} │
+│ Compression Ratio  │ ${pad(ratio + "%")} │${cacheRow}
 ├────────────────────┼──────────────────────┤
 │ Ghost Retries      │ ${pad(lt.ghost_retries.toLocaleString())} │
 │ Retry Rate         │ ${pad(retryRate + "%")} │
