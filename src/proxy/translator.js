@@ -469,9 +469,9 @@ export function translateAnthropicToOpenAI(payload, ctx = null) {
 
   if (Array.isArray(out.tools)) {
     out.tools = _sanitizeToolArray(out.tools);
-    console.log(
-      `[Tool Translator] 🛠️ Natively mapped ${out.tools.length} schemas`,
-    );
+//     console.log(
+//       `[Tool Translator] 🛠️ Natively mapped ${out.tools.length} schemas`,
+//     );
   }
 
   return out;
@@ -661,9 +661,9 @@ export function minimizeToolSchemas(payload) {
 
   if (_toolSchemaCacheMap.has(hash)) {
     payload.tools = _toolSchemaCacheMap.get(hash);
-    console.log(
-      `[Tool Minimizer] ✅ Cache hit (${hash}) — skipped minimization`,
-    );
+//     console.log(
+//       `[Tool Minimizer] ✅ Cache hit (${hash}) — skipped minimization`,
+//     );
     return payload;
   }
 
@@ -721,10 +721,10 @@ export function minimizeToolSchemas(payload) {
   // Cache the result
   _toolSchemaCacheMap.set(hash, payload.tools);
 
-  console.log(
-    `[Tool Minimizer] ${originalSize} → ${newSize} chars ` +
-      `(saved ~${savedTokens} tokens across ${payload.tools.length} tools) [cached as ${hash}]`,
-  );
+//   console.log(
+//     `[Tool Minimizer] ${originalSize} → ${newSize} chars ` +
+//       `(saved ~${savedTokens} tokens across ${payload.tools.length} tools) [cached as ${hash}]`,
+//   );
 
   // FIX F5: Stamp savings for observability and baseline derivation
   payload._cf_minimizeTokensSaved = savedTokens;

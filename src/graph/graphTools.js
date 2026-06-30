@@ -17,18 +17,18 @@ import {
   queryWhatDoesThisImport,
   queryWhoDependsOnFile,
   queryWhoCallsThis,
-  queryWhatDoesThisCall,
   querySymbolImpact,
   querySymbolDependencies,
   queryFindRoutes,
   getGraphStats,
   queryFindLiteralsByFn,
   queryFindConfigByFn,
+  getWorkspaceRoot,
 } from "./graphDb.js";
 import { statsEmitter } from "../proxy/statsEmitter.js";
 import fs from "node:fs";
 import path from "node:path";
-import { resolve, resolveWithEmbeddings } from "./semanticResolver.js";
+import { planRetrieval } from "./retrievalPlanner.js";
 
 export const GRAPH_TOOL_NAME = "contextforge_query_graph";
 
@@ -146,6 +146,7 @@ export function getGraphToolDefinition() {
           query_type: {
             type: "string",
             enum: [
+              "retrieve",
               "find",
               "read_function",
               "who_imports_this",
@@ -159,6 +160,10 @@ export function getGraphToolDefinition() {
               "find_route",
             ],
             description:
+              "\n  retrieve — unified retrieval with automatic source selection. " +
+              "Pass query + intent (location|implementation|architecture|debug). " +
+              "ContextForge decides whether to use graph, function body, call graph, or file. " +
+              "USE THIS FIRST before any other query type.\n" +
               "\n  find — unified search across symbols, literals, routes, env vars, and config. Returns metadata only." +
               "\n  read_function — read the exact full body of a symbol by name, plus related context." +
               "\n  Spatial: who_imports_this, what_does_this_export, find_symbol, " +
@@ -510,114 +515,63 @@ export async function executeGraphQuery(queryType, target) {
         break;
       }
 
-      // In executeGraphQuery, add new case:
+      // ADD before the "find" case:
+      case "retrieve": {
+        const intent = args.intent ?? "location";
+        const validIntents = ["location", "implementation", "architecture", "debug"];
 
-      case "find": {
-        // ── Tier 1: SQLite candidate-and-rank ──
-        const resolution = resolve(cleanTarget);
-
-        // ── Tier 2: Semantic fallback (HNSW + BM25) ──
-        // Runs when SQLite confidence is low OR found nothing.
-        // Results are merged with SQLite results and re-ranked.
-        let semanticResults = [];
-        let semanticStrategy = null;
-
-        if (resolution.needsSemanticFallback || !resolution.found) {
-          try {
-            const embResult = await resolveWithEmbeddings(cleanTarget);
-            semanticResults = embResult.results;
-            semanticStrategy = embResult.strategy;
-          } catch (err) {
-            // Non-critical — SQLite results still returned
-            if (process.env.CF_DEBUG_GRAPH === "1") {
-              console.warn(`[GraphQuery] Semantic fallback error: ${err.message}`);
-            }
-          }
-        }
-
-        // ── Unified ranking: merge SQLite + semantic ──
-        // Each candidate gets a unified_score combining both signals.
-        // SQLite exact matches dominate (weight 0.7), semantic augments (weight 0.3).
-        const allCandidates = new Map(); // dedupKey → candidate
-
-        // Add SQLite results
-        for (const r of resolution.results) {
-          const key = `${r.name || r.value || r.key || r.route}|${r.file || ""}|${r.startLine ?? r.line ?? 0}|${r.kind || r.type || ""}`;
-          allCandidates.set(key, {
-            ...r,
-            _sqliteScore: r._score ?? 0,
-            _semanticScore: 0,
-          });
-        }
-
-        // Merge semantic results — boost existing or add new
-        for (const r of semanticResults) {
-          const key = `${r.name}|${r.file}|${r.startLine ?? 0}|${r.kind || ""}`;
-          if (allCandidates.has(key)) {
-            // Boost existing SQLite result with semantic score
-            allCandidates.get(key)._semanticScore = r._semanticScore ?? 0;
-          } else {
-            // New result from semantic — add with zero SQLite score
-            allCandidates.set(key, {
-              ...r,
-              _sqliteScore: 0,
-              _semanticScore: r._semanticScore ?? 0,
-            });
-          }
-        }
-
-        // Compute unified score and sort
-        const unified = [...allCandidates.values()]
-          .map((c) => ({
-            ...c,
-            _unifiedScore: c._sqliteScore * 0.7 + c._semanticScore * 0.3,
-          }))
-          .sort((a, b) => b._unifiedScore - a._unifiedScore);
-
-        // Strip internal scoring fields before sending to LLM
-        const finalResults = unified.map(
-          ({ _sqliteScore, _semanticScore, _unifiedScore, _score, _semanticScore: _s, ...rest }) =>
-            rest
-        );
-
-        const totalFound = finalResults.length > 0;
-
-        if (!totalFound) {
+        if (!validIntents.includes(intent)) {
           result = JSON.stringify({
-            query: cleanTarget,
-            result: "not_found",
-            strategy_used: resolution.strategy,
-            confidence: resolution.confidence ?? 0,
-            message:
-              `'${cleanTarget}' not found in any index (SQLite + semantic searched). ` +
-              `Try what_does_this_export on the file you expect contains this.`,
+            error: "invalid_intent",
+            valid: validIntents,
+            message: `intent must be one of: ${validIntents.join(", ")}`,
           });
           break;
         }
 
-        // Cap any fn_body that came through from literal/config 1-hop join
-        const cappedResults = finalResults.map((r) => {
-          if (r.containing_function?.body) {
-            r.containing_function.body = capBodyText(
-              r.containing_function.body,
-              r.containing_function.name
-            );
-          }
-          return r;
-        });
-
-        const usedStrategies = [resolution.strategy];
-        if (semanticStrategy) usedStrategies.push(semanticStrategy);
+        const plan = await planRetrieval(cleanTarget, intent);
 
         result = JSON.stringify(
           {
             query: cleanTarget,
-            strategy_used: usedStrategies.join(" + "),
-            confidence: resolution.confidence ?? 0,
-            kind: resolution.kind,
-            results: cappedResults,
-            count: cappedResults.length,
-            hint: "Call read_function('name') to get the full body implementation of any symbol.",
+            intent,
+            confidence: plan.confidence,
+            strategy: plan.strategy,
+            tiers_used: plan.tiersUsed,
+            answer: plan.answer,
+          },
+          null,
+          2
+        );
+        break;
+      }
+
+      // In executeGraphQuery, add new case:
+
+      case "find": {
+        // Use the evidence planner for all find queries
+        const plan = await planRetrieval(cleanTarget, "implementation");
+
+        if (!plan.evidence.length) {
+          result = JSON.stringify({
+            query: cleanTarget,
+            result: "not_found",
+            strategy_used: plan.strategy,
+            message: `'${cleanTarget}' not found. Try a different search term.`,
+          });
+          break;
+        }
+
+        const formatted = formatEvidence(plan.evidence);
+
+        result = JSON.stringify(
+          {
+            query: cleanTarget,
+            confidence: plan.confidence,
+            strategy_used: plan.strategy,
+            results: formatted,
+            count: formatted.length,
+            hint: "Call read_function('name') to get full implementation.",
           },
           null,
           2
@@ -818,7 +772,12 @@ export function executeReadFileChunk(filePath, startLine, endLine) {
 
   let resolvedPath = filePath;
   if (!path.isAbsolute(resolvedPath)) {
-    resolvedPath = path.resolve(process.cwd(), resolvedPath);
+    // Try workspace root first (from the graph mapper), then fall back to cwd
+    const workspaceRoot = getWorkspaceRoot();
+    resolvedPath = path.resolve(workspaceRoot, resolvedPath);
+    if (!fs.existsSync(resolvedPath)) {
+      resolvedPath = path.resolve(process.cwd(), filePath);
+    }
   }
 
   try {
@@ -917,7 +876,7 @@ export function injectReadFileChunkTool(tools) {
   }
 
   if (!_readFileChunkInjectedOnce) {
-    console.log(`[ReadFileChunk] ✅ Tool injected`);
+//     console.log(`[ReadFileChunk] ✅ Tool injected`);
     _readFileChunkInjectedOnce = true;
   }
 
@@ -944,4 +903,58 @@ function findCallLineInFile(filePath, functionName) {
     }
   }
   return null;
+}
+
+function formatEvidence(evidence) {
+  const output = [];
+  for (const e of evidence) {
+    for (const item of e.items) {
+      if (item.type === "symbol") {
+        const entry = {
+          type: "symbol",
+          name: item.name,
+          kind: item.kind,
+          file: item.file,
+          startLine: item.startLine,
+          endLine: item.endLine,
+          complexity: item.complexity,
+          signature: item.signature,
+          calls: item.calls || [],
+          literalRefs: item.literalRefs || [],
+          envRefs: item.envRefs || [],
+        };
+        // Cap body if present
+        if (item.body) entry.body = capBodyText(item.body, item.name);
+        output.push(entry);
+      } else if (item.type === "route") {
+        output.push({
+          type: "route",
+          route: item.route,
+          file: item.file,
+          line: item.line,
+          handler: item.handler,
+        });
+      } else if (item.type === "literal" || item.type === "env_var") {
+        output.push({
+          type: item.type,
+          value: item.value || item.key,
+          file: item.file,
+          line: item.line,
+          usedIn: item.usedIn,
+          containing_function: item.containing_function || undefined,
+        });
+      } else if (item.body) {
+        // function_body items
+        output.push({
+          type: "function_body",
+          name: item.name,
+          file: item.file,
+          startLine: item.startLine,
+          endLine: item.endLine,
+          body: capBodyText(item.body, item.name),
+        });
+      }
+    }
+  }
+  return output;
 }

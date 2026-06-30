@@ -34,12 +34,13 @@ import {
 } from "../graph/graphTools.js";
 import { isPatchToolCall, executePatchToolCall, PATCH_TOOL_NAME } from "../graph/patchTools.js";
 import { hasMemoryToolCalls, executeMemoryToolCalls } from "../memory/memoryTools.js";
+import { normalizeConceptKey } from "../graph/semanticResolver.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const MAX_GHOST_RETRIES = 10;
-const MAX_GRAPH_ONLY_ROUNDS = 5;
+const MAX_GRAPH_ONLY_ROUNDS = 3;
 
 // ── Chunk cache ──────────────────────────────────────────────────────────────
 // Caches file lines read during the session so overlapping reads
@@ -203,10 +204,10 @@ export function invalidateCacheForPatch(filePath, symbol) {
   chunkCacheInvalidateFile(filePath);
 
   if (cleared > 0) {
-    console.log(
-      `[Ghost Interceptor] 🗑️  Invalidated ${cleared} cache entries` +
-        (symbol ? ` for symbol '${symbol}'` : ` for file '${fileBasename}'`)
-    );
+//     console.log(
+//       `[Ghost Interceptor] 🗑️  Invalidated ${cleared} cache entries` +
+//         (symbol ? ` for symbol '${symbol}'` : ` for file '${fileBasename}'`)
+//     );
   }
 }
 
@@ -242,9 +243,9 @@ export function invalidateCacheForFile(filePath) {
   chunkCacheInvalidateFile(filePath);
 
   if (cleared > 0) {
-    console.log(
-      `[Ghost Interceptor] 🗑️  Invalidated ${cleared} cache entries for file '${fileBasename}'`
-    );
+//     console.log(
+//       `[Ghost Interceptor] 🗑️  Invalidated ${cleared} cache entries for file '${fileBasename}'`
+//     );
   }
 }
 
@@ -260,6 +261,8 @@ class ToolInterceptor {
     this.req = ctx.req;
     this._graphOnlyRounds = 0;
     this._retrievedVaultIds = new Set();
+    this._resolvedConcepts = new Map(); // normalizedKey → content string
+    this._consecutivePatchFailures = 0;
   }
 
   isBackgroundTool(name) {
@@ -295,10 +298,10 @@ class ToolInterceptor {
     if (allAreGraphQueries) {
       this._graphOnlyRounds++;
       if (this._graphOnlyRounds > MAX_GRAPH_ONLY_ROUNDS) {
-        console.warn(
-          `\n[Ghost Interceptor] ⚠️  Graph-only round ${this._graphOnlyRounds} — ` +
-            `LLM stuck in navigation loop. Letting through to force decision.`
-        );
+//         console.warn(
+//           `\n[Ghost Interceptor] ⚠️  Graph-only round ${this._graphOnlyRounds} — ` +
+//             `LLM stuck in navigation loop. Letting through to force decision.`
+//         );
         return { intercepted: false };
       }
     } else {
@@ -321,7 +324,7 @@ class ToolInterceptor {
       // ── Session cache ──
       const cachedResult = sessionCacheGet(name, argsStr);
       if (cachedResult !== null) {
-        console.log(`[Ghost Interceptor] ♻️ Session cache hit: ${name}("${argsStr.slice(0, 60)}")`);
+//         console.log(`[Ghost Interceptor] ♻️ Session cache hit: ${name}("${argsStr.slice(0, 60)}")`);
         results.push({ tool_call_id: tc.id, name, content: cachedResult });
         continue;
       }
@@ -330,9 +333,9 @@ class ToolInterceptor {
       try {
         args = JSON.parse(argsStr);
       } catch (err) {
-        console.error(
-          `[Ghost Interceptor] ⚠️ Args JSON malformed for ${name}: "${argsStr.slice(0, 120)}"`
-        );
+//         console.error(
+//           `[Ghost Interceptor] ⚠️ Args JSON malformed for ${name}: "${argsStr.slice(0, 120)}"`
+//         );
         results.push({
           tool_call_id: tc.id,
           name,
@@ -351,13 +354,56 @@ class ToolInterceptor {
 
       if (isGraphToolCall(name)) {
         if (args.query_type && args.target !== undefined) {
-          content = await executeGraphQuery(args.query_type, args.target);
-          console.log(
-            `[Ghost Interceptor] ✅ Graph: ${args.query_type}("${args.target}") → ${content.length} chars`
-          );
-          statsEmitter.recordAgentAction("graphLookups");
-          toolSucceeded = true;
-          isActionTool = false;
+          // ── Concept dedup for find() only ─────────────────────────────────
+          if (args.query_type === "find") {
+            const conceptKey = normalizeConceptKey(args.target);
+            const resolvedResult = this._resolvedConcepts.get(conceptKey);
+
+            if (resolvedResult !== undefined) {
+//               console.log(
+//                 `[Ghost Interceptor] 🔁 Concept cache hit: find("${args.target}") ` +
+//                   `→ key "${conceptKey}" (${resolvedResult.length} chars)`
+//               );
+              // Set content and fall through — metrics, session cache, results.push all run normally
+              content = resolvedResult;
+              toolSucceeded = true;
+              isActionTool = false;
+              // Skip the executeGraphQuery call but continue normal pipeline below
+            }
+          }
+
+          // Only execute if not already resolved by concept cache above
+          if (!content) {
+            content = await executeGraphQuery(args.query_type, args.target);
+            console.log(
+              `[Ghost Interceptor] ✅ Graph: ${args.query_type}("${args.target}") → ${content.length} chars`
+            );
+            statsEmitter.recordAgentAction("graphLookups");
+            toolSucceeded = true;
+            isActionTool = false;
+
+            // ── Mark concept resolved only on genuine find() success ────────
+            // Parse the JSON response and check the structured found flag —
+            // never use content.length as a success proxy.
+            if (args.query_type === "find") {
+              try {
+                const parsed = JSON.parse(content);
+                // found:true + count>0 = genuine result
+                // result:"not_found" = miss — don't cache, let variations try
+                if (parsed.found === true && parsed.count > 0) {
+                  const conceptKey = normalizeConceptKey(args.target);
+                  this._resolvedConcepts.set(conceptKey, content);
+                  if (process.env.CF_DEBUG_GRAPH === "1") {
+//                     console.log(
+//                       `[Ghost Interceptor] 📌 Concept resolved: "${args.target}" → key "${conceptKey}"`
+//                     );
+                  }
+                }
+              } catch {
+                // JSON parse failed — don't cache, safe to retry
+              }
+            }
+          }
         } else {
           content = JSON.stringify({ error: "Missing query_type or target" });
           toolSucceeded = false;
@@ -368,10 +414,10 @@ class ToolInterceptor {
         const cachedChunk = chunkCacheGet(args.file_path, args.start_line, args.end_line);
         if (cachedChunk !== null) {
           content = cachedChunk;
-          console.log(
-            `[Ghost Interceptor] ♻️ Chunk cache hit: ${args.file_path}` +
-              ` L${args.start_line}-${args.end_line} → ${content.length} chars`
-          );
+//           console.log(
+//             `[Ghost Interceptor] ♻️ Chunk cache hit: ${args.file_path}` +
+//               ` L${args.start_line}-${args.end_line} → ${content.length} chars`
+//           );
         } else {
           content = executeReadFileChunk(args.file_path, args.start_line, args.end_line);
           chunkCacheSet(args.file_path, args.start_line, args.end_line, content);
@@ -385,25 +431,46 @@ class ToolInterceptor {
       } else if (isPatchToolCall(name)) {
         isActionTool = true;
         content = await executePatchToolCall(argsStr, this.semanticCache);
-        console.log(`[Ghost Interceptor] 🩹 Patch tool executed`);
+//         console.log(`[Ghost Interceptor] 🩹 Patch tool executed`);
         statsEmitter.recordAgentAction("astPatches");
 
         try {
           const parsed = JSON.parse(content);
           toolSucceeded = parsed.success === true;
           if (toolSucceeded) {
-            console.log(`[Ghost Interceptor] ✅ Patch succeeded`);
+//             console.log(`[Ghost Interceptor] ✅ Patch succeeded`);
             invalidateCacheForPatch(args.file_path, args.target_symbol || null);
             recordPatch(
               args.file_path,
               args.target_symbol || null,
               parsed.lines_changed ?? parsed.lines_inserted ?? 0
             );
+            this._consecutivePatchFailures = 0; // ← reset on success
           } else {
-            console.log(`[Ghost Interceptor] ❌ Patch failed: ${parsed.error?.slice(0, 100)}`);
+//             console.log(`[Ghost Interceptor] ❌ Patch failed: ${parsed.error?.slice(0, 100)}`);
+
+            // ← NEW: clear chunk cache so next read hits disk not stale cache
+            chunkCacheInvalidateFile(args.file_path);
+
+            // ← NEW: clear graph cache for this file too
+            invalidateCacheForFile(args.file_path);
+
+            // ← NEW: consecutive failure guard
+            this._consecutivePatchFailures = (this._consecutivePatchFailures ?? 0) + 1;
+            if (this._consecutivePatchFailures >= 3) {
+//               console.warn(
+//                 `[Ghost Interceptor] ⚠️ ${this._consecutivePatchFailures} consecutive patch failures — forcing read hint`
+//               );
+              content = JSON.stringify({
+                success: false,
+                error: parsed.error,
+                hint: `STOP retrying. Use read_file_chunk(file_path: "${args.file_path}", start_line: 1, end_line: 99999) to get the exact current file content before attempting another patch.`,
+              });
+            }
           }
         } catch {
           toolSucceeded = false;
+          this._consecutivePatchFailures = (this._consecutivePatchFailures ?? 0) + 1;
         }
       } else if (normalized.includes("contextforge_retrieve")) {
         isActionTool = true;
@@ -419,7 +486,7 @@ class ToolInterceptor {
               vaultedText =
                 `[Graph result for '${sq}' from ${hit.file} lines ${hit.start_line}–${hit.end_line}]\n\n` +
                 hit.body;
-              console.log(`[Ghost Interceptor] 🗺️ Graph shortcut hit for '${sq}'`);
+//               console.log(`[Ghost Interceptor] 🗺️ Graph shortcut hit for '${sq}'`);
             }
           } catch {}
         }
@@ -434,7 +501,7 @@ class ToolInterceptor {
               this.hybridRetriever
             );
           } catch (err) {
-            console.error(`[Ghost Interceptor] ⚠️ Vault retrieval failed: ${err.message}`);
+//             console.error(`[Ghost Interceptor] ⚠️ Vault retrieval failed: ${err.message}`);
           }
         }
 
@@ -453,18 +520,18 @@ class ToolInterceptor {
                 `To get the FULL raw source for patching, call contextforge_retrieve ` +
                 `with vault_id="${args.vault_id}" again.\n\n` +
                 compressed.kept;
-              console.log(
-                `[Ghost Interceptor] 📦 Vault ${args.vault_id} compressed on first access: ` +
-                  `${vaultedText.length} chars (${reduction}% reduction)`
-              );
+//               console.log(
+//                 `[Ghost Interceptor] 📦 Vault ${args.vault_id} compressed on first access: ` +
+//                   `${vaultedText.length} chars (${reduction}% reduction)`
+//               );
             }
           }
 
           recordCCRSuccess(currentPayload, args.vault_id);
           statsEmitter.recordAgentAction("rawVaultOpens");
-          console.log(
-            `[Ghost Interceptor] ✅ Vault ${args.vault_id} opened (${vaultedText.length} chars)`
-          );
+//           console.log(
+//             `[Ghost Interceptor] ✅ Vault ${args.vault_id} opened (${vaultedText.length} chars)`
+//           );
           content = vaultedText;
           toolSucceeded = true;
         } else {
@@ -482,7 +549,7 @@ class ToolInterceptor {
         if (toolResults.length > 0) {
           content = toolResults[0].content;
           toolSucceeded = true;
-          console.log("[Ghost Interceptor] 🧠 Memory tool executed successfully");
+//           console.log("[Ghost Interceptor] 🧠 Memory tool executed successfully");
         } else {
           content = "Memory tool returned no results.";
           toolSucceeded = false;
@@ -498,7 +565,7 @@ class ToolInterceptor {
       if (isActionTool && toolSucceeded) madeForwardProgress = true;
       if (isActionTool && !toolSucceeded) hadFailure = true;
 
-      results.push({ tool_call_id: tc.id, name, content });
+      results.push({ tool_call_id: tc.id, name, content, __cf_raw: isReadFileChunkTool(name) });
     }
 
     return {
@@ -539,7 +606,7 @@ function normalizeUsage(rawUsage) {
     return {
       input: (rawUsage.input_tokens || 0) + (rawUsage.cache_creation_input_tokens || 0),
       cacheRead: rawUsage.cache_read_input_tokens || 0,
-      output: rawUsage.output_tokens || 0
+      output: rawUsage.output_tokens || 0,
     };
   }
 
@@ -548,11 +615,11 @@ function normalizeUsage(rawUsage) {
     const totalPrompt = rawUsage.prompt_tokens || 0;
     const cacheRead = rawUsage.prompt_tokens_details?.cached_tokens || 0;
     return {
-      // In OpenAI, prompt_tokens includes the cached tokens. 
+      // In OpenAI, prompt_tokens includes the cached tokens.
       // We subtract them to find the "active" input tokens that cost full price.
-      input: Math.max(0, totalPrompt - cacheRead), 
+      input: Math.max(0, totalPrompt - cacheRead),
       cacheRead: cacheRead,
-      output: rawUsage.completion_tokens || 0
+      output: rawUsage.completion_tokens || 0,
     };
   }
 
@@ -677,9 +744,9 @@ export function createUpstreamHandler(ctx) {
         : provider.hostname;
 
       if (retryCount === 0) {
-        console.log(`\n[Route] ${req.url} -> ${providerBase}${outboundPath}`);
+//         console.log(`\n[Route] ${req.url} -> ${providerBase}${outboundPath}`);
       } else {
-        console.log(`\n[Ghost Interceptor] Retry #${retryCount} -> ${providerBase}${outboundPath}`);
+//         console.log(`\n[Ghost Interceptor] Retry #${retryCount} -> ${providerBase}${outboundPath}`);
       }
 
       const isStreamRequest = currentPayload.stream === true;
@@ -888,9 +955,9 @@ export function createUpstreamHandler(ctx) {
 
                   if (result.intercepted) {
                     if (result.circuitBreakerTripped) {
-                      console.warn(
-                        `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on streaming path.`
-                      );
+//                       console.warn(
+//                         `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on streaming path.`
+//                       );
                       currentPayload.messages.push(
                         {
                           role: "assistant",
@@ -922,6 +989,7 @@ export function createUpstreamHandler(ctx) {
                         tool_call_id: r.tool_call_id,
                         name: r.name,
                         content: r.content,
+                        ...(r.__cf_raw ? { __cf_raw: true } : {})
                       });
                     }
 
@@ -999,9 +1067,9 @@ export function createUpstreamHandler(ctx) {
 
               if (result.intercepted) {
                 if (result.circuitBreakerTripped) {
-                  console.warn(
-                    `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on non-streaming path.`
-                  );
+//                   console.warn(
+//                     `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on non-streaming path.`
+//                   );
                   currentPayload.messages.push(
                     {
                       role: "assistant",
@@ -1041,6 +1109,7 @@ export function createUpstreamHandler(ctx) {
                     tool_call_id: r.tool_call_id,
                     name: r.name,
                     content: r.content,
+                    ...(r.__cf_raw ? { __cf_raw: true } : {})
                   });
                 }
 
@@ -1084,7 +1153,7 @@ export function createUpstreamHandler(ctx) {
               const normalizedUsage = normalizeUsage(jsonResponse.usage);
               // Replace the locally estimated 'hopTokens' with the true input from the LLM
               acc.accumulatedInputTokens -= hopTokens;
-              acc.accumulatedInputTokens += (normalizedUsage.input + normalizedUsage.cacheRead);
+              acc.accumulatedInputTokens += normalizedUsage.input + normalizedUsage.cacheRead;
               acc.accumulatedCacheReadTokens += normalizedUsage.cacheRead;
             }
 

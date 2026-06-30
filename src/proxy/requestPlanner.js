@@ -216,6 +216,15 @@ function scoreIntents(message) {
   const confidence =
     totalScore === 0 ? 0 : (winnerScore - runnerScore) / totalScore;
 
+  if (confidence < 0.5) {
+    const hasCreate = scores.CREATE > 0;
+    const hasPatch = scores.PATCH > 0;
+    if (hasCreate && hasPatch) {
+      // Multi-task prompt — use DEBUG for full capability set
+      return { intent: "DEBUG", score: winnerScore, confidence: 0, allScores: scores, matchedPatterns };
+    }
+  }
+
   return {
     intent: totalScore === 0 ? "CHAT" : winnerIntent,
     score: winnerScore,
@@ -232,7 +241,7 @@ function scoreIntents(message) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CAPABILITY_MATRIX = {
-  PATCH: new Set([CAPABILITIES.PATCH]), // targeted edit
+  PATCH: new Set([CAPABILITIES.GRAPH, CAPABILITIES.PATCH, CAPABILITIES.READ]), // edit with context
   DEBUG: new Set([CAPABILITIES.GRAPH, CAPABILITIES.PATCH, CAPABILITIES.READ]), // exploratory fix
   SEARCH: new Set([CAPABILITIES.GRAPH, CAPABILITIES.READ]), // explorer
   CREATE: new Set([CAPABILITIES.GRAPH, CAPABILITIES.READ]), // explore before scaffold
@@ -336,7 +345,7 @@ export async function initPlanner(onnxEmbedder, semanticCache) {
   _embedder = onnxEmbedder;
   _plannerCache = semanticCache;
 
-  console.log("[Planner] Starting anchor embedding...");
+//   console.log("[Planner] Starting anchor embedding...");
 
   let totalAnchors = 0;
   for (const [intent, phrases] of Object.entries(SEMANTIC_ANCHORS)) {
@@ -349,9 +358,9 @@ export async function initPlanner(onnxEmbedder, semanticCache) {
         _idToIntent.set(anchorId, intent);
         totalAnchors++;
       } catch (err) {
-        console.warn(
-          `[Planner] ⚠️ Failed to embed anchor "${phrase}": ${err.message}`,
-        );
+//         console.warn(
+//           `[Planner] ⚠️ Failed to embed anchor "${phrase}": ${err.message}`,
+//         );
       }
     }
   }
@@ -359,14 +368,14 @@ export async function initPlanner(onnxEmbedder, semanticCache) {
   _plannerReady = true;
 
   const cacheStats = semanticCache.stats();
-  console.log(
-    `[Planner] ✅ Ready — ${Object.keys(SEMANTIC_ANCHORS).length} intents, ` +
-      `${totalAnchors} anchors in HNSW`,
-  );
-  console.log(
-    `[Planner] 📊 Cache stats: total=${cacheStats.size}, ` +
-      `namespaces=${JSON.stringify(cacheStats.namespaces)}`,
-  );
+//   console.log(
+//     `[Planner] ✅ Ready — ${Object.keys(SEMANTIC_ANCHORS).length} intents, ` +
+//       `${totalAnchors} anchors in HNSW`,
+//   );
+//   console.log(
+//     `[Planner] 📊 Cache stats: total=${cacheStats.size}, ` +
+//       `namespaces=${JSON.stringify(cacheStats.namespaces)}`,
+//   );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -402,37 +411,40 @@ function extractLastUserMessage(payload) {
  */
 async function semanticLookup(message) {
   if (!_plannerReady || !_embedder || !_plannerCache) {
-    console.log(
-      `[Planner] ⚠️ semanticLookup skipped: ready=${_plannerReady}, embedder=${!!_embedder}, cache=${!!_plannerCache}`,
-    );
+//     console.log(
+//       `[Planner] ⚠️ semanticLookup skipped: ready=${_plannerReady}, embedder=${!!_embedder}, cache=${!!_plannerCache}`,
+//     );
     return null;
   }
 
   try {
-    const queryVec = await _embedder.embed(message);
+    const queryVec = await Promise.race([
+      _embedder.embed(message),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("embed timeout")), 2000))
+    ]);
 
     const hits = _plannerCache.searchK(queryVec, 5);
     if (!hits || hits.length === 0) {
-      console.log(`[Planner] ⚠️ searchK returned no hits`);
+//       console.log(`[Planner] ⚠️ searchK returned no hits`);
       return null;
     }
 
     const plannerHits = hits.filter((h) => h.namespace === "PLANNER");
     if (plannerHits.length === 0) {
-      console.log(
-        `[Planner] ⚠️ searchK returned ${hits.length} hits but none in PLANNER namespace`,
-      );
-      console.log(
-        `[Planner] ⚠️ Hit namespaces: ${hits.map((h) => h.namespace).join(", ")}`,
-      );
+//       console.log(
+//         `[Planner] ⚠️ searchK returned ${hits.length} hits but none in PLANNER namespace`,
+//       );
+//       console.log(
+//         `[Planner] ⚠️ Hit namespaces: ${hits.map((h) => h.namespace).join(", ")}`,
+//       );
       return null;
     }
 
     const topScore = plannerHits[0].score;
     if (topScore < SEMANTIC_SCORE_THRESHOLD) {
-      console.log(
-        `[Planner] ⚠️ Top score ${topScore.toFixed(3)} below threshold ${SEMANTIC_SCORE_THRESHOLD}`,
-      );
+//       console.log(
+//         `[Planner] ⚠️ Top score ${topScore.toFixed(3)} below threshold ${SEMANTIC_SCORE_THRESHOLD}`,
+//       );
       return null;
     }
 
@@ -452,7 +464,8 @@ async function semanticLookup(message) {
       votes: intentVotes,
     };
   } catch (err) {
-    console.error(`[Planner] ❌ semanticLookup failed: ${err.message}`);
+    console.warn(`[Planner] ⚠️ Semantic lookup failed: ${err.message}`);
+//     console.error(`[Planner] ❌ semanticLookup failed: ${err.message}`);
     console.error(err.stack);
     return null;
   }
@@ -590,10 +603,10 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
       evidence.push(`semantic_votes=${JSON.stringify(semResult.votes)}`);
       evidence.push(`semantic_winner=${semResult.intent}`);
 
-      console.log(
-        `[Planner] 🧠 Semantic: "${lastMsg.slice(0, 50)}" → ${finalIntent} ` +
-          `(score: ${semResult.score.toFixed(3)}, votes: ${JSON.stringify(semResult.votes)})`,
-      );
+//       console.log(
+//         `[Planner] 🧠 Semantic: "${lastMsg.slice(0, 50)}" → ${finalIntent} ` +
+//           `(score: ${semResult.score.toFixed(3)}, votes: ${JSON.stringify(semResult.votes)})`,
+//       );
     } else {
       if (semResult) {
         evidence.push(
@@ -616,9 +629,9 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
         method = "context_signal";
         evidence.push(`context_signal=file_or_symbol_reference`);
         evidence.push(`chat_upgraded_to_search=true`);
-        console.log(
-          `[Planner] 📁 Context signal: file/symbol reference → SEARCH`,
-        );
+//         console.log(
+//           `[Planner] 📁 Context signal: file/symbol reference → SEARCH`,
+//         );
       } else {
         // Keep regex winner — never override PATCH/DEBUG with context signals
         finalIntent = regexResult.intent;

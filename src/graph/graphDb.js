@@ -16,6 +16,10 @@ let _db = null;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+let _workspaceRoot = null;
+export function setWorkspaceRoot(root) { _workspaceRoot = root; }
+export function getWorkspaceRoot() { return _workspaceRoot || process.env.CF_WORKSPACE_PATH || process.cwd(); }
+
 export function getGraphDb(dbPath = null) {
   if (_db) return _db;
 
@@ -333,7 +337,10 @@ function stmts() {
              source_symbol AS handler, source_line
       FROM   edges
       WHERE  relation = 'defines_route'
-        AND  (? IS NULL OR target_symbol LIKE '%' || ? || '%')
+        AND  (? IS NULL 
+              OR target_symbol LIKE '%' || ? || '%'
+              OR target_symbol LIKE '% ' || ?       -- matches "GET /:id" when searching "/:id"
+              OR target_symbol LIKE '%/' || ? || '%') -- matches "/files/:id" when searching "/:id"
       ORDER BY source_file, target_symbol
     `),
 
@@ -583,7 +590,7 @@ export function querySymbolDependencies(symbolName) {
 }
 
 export function queryFindRoutes(routeFilter = null) {
-  return stmts().findRoutes.all(routeFilter, routeFilter);
+  return stmts().findRoutes.all(routeFilter, routeFilter, routeFilter, routeFilter);
 }
 
 export function queryFindLiteral(value) {

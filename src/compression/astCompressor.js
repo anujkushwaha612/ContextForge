@@ -88,6 +88,11 @@ export function compressCodeOutput(
   policy = null,
   filePath = null,
 ) {
+  // NEW: If the current request intent is PATCH, never compress
+  if (policy?.intent === "PATCH") {
+    return { kept: text, vaulted: false };
+  }
+
   // FIX F3: Raise threshold to ~200 tokens to avoid inflating tiny files
   if (typeof text !== "string" || text.length < 800) {
     return { kept: text, vaulted: false };
@@ -377,7 +382,7 @@ export async function compressCodeToolResults(payload) {
       // SemanticDedup — their content is either a CF_DELTA stub or a
       // vault reference. Running tree-sitter on these wastes 10-30ms
       // and produces garbage output.
-      if (msg._cf_deduped) {
+      if (msg._cf_deduped || msg.__cf_raw) {
         newMessages.push(msg);
         continue;
       }
@@ -433,7 +438,7 @@ export async function compressCodeToolResults(payload) {
         ) {
           // ── Guard: Skip already-vaulted blocks ──
           if (
-            block._dedupVaultId ||
+            block._dedupVaultId || block.__cf_raw ||
             (typeof block.content === "string" &&
               block.content.includes("[CF_VAULT:"))
           ) {

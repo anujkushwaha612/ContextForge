@@ -276,12 +276,12 @@ export function alignCachePrefix(payload, clientName = "anthropic") {
   } else {
     if (state.lastStaticHash !== null) {
       const delta = Math.round(staticPrefix.length / 4) - state.lastStaticTokens;
-      console.log(
-        `[CacheAligner] ⚠️ Static prefix changed ` +
-        `(client: ${clientName}, new hash: ${staticHash}, ` +
-        `previous streak: ${state.consecutiveHits} hits, ` +
-        `token delta: ${delta > 0 ? "+" : ""}${delta})`,
-      );
+//       console.log(
+//         `[CacheAligner] ⚠️ Static prefix changed ` +
+//         `(client: ${clientName}, new hash: ${staticHash}, ` +
+//         `previous streak: ${state.consecutiveHits} hits, ` +
+//         `token delta: ${delta > 0 ? "+" : ""}${delta})`,
+//       );
       
       // FIX 2: Diagnostic output showing exactly what changed
       // console.log(`[CacheAligner] 🔍 OLD PREFIX (first 300 chars):\n${state.lastStaticPrefix.slice(0, 300)}`);
@@ -329,12 +329,12 @@ export function alignCachePrefix(payload, clientName = "anthropic") {
     ? ((state.totalHits / state.totalAlignments) * 100).toFixed(1) 
     : "0.0";
 
-  console.log(
-    `[CacheAligner] 📌 [${clientName}] Prefix: ${staticTokens} tokens (hash: ${staticHash}) | ` +
-    `Dynamic: ${dynamicTokens} tokens | ` +
-    `Streak: ${state.consecutiveHits} | ` +
-    `Hit rate: ${hitRate}%`,
-  );
+//   console.log(
+//     `[CacheAligner] 📌 [${clientName}] Prefix: ${staticTokens} tokens (hash: ${staticHash}) | ` +
+//     `Dynamic: ${dynamicTokens} tokens | ` +
+//     `Streak: ${state.consecutiveHits} | ` +
+//     `Hit rate: ${hitRate}%`,
+//   );
 
   // ── Dashboard hook ──
   statsEmitter.recordCacheAlignStreak(

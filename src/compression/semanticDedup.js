@@ -243,9 +243,17 @@ function buildMessageKey(msg) {
 // SimHash wrappers
 // ─────────────────────────────────────────────
 
+function normalizeForFingerprint(content) {
+  return content
+    .replace(/cf_vault_[a-f0-9]+/g, "VAULT_ID")
+    .replace(/\[CF_COMPRESSED_FILE vault_id:"[^"]+"\]/g, "[CF_COMPRESSED]")
+    .replace(/vault_id="[^"]+"/g, 'vault_id="STABLE"');
+}
+
 function computeFingerprint(text) {
   try {
-    return native.simhash(text);
+    const normalized = normalizeForFingerprint(text);
+    return native.simhash(normalized);
   } catch (err) {
     console.warn("[SemanticDedup] SimHash failed:", err.message);
     return null;
@@ -530,7 +538,7 @@ function getDynamicThreshold({ contentLength, fileType }) {
   if (contentLength > 100_000) return 20;
   if (contentLength > 50_000)  return 16;
   if (contentLength > 20_000)  return 12;
-  return 8;
+  return 14;  // Raise from 8 to 14 — catches metadata-only changes in small files
 }
 
 async function deduplicateMessage(msg, key) {
@@ -550,10 +558,10 @@ async function deduplicateMessage(msg, key) {
       }
       const tokensSaved = Math.round(content.length / 4);
       statsEmitter.recordCacheHit("semanticDedup", true);
-      console.log(
-        `[SemanticDedup] ⚡ Fast-path exact duplicate: ${key} ` +
-          `(FNV-1a match, SimHash skipped)`,
-      );
+      // console.log(
+      //   `[SemanticDedup] ⚡ Fast-path exact duplicate: ${key} ` +
+      //     `(FNV-1a match, SimHash skipped)`,
+      // );
       return {
         deduplicated: true,
         msg: {

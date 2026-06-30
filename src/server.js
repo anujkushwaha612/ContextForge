@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { writeFileSync, readFileSync } from "node:fs";
+import crypto from "node:crypto";
 
 // ── ContextForge core ──
 import { detectAdapter } from "./adapters/index.js";
@@ -72,6 +73,14 @@ const __dirname = path.dirname(__filename);
 const providerName = process.env.CF_PROVIDER || "ollama";
 const provider = ProviderFactory.getAdapter(providerName);
 
+let _cachedPlan = null;
+let _cachedMessageHash = null;
+
+function hashMessage(msg) {
+  if (!msg) return "";
+  return crypto.createHash("sha256").update(msg).digest("hex");
+}
+
 // ─────────────────────────────────────────────
 // Native module initialization
 // ─────────────────────────────────────────────
@@ -107,6 +116,11 @@ const symbolRetriever = new native.HybridRetriever(symbolSemanticCache, {
   dimension: 384,
   denseWeight: 0.7, // symbol retrieval: dense-heavy
 });
+
+// CRITICAL FIX: Prevent the JS SemanticCache from being garbage collected.
+// If it is GC'd, the C++ HybridRetriever is left with a dangling pointer
+// to the underlying hnswIndex, causing a segmentation fault during indexing.
+symbolRetriever._keepAliveCache = symbolSemanticCache;
 
 const memoryHandler = new MemoryHandler(memoryStore, hybridRetriever, {
   maxTokens: 1024,
@@ -150,7 +164,7 @@ console.log("[Memory] PersistentMemoryStore ready");
 
   // ── Step 4: Initialize planner ─────────────────────────────────────────
   await initPlanner(onnxEmbedder, semanticCache);
-  console.log("[Planner] ✅ Initialization complete");
+  //   console.log("[Planner] ✅ Initialization complete");
 
   // ── Step 5: Start accepting requests ───────────────────────────────────
   const PORT = parseInt(process.env.CF_PORT || process.env.PORT || "3000", 10);
@@ -474,7 +488,7 @@ const server = http.createServer((req, res) => {
     // PASSTHROUGH MODE (CF_MODE=passthrough)
     // ─────────────────────────────────────────────────────────────────────────────
     if (process.env.CF_MODE === "passthrough" && req.headers["x-cf-dry-run"] !== "true") {
-      console.log(`[Pipeline] Passthrough: CF_MODE=passthrough (All optimizations disabled)`);
+      //       console.log(`[Pipeline] Passthrough: CF_MODE=passthrough (All optimizations disabled)`);
       const passthroughMetrics = await executeUpstreamRequest(payload);
       const passthroughWireTokens =
         passthroughMetrics?.accumulatedInputTokens ?? trueBaselineTokens;
@@ -544,18 +558,28 @@ const server = http.createServer((req, res) => {
           method: "origin_detection",
           bypass: true,
         };
-        console.log(
-          `[Planner] ⏭️ Bypass — ${originResult.origin.toLowerCase()}, no repository work needed`
-        );
+        //         console.log(
+        //           `[Planner] ⏭️ Bypass — ${originResult.origin.toLowerCase()}, no repository work needed`
+        //         );
         return;
       }
 
       // ── Step 2: Intent + capability planning ──────────────────────────
-      plan = await planPipeline(
-        payload,
-        { hasPriorTools, trueBaselineTokens, originHint: originResult.origin },
-        onnxEmbedder
-      );
+      const userMsgs = payload.messages.filter((m) => m.role === "user");
+      const lastUserMessage = userMsgs.length > 0 ? userMsgs[userMsgs.length - 1].content : "";
+      const messageHash = hashMessage(lastUserMessage);
+
+      if (_cachedPlan && _cachedMessageHash === messageHash) {
+        plan = _cachedPlan;
+      } else {
+        plan = await planPipeline(
+          payload,
+          { hasPriorTools, trueBaselineTokens, originHint: originResult.origin },
+          onnxEmbedder
+        );
+        _cachedPlan = plan;
+        _cachedMessageHash = messageHash;
+      }
 
       console.log(
         `[Planner] Intent: ${plan.intent} | Method: ${plan.method}` +
@@ -572,14 +596,22 @@ const server = http.createServer((req, res) => {
       }
 
       if (!plan.bypass) {
-        if (plan.capabilities.has(CAPABILITIES.GRAPH))
-          payload.tools = injectGraphTool(payload.tools);
-        if (plan.capabilities.has(CAPABILITIES.PATCH))
-          payload.tools = injectPatchTool(payload.tools);
-        if (plan.capabilities.has(CAPABILITIES.READ))
-          payload.tools = injectReadFileChunkTool(payload.tools);
+        const toolInjectionCost = 2000; // ~2000 tokens
+        if (trueBaselineTokens < toolInjectionCost * 2 && !hasPriorTools) {
+          plan.bypass = true;
+          console.log(
+            `[Planner] ⏭️ Bypass — payload too small (${trueBaselineTokens} tokens), skipping tools to prevent token inflation`
+          );
+        } else {
+          if (plan.capabilities.has(CAPABILITIES.GRAPH))
+            payload.tools = injectGraphTool(payload.tools);
+          if (plan.capabilities.has(CAPABILITIES.PATCH))
+            payload.tools = injectPatchTool(payload.tools);
+          if (plan.capabilities.has(CAPABILITIES.READ))
+            payload.tools = injectReadFileChunkTool(payload.tools);
+        }
       } else {
-        console.log(`[Planner] ⏭️ Bypass — '${plan.intent}' needs no file capabilities`);
+        //         console.log(`[Planner] ⏭️ Bypass — '${plan.intent}' needs no file capabilities`);
       }
     });
 
@@ -601,12 +633,12 @@ const server = http.createServer((req, res) => {
     if (!decision.shouldCompress && req.headers["x-cf-dry-run"] !== "true") {
       const passthroughTokens = countTokens(payload);
       const computedAlwaysOnSaved = trueBaselineTokens - passthroughTokens;
-      console.log(`[Pipeline] Passthrough: ${decision.passthroughReason}`);
+      //       console.log(`[Pipeline] Passthrough: ${decision.passthroughReason}`);
       if (computedAlwaysOnSaved > 0) {
-        console.log(
-          `[Pipeline] Always-on saved: ${computedAlwaysOnSaved} tokens ` +
-            `(${((computedAlwaysOnSaved / trueBaselineTokens) * 100).toFixed(1)}% reduction before gate)`
-        );
+        //         console.log(
+        //           `[Pipeline] Always-on saved: ${computedAlwaysOnSaved} tokens ` +
+        //             `(${((computedAlwaysOnSaved / trueBaselineTokens) * 100).toFixed(1)}% reduction before gate)`
+        //         );
       }
       const passthroughMetrics = await executeUpstreamRequest(payload);
       const passthroughWireTokens =
@@ -629,10 +661,10 @@ const server = http.createServer((req, res) => {
         upstreamLatency: passthroughLatencyMs,
       });
 
-      console.log(`[Metrics] Total E2E Latency: ${passthroughLatencyMs.toFixed(2)}ms`);
+      //       console.log(`[Metrics] Total E2E Latency: ${passthroughLatencyMs.toFixed(2)}ms`);
       if (passthroughGhostRetries > 0) {
-        console.log(`[Metrics] Ghost Retries:      ${passthroughGhostRetries}`);
-        console.log(`[Metrics] Total Wire Tokens:  ${passthroughWireTokens}`);
+        //         console.log(`[Metrics] Ghost Retries:      ${passthroughGhostRetries}`);
+        //         console.log(`[Metrics] Total Wire Tokens:  ${passthroughWireTokens}`);
       }
       return;
     }
@@ -665,7 +697,7 @@ const server = http.createServer((req, res) => {
     );
 
     if (!hasCompressibleContent) {
-      console.log(`[Pipeline] ⏭️ No compressible tool results — skipping content stages`);
+      //       console.log(`[Pipeline] ⏭️ No compressible tool results — skipping content stages`);
     }
 
     // 1. Inject Memory Tools
@@ -860,16 +892,16 @@ const server = http.createServer((req, res) => {
 
     // ── Pipeline report ──
     console.log("\n=== ContextForge Pipeline Report ===");
-    console.log(`[Client]  ${clientAdapter.name}`);
+    // console.log(`[Client]  ${clientAdapter.name}`);
     console.log(`[Metrics] True Baseline:      ${trueBaselineTokens}`);
-    console.log(
-      `[Metrics] After Minimize+Dedup: ${afterAlwaysOnTokens} (saved ${alwaysOnSaved} tokens)`
-    );
-    if (toolInjectionCost > 0) {
-      console.log(
-        `[Metrics] Tool Injection Cost:  +${toolInjectionCost} tokens (graph+patch schemas)`
-      );
-    }
+    // console.log(
+    //   `[Metrics] After Minimize+Dedup: ${afterAlwaysOnTokens} (saved ${alwaysOnSaved} tokens)`
+    // );
+    // if (toolInjectionCost > 0) {
+    //   console.log(
+    //     `[Metrics] Tool Injection Cost:  +${toolInjectionCost} tokens (graph+patch schemas)`
+    //   );
+    // }
     console.log(`[Metrics] After Always-On:    ${baselineTokens}`);
     console.log(`[Metrics] Final Tokens:       ${finalTokens}`);
     // ── Savings breakdown (replaces raw "Total Saved" line) ──
@@ -877,10 +909,10 @@ const server = http.createServer((req, res) => {
     const _tokenSavingsSnap = timer.tokenSummary();
     const _sysPromptSaved = _tokenSavingsSnap[STAGES.DEDUPLICATE] ?? 0;
     const _toolSchemaSaved = alwaysOnSaved - _sysPromptSaved;
-    console.log(`          ├─ Tool Schemas:        ↓${_toolSchemaSaved} tokens`);
-    console.log(`          ├─ System Prompt Dedup: ↓${_sysPromptSaved} tokens`);
-    console.log(`          └─ Semantic/AST:        ↓${pipelineSaved} tokens`);
-    console.log(`[Metrics] Total Saved:        ${totalSaved} tokens (vs true baseline)`);
+    // console.log(`          ├─ Tool Schemas:        ↓${_toolSchemaSaved} tokens`);
+    // console.log(`          ├─ System Prompt Dedup: ↓${_sysPromptSaved} tokens`);
+    // console.log(`          └─ Semantic/AST:        ↓${pipelineSaved} tokens`);
+    // console.log(`[Metrics] Total Saved:        ${totalSaved} tokens (vs true baseline)`);
 
     if (totalSaved < 0) {
       console.warn(`[Pipeline] ⚠️ Net-negative: pipeline inflated by ${-totalSaved} tokens`);
@@ -888,7 +920,7 @@ const server = http.createServer((req, res) => {
 
     if (trueBaselineTokens > 0) {
       console.log(
-        `[Metrics] Compression:        ${((totalSaved / trueBaselineTokens) * 100).toFixed(1)}%`
+        // `[Metrics] Compression:        ${((totalSaved / trueBaselineTokens) * 100).toFixed(1)}%`
       );
     }
     if (ghostRetries > 0) {
@@ -897,22 +929,22 @@ const server = http.createServer((req, res) => {
     }
     console.log(`[Metrics] Pipeline Latency:   ${pipelineLatencyMs.toFixed(2)}ms`);
     console.log(`[Metrics] Total E2E Latency:  ${totalLatencyMs.toFixed(2)}ms`);
-    console.log(
-      `[Metrics] Content Stages:     ${hasCompressibleContent ? "ACTIVE" : "SKIPPED (no compressible content)"}`
-    );
+    // console.log(
+    //   `[Metrics] Content Stages:     ${hasCompressibleContent ? "ACTIVE" : "SKIPPED (no compressible content)"}`
+    // );
 
     const actions = statsEmitter.agentActions;
-    console.log(`\n[Repository Operations]`);
-    console.log(` ├─ Graph Lookups:    ${actions.graphLookups}`);
-    console.log(` ├─ Surgical Reads:   ${actions.surgicalReads}`);
-    console.log(` ├─ AST Patches:      ${actions.astPatches}`);
-    console.log(` └─ Raw Vault Opens:  ${actions.rawVaultOpens}`);
+    // console.log(`\n[Repository Operations]`);
+    // console.log(` ├─ Graph Lookups:    ${actions.graphLookups}`);
+    // console.log(` ├─ Surgical Reads:   ${actions.surgicalReads}`);
+    // console.log(` ├─ AST Patches:      ${actions.astPatches}`);
+    // console.log(` └─ Raw Vault Opens:  ${actions.rawVaultOpens}`);
 
-    console.log(`[Decision] ${decision}`);
+    // console.log(`[Decision] ${decision}`);
 
-    for (const [stage, ms] of Object.entries(stages)) {
-      if (ms > 1) console.log(`[Stage] ${stage}: ${ms.toFixed(1)}ms`);
-    }
+    // for (const [stage, ms] of Object.entries(stages)) {
+    //   if (ms > 1) console.log(`[Stage] ${stage}: ${ms.toFixed(1)}ms`);
+    // }
 
     const tokenSavings = timer.tokenSummary();
     if (Object.keys(tokenSavings).length > 0) {

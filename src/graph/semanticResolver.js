@@ -381,7 +381,6 @@ export function resolve(query) {
   };
 }
 
-
 // ─────────────────────────────────────────────
 // Embedding singleton
 //
@@ -431,33 +430,32 @@ export function getGraphEmbedder() {
  */
 export async function resolveWithEmbeddings(query) {
   if (!_embedder || !_retriever) {
-    return { results: [], strategy: 'embeddings:unavailable' };
+    return { results: [], strategy: "embeddings:unavailable" };
   }
 
   try {
     // 1. Embed the query
     const queryEmbedding = await _embedder.embed(query);
     if (!queryEmbedding) {
-      return { results: [], strategy: 'embeddings:no_vector' };
+      return { results: [], strategy: "embeddings:no_vector" };
     }
 
     // Float32Array coercion — embed() may return a regular array
-    const float32Query = queryEmbedding instanceof Float32Array
-      ? queryEmbedding
-      : new Float32Array(queryEmbedding);
+    const float32Query =
+      queryEmbedding instanceof Float32Array ? queryEmbedding : new Float32Array(queryEmbedding);
 
     // 2. Hybrid search — same API as vaultRetriever.js Tier 1
     // threshold: 0.35 (lower than vault's 0.5 — symbol names are short,
     //            similarity scores are naturally lower)
     const hits = _retriever.hybridSearch(
       float32Query,
-      8,      // topK — fetch more than needed, filter by threshold below
-      0.35,   // threshold
-      query   // BM25 query text
+      8, // topK — fetch more than needed, filter by threshold below
+      0.35, // threshold
+      query // BM25 query text
     );
 
     if (!hits || hits.length === 0) {
-      return { results: [], strategy: 'embeddings:miss' };
+      return { results: [], strategy: "embeddings:miss" };
     }
 
     // 3. Resolve stableIds → node records
@@ -479,12 +477,12 @@ export async function resolveWithEmbeddings(query) {
 
       let signature = null;
       if (node.body_text) {
-        signature = node.body_text.split('\n')[0].trim();
-        if (signature.length > 120) signature = signature.slice(0, 120) + '...';
+        signature = node.body_text.split("\n")[0].trim();
+        if (signature.length > 120) signature = signature.slice(0, 120) + "...";
       }
 
       results.push({
-        type: 'symbol',
+        type: "symbol",
         name: node.name,
         kind: node.kind,
         file: node.file_path,
@@ -496,20 +494,53 @@ export async function resolveWithEmbeddings(query) {
         calls: tryParseJson(node.call_summary),
         literalRefs: tryParseJson(node.literal_refs),
         envRefs: tryParseJson(node.env_refs),
-        _semanticScore: hit.combinedScore,   // kept for unified ranking in graphTools
+        _semanticScore: hit.combinedScore, // kept for unified ranking in graphTools
       });
     }
 
-    const strategy = results.length > 0
-      ? `embeddings:hybrid(${results.length} hits, top=${hits[0]?.combinedScore?.toFixed(2)})`
-      : 'embeddings:below_threshold';
+    const strategy =
+      results.length > 0
+        ? `embeddings:hybrid(${results.length} hits, top=${hits[0]?.combinedScore?.toFixed(2)})`
+        : "embeddings:below_threshold";
 
     return { results, strategy };
-
   } catch (err) {
-    if (process.env.CF_DEBUG_GRAPH === '1') {
+    if (process.env.CF_DEBUG_GRAPH === "1") {
       console.warn(`[SemanticResolver] Embedding fallback failed: ${err.message}`);
     }
-    return { results: [], strategy: 'embeddings:error' };
+    return { results: [], strategy: "embeddings:error" };
   }
+}
+
+export function normalizeConceptKey(query) {
+  // Step 1: Split on word boundaries — handles camelCase, hyphen, underscore, space
+  // "contentLength"  → ["content", "length"]
+  // "content-length" → ["content", "length"]
+  // "content length" → ["content", "length"]
+  // "STORAGE_QUOTA"  → ["storage", "quota"]
+  // "storageQuota"   → ["storage", "quota"]
+  // "user_id"        → ["user", "id"]
+  // "userId"         → ["user", "id"]  ← still same, but short so guarded below
+
+  const tokens = String(query)
+    .replace(/([a-z])([A-Z])/g, "$1 $2") // camelCase split: contentLength → content Length
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2") // HTTPSRequest → HTTPS Request
+    .toLowerCase()
+    .split(/[-_\s.]+/) // split on separators
+    .filter((t) => t.length > 0);
+
+  // Step 2: Sort tokens so order doesn't matter
+  // "quota storage" == "storage quota" after sort
+  // (optional — disable if order matters for your queries)
+  // tokens.sort();  ← keep commented out for now, order usually matters
+
+  const key = tokens.join("");
+
+  // Step 3: Minimum token length guard
+  // Single short tokens ("id", "url", "get") are too ambiguous to merge
+  if (tokens.length === 1 && tokens[0].length < 5) {
+    return query.toLowerCase(); // don't normalize — return as-is
+  }
+
+  return key;
 }

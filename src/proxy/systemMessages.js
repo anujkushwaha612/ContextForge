@@ -64,9 +64,9 @@ export function deduplicateSystemMessages(payload) {
 
   if (prunedCount > 0) {
     const tokensSaved = Math.floor(charsSaved / 4);
-    console.log(
-      `[SysPrompt Pruner] ✂️  Removed ${prunedCount} redundant system blocks (saved ~${tokensSaved} tokens)`,
-    );
+//     console.log(
+//       `[SysPrompt Pruner] ✂️  Removed ${prunedCount} redundant system blocks (saved ~${tokensSaved} tokens)`,
+//     );
     payload._cf_sysPromptTokensSaved = tokensSaved;
   }
 
