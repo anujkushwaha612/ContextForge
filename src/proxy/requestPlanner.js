@@ -221,7 +221,8 @@ function scoreIntents(message) {
     const hasPatch = scores.PATCH > 0;
     if (hasCreate && hasPatch) {
       // Multi-task prompt — use DEBUG for full capability set
-      return { intent: "DEBUG", score: winnerScore, confidence: 0, allScores: scores, matchedPatterns };
+      // Return high confidence (1) so the semantic fallback doesn't override this decision
+      return { intent: "DEBUG", score: winnerScore, confidence: 1, allScores: scores, matchedPatterns };
     }
   }
 

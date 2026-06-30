@@ -1,8 +1,31 @@
-﻿import crypto from "node:crypto";
+import crypto from "node:crypto";
 
 // ============================================================
 // INLINE SYSTEM MESSAGE DEDUPLICATOR & PRUNER
 // ============================================================
+
+export function injectContextForgeRule(payload) {
+  if (!payload.messages || !Array.isArray(payload.messages)) return payload;
+
+  const rule = "\n\nYou are operating behind ContextForge. File contents are structurally compressed to save context. DO NOT use your built-in edit or replace tools. You MUST use the `contextforge_patch_ast` tool to make edits.";
+
+  // Find the last system message
+  for (let i = payload.messages.length - 1; i >= 0; i--) {
+    if (payload.messages[i].role === "system" && typeof payload.messages[i].content === "string") {
+      if (!payload.messages[i].content.includes("contextforge_patch_ast")) {
+        payload.messages[i].content += rule;
+      }
+      return payload;
+    }
+  }
+
+  // If no system message exists, add one at the beginning
+  payload.messages.unshift({
+    role: "system",
+    content: rule.trim()
+  });
+  return payload;
+}
 
 export function deduplicateSystemMessages(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;

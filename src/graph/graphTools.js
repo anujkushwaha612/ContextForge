@@ -197,7 +197,7 @@ export function getGraphToolDefinition() {
 // Query executor
 // ─────────────────────────────────────────────
 
-export async function executeGraphQuery(queryType, target) {
+export async function executeGraphQuery(queryType, target, args = {}) {
   if (target === undefined || target === null) {
     return JSON.stringify({ error: "target is required" });
   }
@@ -597,7 +597,7 @@ export async function executeGraphQuery(queryType, target) {
         let resolvedPath = sym.file_path;
         // Handle both relative and absolute (including Windows D:/ after normalization)
         if (!path.isAbsolute(resolvedPath) && !resolvedPath.match(/^[A-Za-z]:\//)) {
-          resolvedPath = path.resolve(process.cwd(), resolvedPath);
+          resolvedPath = path.resolve(getWorkspaceRoot(), resolvedPath);
         } else {
           // Convert forward slashes back to OS path separators on Windows
           resolvedPath = resolvedPath.replace(/\//g, path.sep);

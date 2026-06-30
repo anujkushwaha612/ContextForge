@@ -50,7 +50,7 @@ function getNative() {
 // Language routing
 // ─────────────────────────────────────────────
 
-const TREESITTER_EXTENSIONS = new Set(["js", "mjs", "cjs", "ts", "tsx", "py", "go", "rs", "java"]);
+const TREESITTER_EXTENSIONS = new Set(["js", "mjs", "cjs", "jsx", "ts", "tsx", "py", "go", "rs", "java"]);
 
 const REGEX_EXTENSIONS = new Set(["cpp", "cc", "cxx", "h", "hpp", "hh"]);
 
@@ -62,6 +62,7 @@ export function getLanguageForFile(filePath) {
       js: "javascript",
       mjs: "javascript",
       cjs: "javascript",
+      jsx: "javascript",
       ts: "typescript",
       tsx: "tsx",
       py: "python",

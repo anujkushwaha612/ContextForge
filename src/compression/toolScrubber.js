@@ -1,4 +1,4 @@
-﻿import { classifyContentAsync } from "./contentDetector.js";
+import { classifyContentAsync } from "./contentDetector.js";
 // ============================================================
 // PHASE 1, FEATURE 1: NATIVE TERMINAL SCRUBBER (RTK Replacement)
 // ============================================================
@@ -64,8 +64,7 @@ function collapseCarriageReturnProgress(text) {
       let j = i + 1;
       while (
         j < lines.length &&
-        (NPM_PROGRESS_PATTERN.test(lines[j]) ||
-          SPINNER_LINE_PATTERN.test(lines[j]))
+        (NPM_PROGRESS_PATTERN.test(lines[j]) || SPINNER_LINE_PATTERN.test(lines[j]))
       ) {
         j++;
       }
@@ -76,8 +75,7 @@ function collapseCarriageReturnProgress(text) {
         const lastProgress = lines[j - 1].trim();
         if (lastProgress && !SPINNER_LINE_PATTERN.test(lastProgress)) {
           result.push(
-            lastProgress +
-              `  [${consecutiveProgressLines - 1} progress lines collapsed]`,
+            lastProgress + `  [${consecutiveProgressLines - 1} progress lines collapsed]`
           );
         }
         // Otherwise drop entirely (pure spinner noise)
@@ -228,6 +226,23 @@ export async function tagToolResults(payload) {
         if (meta.command && !msg._command) msg._command = meta.command;
         // Expose full args for downstream consumers (semanticDedup._args)
         if (!msg._args) msg._args = meta.args;
+
+        if (msg._cf_editable === undefined) {
+          const lowerName = meta.toolName.toLowerCase();
+          const editableTools = new Set([
+            "read_file_chunk",
+            "contextforge_read_file_chunk",
+            "read_function",
+            "read_lines",
+            "read_file",
+            "view",
+            "read",
+          ]);
+          msg._cf_editable =
+            editableTools.has(lowerName) ||
+            lowerName.includes("read") ||
+            lowerName.includes("view");
+        }
       }
 
       // Already tagged — skip Magika, just count
@@ -242,7 +257,7 @@ export async function tagToolResults(payload) {
         classifyContentAsync(msg.content).then((type) => {
           msg._cf_type = type;
           typesReport[type] = (typesReport[type] || 0) + 1;
-        }),
+        })
       );
     }
 
@@ -251,8 +266,7 @@ export async function tagToolResults(payload) {
         if (block.type === "tool_result" && typeof block.content === "string") {
           if (block._cf_type) {
             skippedAlreadyTagged++;
-            typesReport[block._cf_type] =
-              (typesReport[block._cf_type] || 0) + 1;
+            typesReport[block._cf_type] = (typesReport[block._cf_type] || 0) + 1;
             continue;
           }
 
@@ -260,7 +274,7 @@ export async function tagToolResults(payload) {
             classifyContentAsync(block.content).then((type) => {
               block._cf_type = type;
               typesReport[type] = (typesReport[type] || 0) + 1;
-            }),
+            })
           );
         }
       }
@@ -283,5 +297,3 @@ export async function tagToolResults(payload) {
 
   return payload;
 }
-
-

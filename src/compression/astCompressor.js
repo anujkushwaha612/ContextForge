@@ -362,6 +362,12 @@ export async function compressCodeToolResults(payload) {
       typeof msg.content === "string" &&
       msg._cf_type === "code"
     ) {
+      if (msg._cf_editable === true) {
+        // Skip editable tool outputs to preserve exact literal bytes
+        newMessages.push(msg);
+        continue;
+      }
+
       // ── Skip already-AST-compressed messages ──
       if (msg._compressedVaultId) {
         newMessages.push(msg);

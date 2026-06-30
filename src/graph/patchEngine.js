@@ -15,7 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 
-import { queryFindSymbol, writeFileGraph } from "./graphDb.js";
+import { queryFindSymbol, writeFileGraph, getWorkspaceRoot } from "./graphDb.js";
 import { extractSymbols, getLanguageForFile } from "./symbolExtractor.js";
 import { invalidateByFile } from "../logging/cacheDb.js";
 import { invalidateRegistryEntry } from "../compression/semanticDedup.js";
@@ -354,9 +354,12 @@ export async function executePatch({
       return { success: false, error: "insert_at_line requires new_body." };
     }
 
-    const normalizedFilePath = file_path
+    let normalizedFilePath = file_path
       .replace(/\\/g, "/")
       .replace(/^\.\//, "");
+    if (!path.isAbsolute(normalizedFilePath) && !normalizedFilePath.match(/^[A-Za-z]:\//)) {
+      normalizedFilePath = path.resolve(getWorkspaceRoot(), normalizedFilePath);
+    }
     let source, hasCRLF;
     try {
       ({ source, hasCRLF } = readSource(normalizedFilePath));
@@ -455,9 +458,12 @@ export async function executePatch({
       };
     }
 
-    const normalizedFilePath = file_path
+    let normalizedFilePath = file_path
       .replace(/\\/g, "/")
       .replace(/^\.\//, "");
+    if (!path.isAbsolute(normalizedFilePath) && !normalizedFilePath.match(/^[A-Za-z]:\//)) {
+      normalizedFilePath = path.resolve(getWorkspaceRoot(), normalizedFilePath);
+    }
     let source, hasCRLF;
     try {
       ({ source, hasCRLF } = readSource(normalizedFilePath));
@@ -575,6 +581,10 @@ export async function executePatch({
   if (resolved.error) return { success: false, error: resolved.error };
 
   let { row, normalizedFilePath } = resolved;
+
+  if (!path.isAbsolute(normalizedFilePath) && !normalizedFilePath.match(/^[A-Za-z]:\//)) {
+    normalizedFilePath = path.resolve(getWorkspaceRoot(), normalizedFilePath);
+  }
 
   let source, hasCRLF;
   try {

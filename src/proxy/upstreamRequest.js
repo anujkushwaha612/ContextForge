@@ -374,7 +374,7 @@ class ToolInterceptor {
 
           // Only execute if not already resolved by concept cache above
           if (!content) {
-            content = await executeGraphQuery(args.query_type, args.target);
+            content = await executeGraphQuery(args.query_type, args.target, args);
             console.log(
               `[Ghost Interceptor] ✅ Graph: ${args.query_type}("${args.target}") → ${content.length} chars`
             );
@@ -666,7 +666,7 @@ export function createUpstreamHandler(ctx) {
       // ── Inject WorkspaceState summary ─────────────────────────────────
       // Tells the LLM what has already been patched this session so it
       // doesn't re-search for symbols it already modified.
-      const workspaceSummary = buildWorkspaceSummary();
+      const workspaceSummary = process.env.CF_MODE === "passthrough" ? null : buildWorkspaceSummary();
       if (workspaceSummary && currentPayload.messages?.length > 0) {
         const msgs = currentPayload.messages;
         const lastUserIdx = msgs.reduce((acc, m, i) => (m.role === "user" ? i : acc), -1);
@@ -875,7 +875,7 @@ export function createUpstreamHandler(ctx) {
             );
 
             if (clientAdapter.name === "anthropic" || clientAdapter.name === "gemini") {
-              if (hasSeenToolCall) {
+              if (hasSeenToolCall && process.env.CF_MODE !== "passthrough") {
                 if (translatedEvents.length > 0) {
                   isFirstChunk = false;
                   heldEvents.push(...translatedEvents);
@@ -929,7 +929,7 @@ export function createUpstreamHandler(ctx) {
             // STREAMING: GHOST INTERCEPTOR
             // ═══════════════════════════════════════════════════════════════
             if (isStreamRequest) {
-              if (hasSeenToolCall) {
+              if (hasSeenToolCall && process.env.CF_MODE !== "passthrough") {
                 const validToolCalls = toolCalls
                   .filter((tc) => tc.name)
                   .map((tc) => {
@@ -1058,7 +1058,7 @@ export function createUpstreamHandler(ctx) {
 
             const message = jsonResponse.choices?.[0]?.message;
 
-            if (message?.tool_calls && message.tool_calls.length > 0) {
+            if (message?.tool_calls && message.tool_calls.length > 0 && process.env.CF_MODE !== "passthrough") {
               const result = await interceptor.process(
                 message.tool_calls,
                 currentPayload,

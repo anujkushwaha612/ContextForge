@@ -34,7 +34,7 @@ import { interceptAndVaultMassiveToolResults } from "./compression/fatCatch.js";
 import { scrubToolResults, tagToolResults } from "./compression/toolScrubber.js";
 import { pruneToolResults } from "./compression/pruner.js";
 import { sliceJsonToolResults } from "./compression/jsonSlicer.js";
-import { deduplicateSystemMessages } from "./proxy/systemMessages.js";
+import { injectContextForgeRule, deduplicateSystemMessages } from "./proxy/systemMessages.js";
 import { stripAnthropicSpecificFields } from "./proxy/translator.js";
 
 // ── Compression stages ──
@@ -527,6 +527,7 @@ const server = http.createServer((req, res) => {
       }
     });
     timer.time(STAGES.DEDUPLICATE, () => {
+      payload = injectContextForgeRule(payload);
       payload = deduplicateSystemMessages(payload);
       if (payload._cf_sysPromptTokensSaved) {
         timer.recordTokenSavings(STAGES.DEDUPLICATE, payload._cf_sysPromptTokensSaved);
