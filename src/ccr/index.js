@@ -9,34 +9,26 @@ export {
   scanForMarkers,
   parseCCRToolCall,
 } from "./toolInjection.js";
-export { ContextTracker } from "./contextTracker.js";
 export { SessionRegistry, sessionRegistry } from "./sessionRegistry.js";
 
 import { CCRToolInjector, scanForMarkers } from "./toolInjection.js";
-import { ContextTracker } from "./contextTracker.js";
 import { sessionRegistry, SessionRegistry } from "./sessionRegistry.js";
 import { countTokens } from "../compression/compressionHelper.js";
 
-export const contextTracker = new ContextTracker();
+// ContextTracker kept for export compatibility but no longer used in pipeline.
+// Proactive expansion was disabled (Phase 1) and context tracking added
+// overhead without measurable benefit. Removed from hot path.
+export { ContextTracker } from "./contextTracker.js";
+export const contextTracker = null;
 
 const CCR_MIN_TOKENS = 18000;
 
 // ─────────────────────────────────────────────
 // Per-session marker scan cache
-// Key: sessionId → Set of already-scanned message indices
-// Prevents re-scanning history messages on every turn
+// Key: sessionId → Set of already-scanned message IDs
 // ─────────────────────────────────────────────
-const _scannedMessageIds = new Map(); // sessionId → Set<tool_call_id>
+const _scannedMessageIds = new Map();
 
-/**
- * Scan only NEW messages — messages not seen in a prior turn.
- * Uses tool_call_id as a stable identifier for tool messages.
- * For other message types uses a content hash prefix.
- *
- * @param {string} sessionId
- * @param {object[]} messages
- * @returns {string[]} vault IDs found in new messages only
- */
 function getFastContentPreview(content, maxLength) {
   if (typeof content === "string") return content.slice(0, maxLength);
   if (Array.isArray(content)) {
@@ -63,15 +55,12 @@ function scanNewMessagesOnly(sessionId, messages) {
   const newMsgs = [];
 
   for (const msg of messages) {
-    // Build a stable identity for this message
     let msgId;
     if (msg.tool_call_id) {
       msgId = "tool:" + msg.tool_call_id;
     } else if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
-      msgId =
-        "asst:" + (msg.tool_calls[0]?.id ?? msg.content?.slice(0, 32) ?? "");
+      msgId = "asst:" + (msg.tool_calls[0]?.id ?? msg.content?.slice(0, 32) ?? "");
     } else {
-      // For user/system messages, use role + fast preview
       msgId = msg.role + ":" + getFastContentPreview(msg.content, 64);
     }
 
@@ -86,101 +75,76 @@ function scanNewMessagesOnly(sessionId, messages) {
 
 /**
  * Main CCR pipeline function.
- * Called from server.js before forwarding request to LLM.
  *
- * Fix 1: Accept pre-counted token count from pipeline to avoid
- *        double-counting (pipeline already counted before this stage).
- * Fix 2: Only scan NEW messages for vault markers (O(1) per turn
- *        instead of O(history)).
- * Fix 3 (Phase 1): Proactive expansion disabled — it added 200-500 tokens
- *        speculatively without meaningful precision. The retrieve tool
- *        is injected on-demand; LLM pulls context when it needs it.
+ * Injection rule (fixed):
+ *   Inject contextforge_retrieve if and only if the current payload
+ *   contains [CF_VAULT:] stubs that have NOT yet been retrieved.
  *
- * @param {object} payload        - The translated OpenAI payload
- * @param {number} [tokenCount]   - Pre-counted tokens from pipeline (optional)
- * @returns {object}
+ *   Once a vault is retrieved (LLM called contextforge_retrieve for it),
+ *   that vault ID is added to session.retrievedVaultIds. On the next turn
+ *   we scan the payload for vault stubs and subtract already-retrieved IDs.
+ *   If the remaining set is empty → no injection.
+ *
+ * This replaces the broken sticky-on logic where:
+ *   - session.hasDoneCCR = true permanently after first retrieval
+ *   - session.knownVaultIds accumulated forever
+ *   - Both conditions caused inject=true on every subsequent turn
  */
 export function applyCCRPipeline(payload, tokenCount = null) {
-  // Fix 1: Use pre-counted value if provided, count only if not
   const tokens = tokenCount ?? countTokens(payload);
 
   if (tokens < CCR_MIN_TOKENS) {
-    // console.log(`[CCR] ⏭️  Skipped — ${tokens} tokens below threshold`);
     return payload;
   }
 
-  // Derive session and workspace identity
   const sessionId = SessionRegistry.deriveSessionId(payload);
   const workspaceKey = SessionRegistry.deriveWorkspaceKey(payload);
   const session = sessionRegistry.getOrCreate(sessionId, workspaceKey);
-  const turnNumber = session.incrementTurn();
+  session.incrementTurn();
 
-  // Fix 2: Only scan messages we haven't seen before
+  // ── Step 1: Find vault stubs in NEW messages only ─────────────────────
   const newVaultIds = scanNewMessagesOnly(sessionId, payload.messages);
 
-  // Inject tool if needed
-  const injector = new CCRToolInjector({ provider: "openai" });
+  // Register newly discovered vault IDs in the session
+  for (const vaultId of newVaultIds) {
+    session.addDiscoveredVaultId(vaultId);
+  }
 
-  // Manually set detected vault IDs from our incremental scan
-  injector._detectedVaultIds = [
-    ...session.knownVaultIds, // vaults from prior turns (sticky)
-    ...newVaultIds,           // vaults found in new messages
-  ];
+  // ── Step 2: Compute UNRETRIEVED vaults in current payload ─────────────
+  // Scan the FULL current payload (not just new messages) for vault stubs.
+  // This catches stubs that were injected by THIS pipeline run (fat catch,
+  // AST compressor) which haven't been seen in prior turns yet.
+  const allCurrentVaultIds = scanForMarkers(payload.messages);
+
+  // Subtract vaults the LLM has already successfully retrieved.
+  // These are already in the LLM context window — no need to offer retrieval.
+  const unretrievedVaultIds = allCurrentVaultIds.filter(
+    (id) => !session.retrievedVaultIds.has(id)
+  );
+
+  // ── Step 3: Inject tool only if there are unretrieved stubs ──────────
+  const shouldInject = unretrievedVaultIds.length > 0;
+
+  if (!shouldInject) {
+    return payload;
+  }
+
+  const injector = new CCRToolInjector({ provider: "openai" });
+  injector._detectedVaultIds = unretrievedVaultIds;
 
   const { messages, tools, toolWasInjected } = injector.processRequest(
     payload.messages,
     payload.tools,
-    { sessionHasDoneCCR: session.hasDoneCCR },
+    { sessionHasDoneCCR: false }, // never use sticky flag — let vault scan decide
   );
 
   if (toolWasInjected) {
     console.log(
-      `[CCR] 💉 contextforge_retrieve injected ` +
-        `(session=${sessionId.slice(0, 8)} workspace=${workspaceKey.slice(0, 8)})`,
-    );
-  } else if (session.hasDoneCCR) {
-    console.log(
-      `[CCR] 🔒 contextforge_retrieve kept (sticky-on, session=${sessionId.slice(0, 8)})`,
+      `[CCR] 💉 contextforge_retrieve injected — ` +
+      `${unretrievedVaultIds.length} unretrieved vault(s) in context ` +
+      `(session=${sessionId.slice(0, 8)})`
     );
   }
-
-  // Track new vault IDs in context tracker (kept for future query-matching
-  // improvements — only the proactive push is disabled, not the tracking itself)
-  for (const vaultId of newVaultIds) {
-    // Register in session for sticky tracking
-    session.addKnownVaultId?.(vaultId);
-
-    contextTracker.trackCompression({
-      vaultId,
-      turnNumber,
-      workspaceKey,
-      queryContext: extractLastUserQuery(messages),
-      sampleContent: "",
-    });
-  }
-
-  // ── Proactive expansion — DISABLED (Phase 1 dead-weight removal) ──
-  //
-  // Audit finding: Fires speculatively and adds 200-500 tokens of vault
-  // context the LLM never uses. The retrieve tool injected above already
-  // gives the LLM on-demand access. Proactive push causes net-negative
-  // compression on sessions where the predicted vault isn't relevant.
-  //
-  // To re-enable: gate on confidence > 0.85 and verify precision in logs.
-  //
-  // const currentQuery = extractLastUserQuery(messages);
-  // if (currentQuery) {
-  //   const recommendations = contextTracker.analyzeQuery(currentQuery, {
-  //     currentTurn: turnNumber,
-  //     workspaceKey,
-  //   });
-  //   if (recommendations.length > 0) {
-  //     console.log(
-  //       `[CCR] 🔮 Proactive expansion: ${recommendations.length} vault(s) relevant to query`,
-  //     );
-  //     payload._ccrRecommendations = recommendations;
-  //   }
-  // }
 
   return {
     ...payload,
@@ -188,30 +152,29 @@ export function applyCCRPipeline(payload, tokenCount = null) {
     tools: tools || payload.tools,
     _sessionId: sessionId,
     _workspaceKey: workspaceKey,
-    _turnNumber: turnNumber,
   };
 }
 
+/**
+ * Called by upstreamRequest.js when the LLM successfully retrieves a vault.
+ *
+ * FIX: Now marks the specific vault as RETRIEVED (not just "CCR done").
+ * This prevents the tool from being re-injected on future turns for
+ * vaults whose content is already in the LLM context window.
+ */
 export function recordCCRSuccess(payload, vaultId) {
-  if (!payload._sessionId) return;
+  if (!payload._sessionId || !vaultId) return;
 
   const session = sessionRegistry.getOrCreate(
     payload._sessionId,
     payload._workspaceKey || "",
   );
-  session.markCCRDone(vaultId);
+
+  session.markVaultRetrieved(vaultId);
 
   console.log(
-    `[CCR] ✅ CCR success recorded — tool now sticky for session ` +
-      payload._sessionId.slice(0, 8),
+    `[CCR] ✅ Vault ${vaultId} marked as retrieved — ` +
+    `will not re-inject for this vault ` +
+    `(session=${payload._sessionId.slice(0, 8)})`
   );
-}
-
-function extractLastUserQuery(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") {
-      return getFastContentPreview(messages[i].content, 200);
-    }
-  }
-  return "";
 }

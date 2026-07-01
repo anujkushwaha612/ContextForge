@@ -1,11 +1,11 @@
-﻿import { saveToVault } from "../logging/cacheDb.js";
+import { saveToVault } from "../logging/cacheDb.js";
 // ─────────────────────────────────────────────
 const MINIFIED_AVG_LINE_LENGTH = 500; // chars/line → treat as minified
 const MINIFIED_MIN_CHARS = 5_000; // don't bother for tiny files
 
 export function interceptAndVaultMassiveToolResults(
   payload,
-  charThreshold = 15000,
+  charThreshold = 150000,
 ) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
@@ -18,61 +18,53 @@ export function interceptAndVaultMassiveToolResults(
     return payload;
   }
 
-  payload.messages = payload.messages.map((msg) => {
-    if (msg.role !== "tool" || typeof msg.content !== "string") return msg;
-
-    const content = msg.content;
+  function processContent(content, msgType) {
     const contentLength = content.length;
-
-    // ── Fix 1: Minified code fast-path ──────────────────────────────────────
-    // If ContentRouter tagged this as code AND the average line length
-    // exceeds the minified threshold, vault immediately — regardless of
-    // charThreshold. Minified code is unreadable inline and will never
-    // compress via AST (no multi-line structure to reduce).
-    //
-    // Guard: only fire when the file is large enough to matter (>5k chars).
-    // This prevents single-line config snippets from being needlessly vaulted.
-    if (msg._cf_type === "code" && contentLength > MINIFIED_MIN_CHARS) {
+    if (msgType === "code" && contentLength > MINIFIED_MIN_CHARS) {
       const lines = content.split("\n");
       const avgLine = contentLength / lines.length;
-
       if (avgLine > MINIFIED_AVG_LINE_LENGTH) {
         const vaultId = saveToVault(content);
-        console.log(
-          `[Fat Catch] 🗜️  Minified code detected ` +
-            `(${contentLength} chars, avg line ${Math.round(avgLine)} chars) ` +
-            `-> Vaulted ${vaultId}`,
-        );
-        return {
-          ...msg,
-          _cf_vaulted: true, // FIX F7: Flag to skip downstream dedup
-          content:
-            `[CF_VAULT:${vaultId}] ${Math.round(contentLength / 4)} tokens compressed. ` +
-            `Use tool call contextforge_retrieve with vault_id="${vaultId}" to read this content.`,
-        };
+        console.log(`[Fat Catch] 🗜️  Minified code detected (${contentLength} chars, avg line ${Math.round(avgLine)} chars) -> Vaulted ${vaultId}`);
+        return `[CF_VAULT:${vaultId}] ${Math.round(contentLength / 4)} tokens compressed. Use tool call contextforge_retrieve with vault_id="${vaultId}" to read this content.`;
       }
     }
-
-    // ── Standard Fat Catch (unchanged) ──────────────────────────────────────
     if (contentLength > charThreshold) {
       const vaultId = saveToVault(content);
-      console.log(
-        `[Fat Catch] 🕸️ Intercepted massive tool result (${contentLength} chars) -> Offloaded to ${vaultId}` +
-          ` [threshold=${charThreshold}]`,
-      );
-      return {
-        ...msg,
-        _cf_vaulted: true, // FIX F7: Flag to skip downstream dedup
-        content:
-          `[CF_VAULT:${vaultId}] ${Math.round(contentLength / 4)} tokens compressed. ` +
-          `Use tool call contextforge_retrieve with vault_id="${vaultId}" to read this content.`,
-      };
+      console.log(`[Fat Catch] 🕸️ Intercepted massive tool result (${contentLength} chars) -> Offloaded to ${vaultId} [threshold=${charThreshold}]`);
+      return `[CF_VAULT:${vaultId}] ${Math.round(contentLength / 4)} tokens compressed. Use tool call contextforge_retrieve with vault_id="${vaultId}" to read this content.`;
     }
+    return content;
+  }
 
+  payload.messages = payload.messages.map((msg) => {
+    // Whitelist contextforge_retrieve: if the LLM explicitly asks for a vaulted file, give it the FULL file!
+    if (msg.role === "tool" && typeof msg.content === "string") {
+      if (msg.name === "contextforge_retrieve") return msg;
+      
+      const newContent = processContent(msg.content, msg._cf_type);
+      if (newContent !== msg.content) {
+        return { ...msg, _cf_vaulted: true, content: newContent };
+      }
+    }
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      let modified = false;
+      const newContent = msg.content.map(block => {
+        if (block.type === "tool_result" && typeof block.content === "string") {
+          if (block.name === "contextforge_retrieve") return block;
+          
+          const processed = processContent(block.content, block._cf_type);
+          if (processed !== block.content) {
+            modified = true;
+            return { ...block, _cf_vaulted: true, content: processed };
+          }
+        }
+        return block;
+      });
+      if (modified) return { ...msg, content: newContent };
+    }
     return msg;
   });
 
   return payload;
 }
-
-

@@ -113,11 +113,7 @@ export function scrubTerminalOutput(text) {
   // 4. Collapse vertical whitespace (3+ blank lines → 2)
   cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
 
-  // 5. Collapse horizontal whitespace on each line (2+ spaces → 1)
-  cleaned = cleaned
-    .split("\n")
-    .map((line) => line.replace(/  +/g, " "))
-    .join("\n");
+  // 5. (Removed) Do not collapse horizontal whitespace to preserve code indentation
 
   // 6. Trim trailing whitespace per line
   cleaned = cleaned
@@ -138,29 +134,43 @@ export function scrubToolResults(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
   payload.messages = payload.messages.map((msg) => {
-    // Post-translation: tool results are role: "tool"
+    // OpenAI format: role:"tool" with string content
     if (msg.role === "tool" && typeof msg.content === "string") {
-      const beforeLen = msg.content.length;
-      msg.content = scrubTerminalOutput(msg.content);
-      if (beforeLen !== msg.content.length) {
-        // We'll log this at the call site
-        msg._scrubbedChars = beforeLen - msg.content.length;
+      const scrubbed = scrubTerminalOutput(msg.content);
+
+      // CH-7: Use spread to create new object — direct mutation would leave
+      // _cachedTokens stale on the same object reference, causing countTokens
+      // to return the pre-scrub length on all subsequent pipeline stages.
+      if (scrubbed !== msg.content) {
+        const savedChars = msg.content.length - scrubbed.length;
+        return {
+          ...msg, // new object — _cachedTokens dropped ✅
+          content: scrubbed,
+          _scrubbedChars: savedChars,
+        };
       }
+      return msg; // unchanged — cache valid ✅
     }
 
-    // Pre-translation: anthropic content blocks
+    // Anthropic format: role:"user" with tool_result blocks (dead path post-translation)
     if (msg.role === "user" && Array.isArray(msg.content)) {
-      msg.content = msg.content.map((block) => {
+      let modified = false;
+      const newContent = msg.content.map((block) => {
         if (block.type === "tool_result" && typeof block.content === "string") {
-          const beforeLen = block.content.length;
-          const cleaned = scrubTerminalOutput(block.content);
-          if (beforeLen !== cleaned.length) {
-            block._scrubbedChars = beforeLen - cleaned.length;
+          const scrubbed = scrubTerminalOutput(block.content);
+          if (scrubbed !== block.content) {
+            modified = true;
+            return { ...block, content: scrubbed }; // new block object ✅
           }
-          return { ...block, content: cleaned };
         }
         return block;
       });
+
+      // Only create new message object if content actually changed
+      if (modified) {
+        return { ...msg, content: newContent }; // new object — _cachedTokens dropped ✅
+      }
+      return msg;
     }
 
     return msg;
@@ -229,19 +239,28 @@ export async function tagToolResults(payload) {
 
         if (msg._cf_editable === undefined) {
           const lowerName = meta.toolName.toLowerCase();
-          const editableTools = new Set([
-            "read_file_chunk",
-            "contextforge_read_file_chunk",
-            "read_function",
-            "read_lines",
-            "read_file",
-            "view",
-            "read",
-          ]);
-          msg._cf_editable =
-            editableTools.has(lowerName) ||
-            lowerName.includes("read") ||
-            lowerName.includes("view");
+          const isReadTool = lowerName.includes("read") || lowerName.includes("view");
+
+          if (isReadTool) {
+            let linesRequested = -1;
+            const args = meta.args || {};
+
+            const startLine = args.start_line ?? args.startLine ?? args.start ?? args.StartLine;
+            const endLine = args.end_line ?? args.endLine ?? args.end ?? args.EndLine;
+
+            if (startLine !== undefined && endLine !== undefined) {
+              linesRequested = Number(endLine) - Number(startLine);
+            }
+
+            // Only bypass AST compression if it's a targeted chunk (<= 800 lines)
+            if (linesRequested >= 0 && linesRequested <= 800) {
+              msg._cf_editable = true;
+            } else {
+              msg._cf_editable = false;
+            }
+          } else {
+            msg._cf_editable = false;
+          }
         }
       }
 

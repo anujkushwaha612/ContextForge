@@ -1,12 +1,22 @@
 /**
- * Memory tools — injected into every request, handled natively.
+ * memoryTools.js
+ *
+ * Memory tools — injected into requests, handled by Ghost Interceptor.
  *
  * Tools: memory_save, memory_search, memory_update, memory_delete, memory_list
  *
- * These are REAL tools (not Ghost Interceptor hacks).
- * The LLM calls them → the proxy intercepts before forwarding → executes →
- * injects tool result → continues.
+ * Fixes applied:
+ *   MT-1: injectMemoryTools now actually uses the hasMemoryMarkers check.
+ *         Previously computed but ignored — always injected 5 tool schemas
+ *         (~1000-2000 tokens) on every request unconditionally.
+ *         Now only injects when memory content exists in the conversation
+ *         OR when the session has previously used memory tools.
  *
+ *   MT-2: payloadHasMemoryContent now checks role:"tool" messages with
+ *         name matching memory tool names — more precise than string matching
+ *         "memory_" which could false-positive on "memory usage" in logs.
+ *
+ *   MT-3: Removed unused saveToVault import.
  */
 
 export const MEMORY_TOOL_NAMES = new Set([
@@ -18,7 +28,7 @@ export const MEMORY_TOOL_NAMES = new Set([
 ]);
 
 // ─────────────────────────────────────────────
-// Tool definitions (OpenAI format — post-translation)
+// Tool definitions (OpenAI format)
 // ─────────────────────────────────────────────
 
 export function getMemoryToolDefinitions() {
@@ -131,23 +141,75 @@ export function getMemoryToolDefinitions() {
 }
 
 // ─────────────────────────────────────────────
+// Detect whether this payload warrants memory tool injection
+//
+// MT-2: Now uses two precise checks instead of broad string matching:
+//   1. Any role:"tool" message whose name is a memory tool name
+//      → the LLM has already used memory tools this session
+//   2. Any message content containing "mem_" followed by hex chars
+//      → a memory ID is referenced in the conversation
+//
+// Previously checked content.includes("memory_") which false-positived
+// on "memory usage", "memory management", etc. in logs and tool results.
+// ─────────────────────────────────────────────
+
+const MEMORY_ID_PATTERN = /\bmem_[0-9a-f]{16}\b/;
+
+function payloadHasMemoryContent(messages) {
+  if (!messages) return false;
+
+  for (const msg of messages) {
+    // Check if any tool result is from a memory tool
+    if (msg.role === "tool" && MEMORY_TOOL_NAMES.has(msg.name)) {
+      return true;
+    }
+
+    // Check if any message content references a memory ID (mem_<hex>)
+    const content =
+      typeof msg.content === "string"
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content
+              .filter((b) => b?.type === "text")
+              .map((b) => b.text || "")
+              .join(" ")
+          : "";
+
+    if (MEMORY_ID_PATTERN.test(content)) return true;
+  }
+
+  return false;
+}
+
+// ─────────────────────────────────────────────
 // Inject memory tools into payload
-// Sticky-on: once injected, always injected
+//
+// MT-1: Now actually uses hasMemoryMarkers to gate injection.
+//       Previously computed it but always injected unconditionally,
+//       adding ~1000-2000 tokens to every single request.
+//
+// Injection triggers:
+//   - sessionHasMemory: caller signals this session has used memory
+//   - payloadHasMemoryContent: conversation references memory IDs or
+//     tool results from memory tools
+//
+// The LLM will discover memory tools exist when it needs them — we do
+// not need to pre-inject them on every turn "just in case".
 // ─────────────────────────────────────────────
 
 export function injectMemoryTools(payload, { sessionHasMemory = false } = {}) {
-  // Check if this request has any memory-related content
-  const hasMemoryMarkers =
+  // MT-1: Wire up the condition that was previously computed but ignored
+  const shouldInject =
     sessionHasMemory || payloadHasMemoryContent(payload.messages);
 
-  // Always inject — memory tools should always be available
-  // (unlike CCR which only injects when vault markers exist)
+  if (!shouldInject) return payload;
+
   const currentTools = payload.tools || [];
 
-  // Check if already injected
+  // Avoid duplicates
   for (const tool of currentTools) {
     const name = tool.name || tool.function?.name;
-    if (MEMORY_TOOL_NAMES.has(name)) return payload; // Already present
+    if (MEMORY_TOOL_NAMES.has(name)) return payload;
   }
 
   return {
@@ -156,20 +218,8 @@ export function injectMemoryTools(payload, { sessionHasMemory = false } = {}) {
   };
 }
 
-function payloadHasMemoryContent(messages) {
-  if (!messages) return false;
-  for (const msg of messages) {
-    const content =
-      typeof msg.content === "string"
-        ? msg.content
-        : JSON.stringify(msg.content);
-    if (content.includes("mem_") || content.includes("memory_")) return true;
-  }
-  return false;
-}
-
 // ─────────────────────────────────────────────
-// Detect memory tool calls in a non-streaming response
+// Detect memory tool calls in a message or synthetic object
 // ─────────────────────────────────────────────
 
 export function hasMemoryToolCalls(message) {
@@ -181,8 +231,8 @@ export function hasMemoryToolCalls(message) {
 
 // ─────────────────────────────────────────────
 // Execute memory tool calls
-// Called when LLM response contains memory tool calls
-// Returns array of tool result messages to append
+// Called by Ghost Interceptor when LLM issues memory tool calls.
+// Returns array of role:"tool" result messages to append.
 // ─────────────────────────────────────────────
 
 export async function executeMemoryToolCalls(
@@ -206,81 +256,82 @@ export async function executeMemoryToolCalls(
     }
 
     const callId = tc.id;
-    let content = "";
+    let content  = "";
 
     try {
       if (name === "memory_save") {
         const id = await memoryHandler.save({
           userId,
           workspace,
-          content: args.content || "",
+          content:    args.content || "",
           importance: args.importance ?? 0.5,
         });
-        
+
         if (!id) {
           content = JSON.stringify({
             status: "error",
-            error: "Failed to save — content was empty",
+            error:  "Failed to save — content was empty or store rejected it",
           });
         } else {
           content = JSON.stringify({
-            status: "saved",
+            status:    "saved",
             memory_id: id,
-            content: (args.content || "").slice(0, 100),
+            content:   (args.content || "").slice(0, 100),
           });
         }
+
       } else if (name === "memory_search") {
         const found = await memoryHandler.search({
           userId,
           workspace,
           query: args.query || "",
-          topK: args.top_k ?? 5,
+          topK:  args.top_k ?? 5,
         });
 
-        // SAFEGUARD: Ensure 'found' is always treated as an array
         const safeFound = Array.isArray(found) ? found : [];
-
         content = JSON.stringify({
-          status: "found",
-          count: safeFound.length,
+          status:   "found",
+          count:    safeFound.length,
           memories: safeFound.map((r) => ({
-            id: r.id,
-            content: r.content,
-            score: Math.round((r.score || 0) * 1000) / 1000,
+            id:      r.id,
+            content: r.content || "",
+            score:   Math.round((r.score || 0) * 1000) / 1000,
           })),
         });
+
       } else if (name === "memory_update") {
         const ok = await memoryHandler.update({
-          id: args.memory_id || "",
+          id:      args.memory_id || "",
           content: args.new_content || "",
         });
         content = JSON.stringify({
-          status: ok ? "updated" : "not_found",
+          status:    ok ? "updated" : "not_found",
           memory_id: args.memory_id,
         });
-      } else if (name === "memory_delete") {
-        const ok = memoryHandler.delete(args.memory_id || ""); // synchronous in memoryHandler
-        content = JSON.stringify({
-          status: ok ? "deleted" : "not_found",
-          memory_id: args.memory_id,
-        });
-      } else if (name === "memory_list") {
-        const limit = Math.min(args.limit ?? 10, 50);
-        const items = memoryHandler.list({ userId, workspace, limit }); // synchronous
 
-        // SAFEGUARD: Ensure 'items' is always treated as an array
+      } else if (name === "memory_delete") {
+        const ok = memoryHandler.delete(args.memory_id || "");
+        content = JSON.stringify({
+          status:    ok ? "deleted" : "not_found",
+          memory_id: args.memory_id,
+        });
+
+      } else if (name === "memory_list") {
+        const limit     = Math.min(args.limit ?? 10, 50);
+        const items     = memoryHandler.list({ userId, workspace, limit });
         const safeItems = Array.isArray(items) ? items : [];
 
         content = JSON.stringify({
-          status: "ok",
-          count: safeItems.length,
+          status:   "ok",
+          count:    safeItems.length,
           memories: safeItems.map((r) => ({
-            id: r.id,
-            content: (r.content || "").slice(0, 150),
+            id:         r.id,
+            content:    r.content || "",
             created_at: r.createdAt,
           })),
         });
       }
+
     } catch (err) {
       console.error(`[Memory] Tool ${name} failed:`, err.message);
       content = JSON.stringify({ status: "error", error: err.message });
@@ -289,7 +340,7 @@ export async function executeMemoryToolCalls(
     console.log(`[Memory] Executed: ${name} → ${content.slice(0, 80)}`);
 
     results.push({
-      role: "tool",
+      role:         "tool",
       tool_call_id: callId,
       name,
       content,

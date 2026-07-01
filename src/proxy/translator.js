@@ -58,14 +58,10 @@ function _msgKey(msg) {
   const last = msg.content[msg.content.length - 1];
   const firstStr = first
     ? (first.type || "") +
-      (first.text?.slice(0, 40) ||
-        first.tool_use_id ||
-        first.tool_call_id ||
-        "")
+      (first.text?.slice(0, 40) || first.tool_use_id || first.tool_call_id || "")
     : "";
   const lastStr = last
-    ? (last.type || "") +
-      (last.text?.slice(0, 40) || last.tool_use_id || last.tool_call_id || "")
+    ? (last.type || "") + (last.text?.slice(0, 40) || last.tool_use_id || last.tool_call_id || "")
     : "";
   return msg.role + "|" + msg.content.length + "|" + firstStr + "|" + lastStr;
 }
@@ -118,12 +114,8 @@ function _countOutputMessages(inputSlice) {
       Array.isArray(msg.content) &&
       msg.content.some((b) => b.type === "tool_result")
     ) {
-      const toolCount = msg.content.filter(
-        (b) => b.type === "tool_result",
-      ).length;
-      const hasText = msg.content.some(
-        (b) => b.type === "text" && b.text?.trim(),
-      );
+      const toolCount = msg.content.filter((b) => b.type === "tool_result").length;
+      const hasText = msg.content.some((b) => b.type === "text" && b.text?.trim());
       count += toolCount + (hasText ? 1 : 0);
     } else {
       count += 1;
@@ -150,13 +142,8 @@ function _translateMessages(messages, ctx) {
   } else if (stableCount === messages.length) {
     translated = ctx.prevOutputMessages;
   } else {
-    const stableOutputCount = _countOutputMessages(
-      ctx.prevInputMessages.slice(0, stableCount),
-    );
-    const stableOutputPrefix = ctx.prevOutputMessages.slice(
-      0,
-      stableOutputCount,
-    );
+    const stableOutputCount = _countOutputMessages(ctx.prevInputMessages.slice(0, stableCount));
+    const stableOutputPrefix = ctx.prevOutputMessages.slice(0, stableOutputCount);
     const newSuffix = messages.slice(stableCount).map(_translateMessage).flat();
     translated = [...stableOutputPrefix, ...newSuffix];
   }
@@ -333,10 +320,7 @@ function _translateMessage(msg) {
   let result;
 
   // ── User message with tool_result blocks ──
-  if (
-    msg.role === "user" &&
-    msg.content.some((b) => b.type === "tool_result")
-  ) {
+  if (msg.role === "user" && msg.content.some((b) => b.type === "tool_result")) {
     const toolMessages = [];
     const textParts = [];
 
@@ -370,16 +354,15 @@ function _translateMessage(msg) {
   }
 
   // ── Assistant message with tool_use blocks ──
-  if (
-    msg.role === "assistant" &&
-    msg.content.some((b) => b.type === "tool_use")
-  ) {
+  if (msg.role === "assistant" && msg.content.some((b) => b.type === "tool_use")) {
     const textParts = [];
     const tool_calls = [];
 
     for (const block of msg.content) {
       if (block.type === "text" && block.text) {
         textParts.push(block.text);
+      } else if (block.type === "thinking" && block.thinking) {
+        textParts.push(`<thinking>\n${block.thinking}\n</thinking>`);
       } else if (block.type === "tool_use") {
         tool_calls.push({
           id: block.id,
@@ -387,9 +370,7 @@ function _translateMessage(msg) {
           function: {
             name: block.name,
             arguments:
-              typeof block.input === "string"
-                ? block.input
-                : JSON.stringify(block.input || {}),
+              typeof block.input === "string" ? block.input : JSON.stringify(block.input || {}),
           },
         });
       }
@@ -409,12 +390,13 @@ function _translateMessage(msg) {
   if (hasImages) {
     const formattedContent = msg.content.map((b) => {
       if (b.type === "text") return { type: "text", text: b.text };
+      if (b.type === "thinking") return { type: "text", text: `<thinking>\n${b.thinking}\n</thinking>` };
       if (b.type === "image") {
         return {
           type: "image_url",
           image_url: {
-            url: `data:${b.source.media_type};base64,${b.source.data}`
-          }
+            url: `data:${b.source.media_type};base64,${b.source.data}`,
+          },
         };
       }
       return b; // passthrough unknown
@@ -426,8 +408,8 @@ function _translateMessage(msg) {
 
   // ── Text-only flattening ──
   const textContent = msg.content
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
+    .filter((b) => b.type === "text" || b.type === "thinking")
+    .map((b) => b.type === "thinking" ? `<thinking>\n${b.thinking}\n</thinking>` : b.text)
     .join("\n");
 
   result = { ...msg, content: textContent };
@@ -460,18 +442,16 @@ export function translateAnthropicToOpenAI(payload, ctx = null) {
       ? _translateMessages(out.messages, ctx)
       : out.messages.map(_translateMessage).flat();
 
-    out.messages = systemMessage
-      ? [systemMessage, ...translatedMsgs]
-      : translatedMsgs;
+    out.messages = systemMessage ? [systemMessage, ...translatedMsgs] : translatedMsgs;
   } else if (systemMessage) {
     out.messages = [systemMessage];
   }
 
   if (Array.isArray(out.tools)) {
     out.tools = _sanitizeToolArray(out.tools);
-//     console.log(
-//       `[Tool Translator] 🛠️ Natively mapped ${out.tools.length} schemas`,
-//     );
+    //     console.log(
+    //       `[Tool Translator] 🛠️ Natively mapped ${out.tools.length} schemas`,
+    //     );
   }
 
   return out;
@@ -644,7 +624,6 @@ export function stripAnthropicSpecificFields(payload) {
   return cleaned;
 }
 
-
 const _toolSchemaCacheMap = new Map();
 
 // Wrap minimizeToolSchemas:
@@ -653,17 +632,23 @@ export function minimizeToolSchemas(payload) {
 
   // Hash the current tools array
   const toolsJson = JSON.stringify(payload.tools);
-  const hash = crypto
-    .createHash("sha256")
-    .update(toolsJson)
-    .digest("hex")
-    .slice(0, 16);
+  const hash = crypto.createHash("sha256").update(toolsJson).digest("hex").slice(0, 16);
 
   if (_toolSchemaCacheMap.has(hash)) {
-    payload.tools = _toolSchemaCacheMap.get(hash);
-//     console.log(
-//       `[Tool Minimizer] ✅ Cache hit (${hash}) — skipped minimization`,
-//     );
+    const cachedTools = _toolSchemaCacheMap.get(hash);
+
+    // ── Stamp savings on cache hit so pipeline reporting is accurate ──
+    // Previously cache hits returned silently with no savings stamp.
+    // This caused the dashboard to show 0 minimize savings on turn 2+
+    // even though the tools ARE being served in minimized form.
+    const originalSize = toolsJson.length;
+    const cachedSize = JSON.stringify(cachedTools).length;
+    const savedTokens = Math.floor((originalSize - cachedSize) / 4);
+    if (savedTokens > 0) {
+      payload._cf_minimizeTokensSaved = savedTokens;
+    }
+
+    payload.tools = cachedTools;
     return payload;
   }
 
@@ -672,45 +657,33 @@ export function minimizeToolSchemas(payload) {
 
   payload.tools = payload.tools.map((tool) => {
     const fn = tool.function || tool;
-    const params = fn.parameters || {};
-    const properties = params.properties || {};
-    const required = params.required || [];
 
-    const keptProps = {};
-    const keptRequired = [];
+    // Deep clone to safely mutate
+    const newFn = JSON.parse(JSON.stringify(fn));
 
-    for (const key of required) {
-      if (properties[key]) {
-        keptProps[key] = {
-          type: properties[key].type || "string",
-          description: (properties[key].description || "").slice(0, 60),
-        };
-        keptRequired.push(key);
+    // Recursive function to minimize descriptions but keep structure intact
+    function minimizeSchema(schema) {
+      if (!schema) return;
+      if (schema.description) {
+        schema.description = schema.description.slice(0, 80);
+      }
+      if (schema.properties) {
+        for (const key of Object.keys(schema.properties)) {
+          minimizeSchema(schema.properties[key]);
+        }
+      }
+      if (schema.items) {
+        minimizeSchema(schema.items);
       }
     }
 
-    let optionalCount = 0;
-    for (const [key, val] of Object.entries(properties)) {
-      if (!required.includes(key) && optionalCount < 2) {
-        keptProps[key] = {
-          type: val.type || "string",
-          description: (val.description || "").slice(0, 40),
-        };
-        optionalCount++;
-      }
+    if (newFn.parameters) {
+      minimizeSchema(newFn.parameters);
     }
 
     return {
       type: "function",
-      function: {
-        name: fn.name,
-        description: (fn.description || "").slice(0, 80),
-        parameters: {
-          type: "object",
-          properties: keptProps,
-          required: keptRequired,
-        },
-      },
+      function: newFn,
     };
   });
 
@@ -721,10 +694,10 @@ export function minimizeToolSchemas(payload) {
   // Cache the result
   _toolSchemaCacheMap.set(hash, payload.tools);
 
-//   console.log(
-//     `[Tool Minimizer] ${originalSize} → ${newSize} chars ` +
-//       `(saved ~${savedTokens} tokens across ${payload.tools.length} tools) [cached as ${hash}]`,
-//   );
+  //   console.log(
+  //     `[Tool Minimizer] ${originalSize} → ${newSize} chars ` +
+  //       `(saved ~${savedTokens} tokens across ${payload.tools.length} tools) [cached as ${hash}]`,
+  //   );
 
   // FIX F5: Stamp savings for observability and baseline derivation
   payload._cf_minimizeTokensSaved = savedTokens;
@@ -735,12 +708,7 @@ export function minimizeToolSchemas(payload) {
 // ========================================================
 // 3. STREAM TRANSLATOR: OpenAI Server Deltas -> Anthropic SSE
 // ========================================================
-export function translateOpenAISSEToAnthropic(
-  openAIData,
-  messageId,
-  isFirst,
-  toolState,
-) {
+export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, toolState) {
   const events = [];
 
   // Initialize sequential block index counter — persists across chunks
@@ -758,14 +726,14 @@ export function translateOpenAISSEToAnthropic(
         `event: content_block_stop\ndata: ${JSON.stringify({
           type: "content_block_stop",
           index: toolState.currentToolIndex,
-        })}\n\n`,
+        })}\n\n`
       );
       events.push(
         `event: message_delta\ndata: ${JSON.stringify({
           type: "message_delta",
           delta: { stop_reason: "tool_use", stop_sequence: null },
           usage: { output_tokens: 0 },
-        })}\n\n`,
+        })}\n\n`
       );
     } else {
       if (toolState.inTextBlock && toolState.textBlockIndex >= 0) {
@@ -773,15 +741,18 @@ export function translateOpenAISSEToAnthropic(
           `event: content_block_stop\ndata: ${JSON.stringify({
             type: "content_block_stop",
             index: toolState.textBlockIndex,
-          })}\n\n`,
+          })}\n\n`
         );
       }
+      let finalStopReason = "end_turn";
+      if (toolState.finishReason === "length") finalStopReason = "max_tokens";
+      
       events.push(
         `event: message_delta\ndata: ${JSON.stringify({
           type: "message_delta",
-          delta: { stop_reason: "end_turn", stop_sequence: null },
+          delta: { stop_reason: finalStopReason, stop_sequence: null },
           usage: { output_tokens: 0 },
-        })}\n\n`,
+        })}\n\n`
       );
     }
     events.push(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
@@ -817,7 +788,7 @@ export function translateOpenAISSEToAnthropic(
           stop_sequence: null,
           usage: { input_tokens: 0, output_tokens: 1 },
         },
-      })}\n\n`,
+      })}\n\n`
     );
     events.push(`event: ping\ndata: {"type":"ping"}\n\n`);
   }
@@ -841,7 +812,7 @@ export function translateOpenAISSEToAnthropic(
           type: "content_block_start",
           index: toolState.textBlockIndex,
           content_block: { type: "text", text: "" },
-        })}\n\n`,
+        })}\n\n`
       );
     }
 
@@ -853,7 +824,7 @@ export function translateOpenAISSEToAnthropic(
           type: "content_block_delta",
           index: toolState.textBlockIndex,
           delta: { type: "text_delta", text: combinedText },
-        })}\n\n`,
+        })}\n\n`
       );
     }
   }
@@ -868,7 +839,7 @@ export function translateOpenAISSEToAnthropic(
           `event: content_block_stop\ndata: ${JSON.stringify({
             type: "content_block_stop",
             index: toolState.textBlockIndex,
-          })}\n\n`,
+          })}\n\n`
         );
       }
 
@@ -880,7 +851,7 @@ export function translateOpenAISSEToAnthropic(
             `event: content_block_stop\ndata: ${JSON.stringify({
               type: "content_block_stop",
               index: toolState.currentToolIndex,
-            })}\n\n`,
+            })}\n\n`
           );
         }
 
@@ -898,7 +869,7 @@ export function translateOpenAISSEToAnthropic(
               name: tc.function.name,
               input: {},
             },
-          })}\n\n`,
+          })}\n\n`
         );
       }
 
@@ -912,7 +883,7 @@ export function translateOpenAISSEToAnthropic(
               type: "input_json_delta",
               partial_json: tc.function.arguments,
             },
-          })}\n\n`,
+          })}\n\n`
         );
       }
     }
@@ -921,18 +892,17 @@ export function translateOpenAISSEToAnthropic(
   // ── Finish Reason Handling ──
   // Close text block on finish_reason — tool blocks close at [DONE]
   if (finishReason && finishReason !== "null") {
+    toolState.finishReason = finishReason;
     if (toolState.inTextBlock && toolState.textBlockIndex >= 0) {
       toolState.inTextBlock = false;
       events.push(
         `event: content_block_stop\ndata: ${JSON.stringify({
           type: "content_block_stop",
           index: toolState.textBlockIndex,
-        })}\n\n`,
+        })}\n\n`
       );
     }
   }
 
   return events;
 }
-
-

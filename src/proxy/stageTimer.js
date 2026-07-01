@@ -223,8 +223,7 @@ export const STAGES = {
   TRANSLATION:      "translation",
   SCRUB:            "scrub",
   TAG:              "tag",
-  PRUNE:            "prune",
-  SLICE_CODE:       "slice_code",
+
   CODE_COMPRESS:    "code_compress",
   PREDICTIVE:       "predictive_injection",
   VAULT_INTERCEPT:  "vault_intercept",

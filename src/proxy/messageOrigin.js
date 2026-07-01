@@ -13,12 +13,15 @@
  *   TOOL_FOLLOWUP  → LLM is processing tool results (mid tool-call loop)
  *   CONTINUATION   → mid-session follow-up to prior work
  *
- * Key structural facts learned from real Claude Code payloads:
- *   - Tool results arrive as role:"user" with content type:"tool_result"
- *     (there is no role:"tool" in the Anthropic wire format)
- *   - Assistant messages mid-task contain type:"tool_use" blocks
- *   - The first user message often has a <system-reminder> harness injection
- *     prepended — the real task is in a later text block
+ * Supports both wire formats that appear in the internal pipeline:
+ *
+ *   Anthropic format (from Claude clients):
+ *     - Tool results: role:"user", content blocks with type:"tool_result"
+ *     - Tool calls:   role:"assistant", content blocks with type:"tool_use"
+ *
+ *   OpenAI format (internal normalized format + Ollama):
+ *     - Tool results: role:"tool", content: string
+ *     - Tool calls:   role:"assistant", tool_calls: [...], content: null
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,11 +54,21 @@ function extractText(content) {
 }
 
 /**
- * Returns true if this user message is purely a tool result response.
- * In the Anthropic wire format, tool results come back as role:"user"
- * messages whose content blocks are all type:"tool_result".
+ * Returns true if this message is a tool result.
+ *
+ * Handles BOTH wire formats:
+ *
+ *   Anthropic format — role:"user" with all content blocks type:"tool_result"
+ *   OpenAI format   — role:"tool" (any content is a tool result by definition)
  */
 function isToolResultMessage(msg) {
+  // ── OpenAI / internal format ─────────────────────────────────────────────
+  // role:"tool" means this IS a tool result — no further inspection needed.
+  if (msg.role === "tool") return true;
+
+  // ── Anthropic wire format ─────────────────────────────────────────────────
+  // Tool results come back as role:"user" messages where every content
+  // block has type:"tool_result".
   if (msg.role !== "user") return false;
   const blocks = toBlocks(msg.content);
   if (blocks.length === 0) return false;
@@ -64,10 +77,21 @@ function isToolResultMessage(msg) {
 
 /**
  * Returns true if this assistant message issued at least one tool call.
- * Tool calls appear as type:"tool_use" blocks in the content array.
+ *
+ * Handles BOTH wire formats:
+ *
+ *   Anthropic format — content blocks with type:"tool_use"
+ *   OpenAI format   — message.tool_calls array (non-empty)
  */
 function assistantCalledTools(msg) {
   if (msg.role !== "assistant") return false;
+
+  // ── OpenAI / internal format ─────────────────────────────────────────────
+  // Tool calls live in msg.tool_calls, content is null.
+  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
+
+  // ── Anthropic wire format ─────────────────────────────────────────────────
+  // Tool calls appear as type:"tool_use" blocks inside the content array.
   return toBlocks(msg.content).some((b) => b.type === "tool_use");
 }
 
@@ -112,15 +136,15 @@ function isAgentStatusMessage(content) {
  *
  * Decision logic (evaluated in order):
  *
- *   1. TOOL_FOLLOWUP  — the most recent user message is a tool result block.
+ *   1. TOOL_FOLLOWUP  — the most recent user/tool message is a tool result.
  *      The LLM is mid tool-call loop; this is not a human turn at all.
  *
- *   2. CONTINUATION   — any of the last 4 messages contain a tool_use block
- *      (assistant called a tool recently) or was a tool result user message.
- *      We are mid-session; keep tools active.
+ *   2. CONTINUATION   — any of the last 6 messages contain a tool call
+ *      (assistant called a tool recently) or was a tool result message.
+ *      Window expanded from 4 → 6 to catch longer tool chains.
  *
  *   3. AGENT_STATUS   — the last assistant message is a pure status report
- *      (no tool_use blocks) AND the current user text is short (< 150 chars).
+ *      (no tool calls) AND the current user text is short (< 150 chars).
  *      This is an acknowledgment loop, not a new task.
  *
  *   4. HUMAN_TASK     — everything else: treat as a fresh coding instruction.
@@ -136,9 +160,10 @@ export function detectMessageOrigin(messages) {
   // ── The current turn is the last message ────────────────────────────────
   const currentMsg = messages[messages.length - 1];
 
-  // ── Rule 1: Tool result user message — mid tool-call loop ───────────────
-  // In Anthropic's wire format, the LLM's tool call produces a user-role
-  // message with type:"tool_result" blocks. This is NOT a human task.
+  // ── Rule 1: Tool result message — mid tool-call loop ────────────────────
+  // Handles both:
+  //   OpenAI format:   role:"tool"
+  //   Anthropic format: role:"user" with all blocks type:"tool_result"
   if (isToolResultMessage(currentMsg)) {
     return {
       origin: "TOOL_FOLLOWUP",
@@ -147,9 +172,11 @@ export function detectMessageOrigin(messages) {
   }
 
   // ── Gather context from recent history ──────────────────────────────────
-  // Look back at the last 4 messages (excluding the current turn).
+  // Look back at the last 6 messages (excluding the current turn).
+  // Expanded from 4 to catch longer tool-call chains where tool activity
+  // may be further back than 4 messages.
   const history = messages.slice(0, -1);
-  const recentHistory = history.slice(-4);
+  const recentHistory = history.slice(-6);
 
   // Find the last assistant message and last human-authored user message.
   let lastAssistantMsg = null;
@@ -167,8 +194,9 @@ export function detectMessageOrigin(messages) {
   }
 
   // ── Rule 2: Recent tool activity — we are mid-session ───────────────────
-  // If any recent message was a tool result (user role, tool_result blocks)
-  // OR the assistant recently called a tool, this is a continuation.
+  // If any recent message was a tool result OR the assistant recently
+  // called tools, this is a continuation — keep capabilities active.
+  // Both Anthropic and OpenAI formats are handled by the updated helpers.
   const hasRecentTools = recentHistory.some(
     (m) => isToolResultMessage(m) || assistantCalledTools(m)
   );
@@ -184,12 +212,9 @@ export function detectMessageOrigin(messages) {
   // AND the current user message is short → acknowledgment loop.
   if (lastAssistantMsg && !assistantCalledTools(lastAssistantMsg)) {
     const lastAssistantText = extractText(lastAssistantMsg.content);
-    const currentUserText   = extractText(currentMsg.content);
+    const currentUserText = extractText(currentMsg.content);
 
-    if (
-      isAgentStatusMessage(lastAssistantText) &&
-      currentUserText.trim().length < 150
-    ) {
+    if (isAgentStatusMessage(lastAssistantText) && currentUserText.trim().length < 150) {
       return {
         origin: "AGENT_STATUS",
         reason: `last_assistant_was_status: "${lastAssistantText.slice(0, 60)}"`,
@@ -215,17 +240,15 @@ export function requiresRepositoryWork(origin) {
 }
 
 /**
- * Returns true if any of the last 4 messages contain tool activity
- * (tool results or tool calls). Replaces broken inline checks that
- * looked for role:"tool" (doesn't exist) and m.tool_calls (wrong field).
- * 
+ * Returns true if any of the last 6 messages contain tool activity.
+ * Handles both Anthropic and OpenAI wire formats.
+ * Window expanded from 4 → 6 to match detectMessageOrigin.
+ *
  * @param {object[]} messages - Full messages array from the request body
  * @returns {boolean}
  */
 export function detectRecentToolActivity(messages) {
   if (!messages || messages.length === 0) return false;
-  const recent = messages.slice(-4);
-  return recent.some(
-    (m) => isToolResultMessage(m) || assistantCalledTools(m)
-  );
+  const recent = messages.slice(-6);
+  return recent.some((m) => isToolResultMessage(m) || assistantCalledTools(m));
 }

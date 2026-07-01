@@ -140,15 +140,11 @@ export function scanForMarkers(messages) {
 // ─────────────────────────────────────────────
 
 export class CCRToolInjector {
-  constructor({
-    provider = "openai",
-    injectTool = true,
-    injectSystemInstructions = false,
-  } = {}) {
-    this.provider                = provider;
-    this.injectTool              = injectTool;
+  constructor({ provider = "openai", injectTool = true, injectSystemInstructions = false } = {}) {
+    this.provider = provider;
+    this.injectTool = injectTool;
     this.injectSystemInstructions = injectSystemInstructions;
-    this._detectedVaultIds       = [];
+    this._detectedVaultIds = [];
   }
 
   get hasCompressedContent() {
@@ -167,12 +163,17 @@ export class CCRToolInjector {
   injectToolDefinition(tools, { sessionHasDoneCCR = false } = {}) {
     if (!this.injectTool) return { tools: tools || [], wasInjected: false };
 
-    const shouldInject = sessionHasDoneCCR || this.hasCompressedContent;
+    // FIX: Removed sessionHasDoneCCR from shouldInject condition.
+    // The sticky-on behavior was the root cause of permanent injection.
+    // Injection is now decided entirely by whether hasCompressedContent
+    // is true — which is controlled by the caller (applyCCRPipeline)
+    // setting _detectedVaultIds to only UNRETRIEVED vault IDs.
+    const shouldInject = this.hasCompressedContent;
     if (!shouldInject) return { tools: tools || [], wasInjected: false };
 
     const currentTools = tools || [];
 
-    // Check if already present — avoid duplicates
+    // Avoid duplicates
     for (const tool of currentTools) {
       const name = tool.name || tool.function?.name;
       if (name === CCR_TOOL_NAME) {
@@ -180,7 +181,7 @@ export class CCRToolInjector {
       }
     }
 
-    console.log('Injecting retrieve tool');
+    console.log("Injecting retrieve tool");
     const ccrTool = createCCRToolDefinition(this.provider);
     return { tools: [...currentTools, ccrTool], wasInjected: true };
   }
@@ -199,14 +200,13 @@ export class CCRToolInjector {
       return { messages, tools, toolWasInjected: false };
     }
 
-    const { tools: updatedTools, wasInjected } = this.injectToolDefinition(
-      tools,
-      { sessionHasDoneCCR },
-    );
+    const { tools: updatedTools, wasInjected } = this.injectToolDefinition(tools, {
+      sessionHasDoneCCR,
+    });
 
     return {
       messages,
-      tools:          updatedTools,
+      tools: updatedTools,
       toolWasInjected: wasInjected,
     };
   }
@@ -216,11 +216,11 @@ export function parseCCRToolCall(toolCall, provider = "openai") {
   let name, inputData;
 
   if (provider === "anthropic") {
-    name      = toolCall.name;
+    name = toolCall.name;
     inputData = toolCall.input || {};
   } else {
     const fn = toolCall.function || {};
-    name     = fn.name;
+    name = fn.name;
     try {
       inputData = JSON.parse(fn.arguments || "{}");
     } catch {
@@ -231,7 +231,7 @@ export function parseCCRToolCall(toolCall, provider = "openai") {
   if (name !== CCR_TOOL_NAME) return { vaultId: null, searchQuery: null };
 
   return {
-    vaultId:     inputData.vault_id    || null,
+    vaultId: inputData.vault_id || null,
     searchQuery: inputData.search_query || null,
   };
 }

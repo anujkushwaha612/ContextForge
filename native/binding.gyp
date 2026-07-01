@@ -5,20 +5,12 @@
             "sources": [
                 "src/addon.cpp",
                 "src/simhash.cpp",
-                "src/sliding_window.cpp",
-                "src/tfidf.cpp",
-                "src/attention.cpp",
-                "src/positional.cpp",
-                "src/fidelity.cpp",
-                "src/token_counter.cpp",
-                "src/static_embed.cpp",
                 "src/cache.cpp",
                 "src/hybrid_retriever.cpp",
                 "src/ast_compressor.cpp",
                 "src/persistent_memory.cpp",
                 "src/onnx_embedder.cpp",
                 "src/embed_cache.cpp",
-                "src/anomaly_scorer.cpp",
 
                 "tree-sitter-src/tree-sitter/lib/src/lib.c",
 

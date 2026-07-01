@@ -3,59 +3,69 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <queue>
 #include "hnswlib/hnswlib/hnswlib.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VectorMetadata
-// Replaces the old id_map_ (label → string).
-// Stores structured metadata alongside each vector so subsystems
-// (planner, memory, cache) can share one HNSW index with namespace isolation.
 // ─────────────────────────────────────────────────────────────────────────────
 struct VectorMetadata {
-    std::string id;             // Namespaced string ID, e.g. "PLANNER__PATCH__0"
-    std::string namespaceName;  // e.g. "PLANNER", "MEMORY", "CACHE"
-    std::string type;           // e.g. "anchor", "document", "response"
-    std::string payload;        // Arbitrary JSON string for extra data
+    std::string id;
+    std::string namespaceName;
+    std::string type;
+    std::string payload;
 };
 
 class SemanticCache : public Napi::ObjectWrap<SemanticCache> {
     friend class HybridRetriever;
+
 public:
     static Napi::Object Init(Napi::Env env, Napi::Object exports);
     SemanticCache(const Napi::CallbackInfo& info);
     ~SemanticCache();
 
 private:
-    // ── Existing API (preserved for backward compat) ──────────────────────
+    // ── Existing API ──────────────────────────────────────────────────────
     Napi::Value Add(const Napi::CallbackInfo& info);
-    Napi::Value Search(const Napi::CallbackInfo& info);           // threshold search, returns string|null
+    Napi::Value Search(const Napi::CallbackInfo& info);
     Napi::Value Invalidate(const Napi::CallbackInfo& info);
     Napi::Value ClearAll(const Napi::CallbackInfo& info);
 
     // ── New API ───────────────────────────────────────────────────────────
-    Napi::Value AddWithMeta(const Napi::CallbackInfo& info);      // add(vec, id, namespace, type, payload?)
-    Napi::Value SearchK(const Napi::CallbackInfo& info);          // searchK(vec, k) → [{id,label,score,namespace,type,payload}]
-    Napi::Value SearchThreshold(const Napi::CallbackInfo& info);  // searchThreshold(vec, threshold) → string|null (alias for Search)
-    Napi::Value ClearPrefix(const Napi::CallbackInfo& info);      // clearPrefix("PLANNER__") → count removed
-    Napi::Value Size(const Napi::CallbackInfo& info);             // size() → number of active vectors
-    Napi::Value Stats(const Napi::CallbackInfo& info);            // stats() → {size, dim, namespaces}
+    Napi::Value AddWithMeta(const Napi::CallbackInfo& info);
+    Napi::Value SearchK(const Napi::CallbackInfo& info);
+    Napi::Value SearchThreshold(const Napi::CallbackInfo& info);
+    Napi::Value ClearPrefix(const Napi::CallbackInfo& info);
+    Napi::Value Size(const Napi::CallbackInfo& info);
+
+    // Stats has two overloads:
+    //   - NAPI entry point called by JS
+    //   - const helper called internally (e.g. from tests or other C++ code)
+    Napi::Value Stats(const Napi::CallbackInfo& info);
+    Napi::Value Stats(Napi::Env env) const;
 
     // ── Internal helpers ──────────────────────────────────────────────────
+
+    // SC-2/SC-8: Remove existing HNSW entry for an ID before re-inserting.
+    // Prevents orphaned entries when the same ID is added more than once.
+    void removeByIdIfExists(const std::string& id);
+
+    // Build a JS result object from a label + similarity score
     Napi::Object BuildHitObject(Napi::Env env,
                                 hnswlib::labeltype label,
                                 float similarity) const;
 
+    // ── Member state ──────────────────────────────────────────────────────
     size_t dim_;
-    hnswlib::SpaceInterface<float>*    space_;
-    hnswlib::HierarchicalNSW<float>*   alg_hnsw_;
-    hnswlib::labeltype                 current_label_;
+    hnswlib::SpaceInterface<float>*   space_;
+    hnswlib::HierarchicalNSW<float>*  alg_hnsw_;
+    hnswlib::labeltype                current_label_;
 
-    // Replaces old id_map_ — keyed by HNSW integer label
     std::unordered_map<hnswlib::labeltype, VectorMetadata> meta_map_;
+    std::unordered_map<std::string, hnswlib::labeltype>    id_to_label_;
 
-    // Reverse index: string ID → label (for contains() and invalidate-by-id)
-    std::unordered_map<std::string, hnswlib::labeltype> id_to_label_;
-
-    // Active count (HNSW doesn't expose this after markDelete)
+    // Accurate count of non-deleted vectors.
+    // current_label_ counts all ever-inserted (including deleted) —
+    // active_count_ is what SearchK should clamp to.
     size_t active_count_;
 };

@@ -1,12 +1,26 @@
 /**
  * graphTools.js
  *
- * G3 fix: find_symbol caps body_text at 1,500 chars in the response.
- * G4 fix: find_symbol falls back to LIKE fuzzy match on exact miss.
- * G5 fix: show_callers "no_callers" guides LLM to who_imports_this.
- * W-CRLF fix: show_callers code_snippet normalizes line endings.
- * Log fix: GraphInject only logs on first injection per process.
- * find_route fix: adds start_line + patch hint to route results.
+ * Fixes applied:
+ *   GT-1: Path normalization now strips workspace root prefix, not just drive letter.
+ *         Absolute paths like "D:/NODE JS/.../controllers/file.js" now correctly
+ *         resolve to "controllers/file.js" for graph queries.
+ *
+ *   GT-2: show_callers now reads each file once and reuses the lines array
+ *         for findCallLine, snippet extraction, and callText — was reading
+ *         the same file 2-3 times per caller entry.
+ *
+ *   GT-3: CONFIDENCE_THRESHOLD removed — was declared but never wired into
+ *         any query path.
+ *
+ *   GT-4: executeReadFileChunk verification in patchTools.js now uses
+ *         result.file (resolved path). executeReadFileChunk itself now
+ *         removes the process.cwd() fallback (GT-5) — workspace root is
+ *         the single authoritative base for all relative paths.
+ *
+ *   GT-5: process.cwd() fallback removed from executeReadFileChunk.
+ *         Workspace root is the canonical base. cwd() fallback caused
+ *         inconsistent resolution when server was started from a parent dir.
  */
 
 import {
@@ -24,11 +38,15 @@ import {
   queryFindLiteralsByFn,
   queryFindConfigByFn,
   getWorkspaceRoot,
+  getAllIndexedFiles,
 } from "./graphDb.js";
 import { statsEmitter } from "../proxy/statsEmitter.js";
 import fs from "node:fs";
 import path from "node:path";
 import { planRetrieval } from "./retrievalPlanner.js";
+
+// Re-export so upstreamRequest.js can import without depending on graphDb directly
+export { getWorkspaceRoot } from "./graphDb.js";
 
 export const GRAPH_TOOL_NAME = "contextforge_query_graph";
 
@@ -45,62 +63,78 @@ export function normalizeGraphToolName(name) {
 }
 
 // ─────────────────────────────────────────────
-// G3 helper: cap body text in find_symbol responses
+// GT-1: Canonical path normalizer
+//
+// Converts any path representation the LLM may pass — absolute Windows,
+// absolute POSIX, relative — to a workspace-relative forward-slash path
+// that matches what the graph DB stores.
+//
+// Strategy:
+//   1. Normalize separators to forward slashes
+//   2. If path starts with workspace root → strip it
+//   3. Else if path has a drive letter → strip drive letter
+//      (best-effort for paths outside workspace)
+//   4. Strip leading slashes left over from stripping
 // ─────────────────────────────────────────────
 
-const BODY_CHAR_LIMIT = 1500;
+function normalizeTargetPath(rawPath) {
+  if (!rawPath || typeof rawPath !== "string") return rawPath ?? "";
 
-// ADD after it:
-// Configurable confidence threshold for semantic fallback.
-// Below this value, resolveWithEmbeddings() is invoked.
-// Override via CF_GRAPH_CONFIDENCE env var.
-const CONFIDENCE_THRESHOLD = parseFloat(process.env.CF_GRAPH_CONFIDENCE ?? "0.4");
+  // Normalize separators
+  let p = rawPath.replace(/\\/g, "/");
 
-function capBodyText(bodyText, symbolName) {
-  if (!bodyText) return null;
+  // Get workspace root in the same normalized form
+  const wsRoot = getWorkspaceRoot().replace(/\\/g, "/");
+  const wsPrefix = wsRoot.endsWith("/") ? wsRoot.toLowerCase() : wsRoot.toLowerCase() + "/";
 
-  // Normalize CRLF → LF so the body returned matches what
-  // the LLM sees in the actual file (on Windows).
-  const normalized = bodyText.replace(/\r\n/g, "\n");
+  const pLower = p.toLowerCase();
 
-  if (normalized.length <= BODY_CHAR_LIMIT) return normalized;
-
-  const lines = normalized.split("\n");
-  let charCount = 0;
-  let cutLine = 0;
-
-  for (let i = 0; i < lines.length; i++) {
-    charCount += lines[i].length + 1;
-    if (charCount > BODY_CHAR_LIMIT) {
-      cutLine = i;
-      break;
-    }
+  if (pLower.startsWith(wsPrefix)) {
+    // Absolute path inside workspace — strip to relative
+    p = p.slice(wsPrefix.length);
+  } else if (/^[A-Za-z]:\//.test(p)) {
+    // Absolute path outside workspace — strip drive letter only
+    // This is best-effort; graph query will return not_found if path is wrong
+    p = p.replace(/^[A-Za-z]:\//, "");
   }
 
-  const truncated = lines.slice(0, cutLine).join("\n");
-  const remaining = lines.length - cutLine;
-  const truncNote =
-    `\n// ... ${remaining} more lines truncated ` +
-    `(${normalized.length} chars total). ` +
-    `Use read_file_chunk with the line numbers above to get the full raw text.`;
+  // Strip any remaining leading slashes
+  p = p.replace(/^\/+/, "");
 
-  return truncated + truncNote;
+  return p;
 }
 
 // ─────────────────────────────────────────────
 // Read file helper — CRLF normalized
-// Used by show_callers to build code_snippet
 // ─────────────────────────────────────────────
 
 function readFileLines(filePath) {
   try {
-    return fs
-      .readFileSync(filePath, "utf-8")
-      .replace(/\r\n/g, "\n") // normalize Windows CRLF → LF
-      .split("\n");
+    return fs.readFileSync(filePath, "utf-8").replace(/\r\n/g, "\n").split("\n");
   } catch {
     return null;
   }
+}
+
+// ─────────────────────────────────────────────
+// GT-2: Find call line from already-loaded lines array
+// Avoids re-reading the file when lines are already in memory.
+// ─────────────────────────────────────────────
+
+function findCallLineInFileFromLines(lines, functionName) {
+  const escaped = functionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const callRegex = new RegExp(`\\b${escaped}\\s*\\(`);
+  for (let i = 0; i < lines.length; i++) {
+    if (callRegex.test(lines[i])) return i + 1; // 1-indexed
+  }
+  return null;
+}
+
+// Kept for external callers that only have a file path
+function findCallLineInFile(filePath, functionName) {
+  const lines = readFileLines(filePath);
+  if (!lines) return null;
+  return findCallLineInFileFromLines(lines, functionName);
 }
 
 // ─────────────────────────────────────────────
@@ -172,7 +206,8 @@ export function getGraphToolDefinition() {
               "analyze_impact (full 2-hop call chain for refactoring safety), " +
               "find_route (HTTP route by path fragment). " +
               "For file analysis: start with what_does_this_export to get symbol names, " +
-              "then find_symbol for specific functions. Never search by class name.",
+              "then find_symbol to get line numbers, " +
+              "then read_function to get the full body. Never search by class name.",
           },
           target: {
             type: "string",
@@ -202,24 +237,13 @@ export async function executeGraphQuery(queryType, target, args = {}) {
     return JSON.stringify({ error: "target is required" });
   }
 
-  let cleanTarget = String(target).trim();
-
-  // Normalize absolute paths to relative
-  const cwdNormalized = process.cwd().replace(/\\/g, "/").toLowerCase();
-  const targetNormalized = cleanTarget.replace(/\\/g, "/");
-  const targetLower = targetNormalized.toLowerCase();
-  if (targetLower.startsWith(cwdNormalized + "/")) {
-    cleanTarget = targetNormalized.slice(cwdNormalized.length + 1);
-  } else {
-    cleanTarget = targetNormalized.replace(/^[A-Za-z]:\//, "");
-  }
+  // GT-1: Use the canonical normalizer instead of the broken drive-letter-only strip
+  const cleanTarget = normalizeTargetPath(String(target).trim());
 
   try {
     let result;
 
     switch (queryType) {
-      // ── Spatial queries ──
-
       case "who_imports_this": {
         const rows = queryWhoImportsThis(cleanTarget);
         if (rows.length === 0) {
@@ -251,7 +275,10 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           result = JSON.stringify({
             file: cleanTarget,
             result: "not_found",
-            message: `No exports found for '${cleanTarget}'. Check the file path or run a graph re-index. If you know the file exists but it might be unindexed or a procedural script, use read_file_chunk(file_path: '${cleanTarget}', start_line: 1, end_line: 99999) to read the full file.`,
+            message:
+              `No exports found for '${cleanTarget}'. Check the file path or run a graph re-index. ` +
+              `If you know the file exists but it might be unindexed or a procedural script, ` +
+              `use read_file_chunk(file_path: '${cleanTarget}', start_line: 1, end_line: 99999) to read the full file.`,
           });
           break;
         }
@@ -291,7 +318,8 @@ export async function executeGraphQuery(queryType, target, args = {}) {
             message:
               `Symbol '${cleanTarget}' not found in the graph index. ` +
               `Try who_imports_this or what_does_this_export on the file you expect it to live in. ` +
-              `If you know the file it lives in, but it lacks named declarations, use read_file_chunk with start_line=1 and end_line=99999 to read the full file directly.`,
+              `If you know the file it lives in, but it lacks named declarations, ` +
+              `use read_file_chunk with start_line=1 and end_line=99999 to read the full file directly.`,
           });
           break;
         }
@@ -302,7 +330,8 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           start_line: r.start_line,
           end_line: r.end_line,
           complexity: r.complexity,
-          body: capBodyText(r.body_text, r.name),
+          // No body — call read_function(name) to get the full implementation.
+          // find_symbol is a location query, not a content query.
         }));
 
         result = JSON.stringify(
@@ -316,7 +345,10 @@ export async function executeGraphQuery(queryType, target, args = {}) {
             }),
             definitions,
             count: rows.length,
-            tip: "If body shows truncation ('... N more lines'), use read_file_chunk with the start_line/end_line above to get the complete raw text.",
+            next_step:
+              "Call read_function('" +
+              cleanTarget +
+              "') to get the full implementation body and line numbers.",
           },
           null,
           2
@@ -371,8 +403,6 @@ export async function executeGraphQuery(queryType, target, args = {}) {
         break;
       }
 
-      // ── Relational queries ──
-
       case "show_callers": {
         const rows = queryWhoCallsThis(cleanTarget);
 
@@ -391,34 +421,28 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           break;
         }
 
+        // GT-2: Read each file once, reuse lines array for all operations
         const callers = rows.map((r) => {
-          let snippet = null;
           let callLine = r.source_line ?? null;
           const fileName = r.source_file;
 
-          // source_line not yet populated for this edge (indexed before migration).
-          // Grep the source file to find the call site.
-          if (!callLine) {
-            callLine = findCallLineInFile(fileName, cleanTarget);
+          // Read file once — reuse for findCallLine, snippet, and callText
+          const lines = readFileLines(fileName);
+
+          if (!callLine && lines) {
+            callLine = findCallLineInFileFromLines(lines, cleanTarget);
           }
 
-          if (callLine) {
-            const lines = readFileLines(fileName);
-            if (lines) {
-              const start = Math.max(0, callLine - 4);
-              const end = Math.min(lines.length, callLine + 3);
-              snippet = lines.slice(start, end).join("\n");
-            }
-          }
-
-          // Extract just the call line text for exact search_string values
+          let snippet = null;
           let callText = null;
-          if (callLine) {
-            const lines = readFileLines(fileName);
-            if (lines && callLine > 0 && callLine <= lines.length) {
-              const raw = lines[callLine - 1].trim();
-              callText = raw.length > 200 ? raw.slice(0, 200) + "..." : raw;
-            }
+
+          if (callLine && lines) {
+            const start = Math.max(0, callLine - 4);
+            const end = Math.min(lines.length, callLine + 3);
+            snippet = lines.slice(start, end).join("\n");
+
+            const raw = lines[callLine - 1]?.trim() ?? "";
+            callText = raw.length > 200 ? raw.slice(0, 200) + "..." : raw;
           }
 
           return {
@@ -515,7 +539,6 @@ export async function executeGraphQuery(queryType, target, args = {}) {
         break;
       }
 
-      // ADD before the "find" case:
       case "retrieve": {
         const intent = args.intent ?? "location";
         const validIntents = ["location", "implementation", "architecture", "debug"];
@@ -546,10 +569,7 @@ export async function executeGraphQuery(queryType, target, args = {}) {
         break;
       }
 
-      // In executeGraphQuery, add new case:
-
       case "find": {
-        // Use the evidence planner for all find queries
         const plan = await planRetrieval(cleanTarget, "implementation");
 
         if (!plan.evidence.length) {
@@ -590,17 +610,12 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           break;
         }
 
-        // Take the first definition
         const sym = rows[0];
 
-        // More robust resolution matching executeReadFileChunk's pattern:
-        let resolvedPath = sym.file_path;
-        // Handle both relative and absolute (including Windows D:/ after normalization)
-        if (!path.isAbsolute(resolvedPath) && !resolvedPath.match(/^[A-Za-z]:\//)) {
+        // GT-1 fix applied here too: resolve against workspace root, not drive letter
+        let resolvedPath = sym.file_path.replace(/\\/g, "/");
+        if (!path.isAbsolute(resolvedPath) && !/^[A-Za-z]:\//.test(resolvedPath)) {
           resolvedPath = path.resolve(getWorkspaceRoot(), resolvedPath);
-        } else {
-          // Convert forward slashes back to OS path separators on Windows
-          resolvedPath = resolvedPath.replace(/\//g, path.sep);
         }
 
         let bodyLines = [];
@@ -613,7 +628,6 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           break;
         }
 
-        // Fetch literals and configs
         const literals = queryFindLiteralsByFn(cleanTarget, sym.file_path);
         const configs = queryFindConfigByFn(cleanTarget, sym.file_path);
 
@@ -637,7 +651,9 @@ export async function executeGraphQuery(queryType, target, args = {}) {
         };
 
         if (rows.length > 1) {
-          readFnResponse.note = `${rows.length} definitions found — showing the exported/most complex one. Use find('${cleanTarget}') to see all.`;
+          readFnResponse.note =
+            `${rows.length} definitions found — showing the exported/most complex one. ` +
+            `Use find('${cleanTarget}') to see all.`;
         }
 
         result = JSON.stringify(readFnResponse, null, 2);
@@ -663,7 +679,7 @@ export async function executeGraphQuery(queryType, target, args = {}) {
             routes: rows.map((r) => ({
               route: r.route_path,
               file: r.source_file,
-              start_line: r.source_line ?? null, // ← ADD THIS
+              start_line: r.source_line ?? null,
               handler: r.handler || "(inline)",
               patch_hint: r.handler
                 ? `Use find_symbol('${r.handler}') to get the handler body and line numbers.`
@@ -725,9 +741,7 @@ export function injectGraphTool(tools) {
 
   for (const tool of currentTools) {
     const name = tool.name || tool.function?.name;
-    if (name === GRAPH_TOOL_NAME) {
-      return currentTools;
-    }
+    if (name === GRAPH_TOOL_NAME) return currentTools;
   }
 
   if (!_graphInjectedOnce) {
@@ -744,9 +758,9 @@ export function injectGraphTool(tools) {
   return [...currentTools, getGraphToolDefinition()];
 }
 
-// ─────────────────────────────────────────────────────────────
-// read_file_chunk — surgical file reading (supports full files)
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// read_file_chunk
+// ─────────────────────────────────────────────
 
 export const READ_FILE_CHUNK_TOOL_NAME = "read_file_chunk";
 
@@ -770,13 +784,42 @@ export function executeReadFileChunk(filePath, startLine, endLine) {
     });
   }
 
-  let resolvedPath = filePath;
-  if (!path.isAbsolute(resolvedPath)) {
-    // Try workspace root first (from the graph mapper), then fall back to cwd
+  // GT-5: Workspace root is the single authoritative base for relative paths.
+  // process.cwd() fallback removed — it caused inconsistent resolution when
+  // the server was started from a parent directory.
+  let resolvedPath = filePath.replace(/\\/g, "/");
+  if (!path.isAbsolute(resolvedPath) && !/^[A-Za-z]:\//.test(resolvedPath)) {
     const workspaceRoot = getWorkspaceRoot();
-    resolvedPath = path.resolve(workspaceRoot, resolvedPath);
+    resolvedPath = path.resolve(workspaceRoot, filePath);
+
     if (!fs.existsSync(resolvedPath)) {
-      resolvedPath = path.resolve(process.cwd(), filePath);
+      // Fuzzy search in graph DB for files that match the relative path suffix
+      const allIndexedFiles = getAllIndexedFiles();
+      const queryPath = filePath.replace(/\\/g, "/").replace(/^\.\//, "");
+      const matches = allIndexedFiles.filter((f) => {
+        const indexedPath = f.file_path.replace(/\\/g, "/");
+        return indexedPath === queryPath || indexedPath.endsWith("/" + queryPath);
+      });
+
+      if (matches.length === 1) {
+        resolvedPath = matches[0].file_path;
+      } else if (matches.length > 1) {
+        return JSON.stringify({
+          error: "Ambiguous file path",
+          message:
+            `Found multiple files matching '${filePath}'. ` +
+            `Please provide the full path relative to workspace root. ` +
+            `Matches: ${matches.map((m) => m.file_path).join(", ")}`,
+        });
+      } else {
+        // GT-5 fix: no cwd fallback — if not in workspace, report clearly
+        return JSON.stringify({
+          error: "File not found",
+          message:
+            `'${filePath}' does not exist relative to workspace root '${workspaceRoot}'. ` +
+            `If this is a newly created file, wait for the graph to re-index or provide the full absolute path.`,
+        });
+      }
     }
   }
 
@@ -797,20 +840,22 @@ export function executeReadFileChunk(filePath, startLine, endLine) {
 
     const searchHint = chunk.length > 0 && chunk[0].trim() ? chunk[0].trim().substring(0, 40) : "";
 
-    const result = {
-      file: filePath,
-      start_line: start,
-      end_line: actualEnd,
-      total_lines: allLines.length,
-      lines: chunk,
-      content: chunk.join("\n"),
-      hint:
-        `To patch this file: use contextforge_patch_ast with ` +
-        `search_string set to one of these lines and file_path="${filePath}". ` +
-        `To retrieve from vault: contextforge_retrieve with search_query="${searchHint}".`,
-    };
-
-    return JSON.stringify(result, null, 2);
+    return JSON.stringify(
+      {
+        file: filePath,
+        start_line: start,
+        end_line: actualEnd,
+        total_lines: allLines.length,
+        lines: chunk,
+        content: chunk.join("\n"),
+        hint:
+          `To patch this file: use contextforge_patch_ast with ` +
+          `search_string set to one of these lines and file_path="${filePath}". ` +
+          `To retrieve from vault: contextforge_retrieve with search_query="${searchHint}".`,
+      },
+      null,
+      2
+    );
   } catch (err) {
     if (err.code === "ENOENT") {
       return JSON.stringify({
@@ -870,13 +915,10 @@ export function injectReadFileChunkTool(tools) {
 
   for (const tool of currentTools) {
     const name = tool.name || tool.function?.name;
-    if (name === READ_FILE_CHUNK_TOOL_NAME) {
-      return currentTools;
-    }
+    if (name === READ_FILE_CHUNK_TOOL_NAME) return currentTools;
   }
 
   if (!_readFileChunkInjectedOnce) {
-//     console.log(`[ReadFileChunk] ✅ Tool injected`);
     _readFileChunkInjectedOnce = true;
   }
 
@@ -884,33 +926,15 @@ export function injectReadFileChunkTool(tools) {
 }
 
 // ─────────────────────────────────────────────
-// Grep a source file for function call sites.
-// Used as fallback when source_line is not yet
-// populated in the edges table (files indexed
-// before the source_line migration).
+// Evidence formatter for find/retrieve results
 // ─────────────────────────────────────────────
-
-function findCallLineInFile(filePath, functionName) {
-  const lines = readFileLines(filePath);
-  if (!lines) return null;
-
-  const escaped = functionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const callRegex = new RegExp(`\\b${escaped}\\s*\\(`);
-
-  for (let i = 0; i < lines.length; i++) {
-    if (callRegex.test(lines[i])) {
-      return i + 1; // 1-indexed line number
-    }
-  }
-  return null;
-}
 
 function formatEvidence(evidence) {
   const output = [];
   for (const e of evidence) {
     for (const item of e.items) {
       if (item.type === "symbol") {
-        const entry = {
+        output.push({
           type: "symbol",
           name: item.name,
           kind: item.kind,
@@ -922,10 +946,9 @@ function formatEvidence(evidence) {
           calls: item.calls || [],
           literalRefs: item.literalRefs || [],
           envRefs: item.envRefs || [],
-        };
-        // Cap body if present
-        if (item.body) entry.body = capBodyText(item.body, item.name);
-        output.push(entry);
+          // No body — find/retrieve returns location metadata only.
+          // Call read_function(name) for the full implementation.
+        });
       } else if (item.type === "route") {
         output.push({
           type: "route",
@@ -942,16 +965,6 @@ function formatEvidence(evidence) {
           line: item.line,
           usedIn: item.usedIn,
           containing_function: item.containing_function || undefined,
-        });
-      } else if (item.body) {
-        // function_body items
-        output.push({
-          type: "function_body",
-          name: item.name,
-          file: item.file,
-          startLine: item.startLine,
-          endLine: item.endLine,
-          body: capBodyText(item.body, item.name),
         });
       }
     }

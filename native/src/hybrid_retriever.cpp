@@ -1,6 +1,5 @@
 #include "hybrid_retriever.h"
 #include <sstream>
-#include <regex>
 #include <set>
 #include <queue>
 #include <unordered_set>
@@ -129,6 +128,8 @@ double HybridRetriever::BM25Score(const BM25Doc &doc,
     const double k1 = 1.2;
     const double b  = 0.75;
 
+    if (avgDocLen_ == 0.0) return 0.0;
+
     for (const auto &term : queryTokens)
     {
         auto tfIt = doc.termFreq.find(term);
@@ -146,26 +147,9 @@ double HybridRetriever::BM25Score(const BM25Doc &doc,
 }
 
 // ==========================================
-// COSINE SIMILARITY
+// HR-9: CosineSimilarity removed — was defined but never called.
+// HNSW distance (1.0f - top.first) is used for dense similarity.
 // ==========================================
-double HybridRetriever::CosineSimilarity(const float *a, const float *b, int dim)
-{
-    double dotProduct = 0.0;
-    double normA      = 0.0;
-    double normB      = 0.0;
-
-    for (int i = 0; i < dim; i++)
-    {
-        dotProduct += a[i] * b[i];
-        normA      += a[i] * a[i];
-        normB      += b[i] * b[i];
-    }
-
-    if (normA == 0.0 || normB == 0.0)
-        return 0.0;
-
-    return dotProduct / (std::sqrt(normA) * std::sqrt(normB));
-}
 
 // ==========================================
 // L2 NORMALIZATION
@@ -183,6 +167,10 @@ std::vector<float> HybridRetriever::L2Normalize(const float *vec, int dim)
     if (norm > 0.0)
         for (int i = 0; i < dim; i++)
             normalized[i] = vec[i] / (float)norm;
+    else
+        // Zero vector — return as-is (no meaningful normalization)
+        for (int i = 0; i < dim; i++)
+            normalized[i] = vec[i];
 
     return normalized;
 }
@@ -210,25 +198,94 @@ std::string HybridRetriever::GenerateBreadcrumb(const std::string &text)
 }
 
 // ==========================================
+// HR-5: Inverted index maintenance
+//
+// Replaces O(n×terms) pre-filter in SparseSearch with O(terms) lookup.
+// Updated on every add/remove.
+// ==========================================
+void HybridRetriever::addToInvertedIndex(size_t docIdx, const BM25Doc &doc)
+{
+    for (const auto &[term, _] : doc.termFreq)
+        invertedIndex_[term].push_back(docIdx);
+}
+
+void HybridRetriever::removeFromInvertedIndex(size_t docIdx, const BM25Doc &doc)
+{
+    for (const auto &[term, _] : doc.termFreq)
+    {
+        auto it = invertedIndex_.find(term);
+        if (it == invertedIndex_.end()) continue;
+
+        auto &vec = it->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), docIdx), vec.end());
+
+        if (vec.empty())
+            invertedIndex_.erase(it);
+    }
+}
+
+void HybridRetriever::rebuildInvertedIndex()
+{
+    invertedIndex_.clear();
+    for (size_t i = 0; i < documents_.size(); i++)
+        addToInvertedIndex(i, documents_[i]);
+}
+
+// ==========================================
 // INTERNAL: shared BM25 indexing
+//
+// HR-1: Replaced O(n) erase-from-middle with O(1) swap-with-last.
+//       The old approach shifted every element and decremented all
+//       docIndex_ entries — O(n²) for repeated updates.
+//
+// HR-2: IDF cache now only clears entries for terms in the modified
+//       document instead of clearing the entire cache. Terms not
+//       affected by the change keep their cached IDF values.
 // ==========================================
 void HybridRetriever::addDocumentInternal(const std::string &id,
                                            const std::string &text)
 {
+    // ── Remove existing document if present ──────────────────────────────
     auto existingIt = docIndex_.find(id);
     if (existingIt != docIndex_.end())
     {
         size_t idx = existingIt->second;
-        totalDocLen_ -= documents_[idx].docLength;
-        documents_.erase(documents_.begin() + idx);
-        docIndex_.erase(existingIt);
-        totalDocs_--;
+        const BM25Doc &oldDoc = documents_[idx];
 
-        for (auto &entry : docIndex_)
-            if (entry.second > idx)
-                entry.second--;
+        totalDocLen_ -= oldDoc.docLength;
+
+        // HR-2: Invalidate only IDF entries for terms in the removed document
+        for (const auto &[term, _] : oldDoc.termFreq)
+            idfCache_.erase(term);
+
+        // HR-5: Remove from inverted index before moving
+        removeFromInvertedIndex(idx, oldDoc);
+
+        // HR-1: O(1) swap-with-last instead of O(n) erase-from-middle
+        size_t lastIdx = documents_.size() - 1;
+        if (idx != lastIdx)
+        {
+            // Move last document into the vacated slot
+            documents_[idx] = std::move(documents_[lastIdx]);
+            // Update the moved document's index entry
+            docIndex_[documents_[idx].id] = idx;
+            // Update inverted index: entries pointing to lastIdx now point to idx
+            for (const auto &[term, _] : documents_[idx].termFreq)
+            {
+                auto iit = invertedIndex_.find(term);
+                if (iit != invertedIndex_.end())
+                {
+                    for (auto &entry : iit->second)
+                        if (entry == lastIdx) { entry = idx; break; }
+                }
+            }
+        }
+        documents_.pop_back();
+        docIndex_.erase(id);
+        totalDocs_--;
     }
 
+    // ── Build new document ───────────────────────────────────────────────
     std::vector<std::string> tokens = Tokenize(text);
 
     std::unordered_map<std::string, int> termFreq;
@@ -243,13 +300,19 @@ void HybridRetriever::addDocumentInternal(const std::string &id,
     doc.docLength  = (int)tokens.size();
     doc.breadcrumb = GenerateBreadcrumb(text);
 
-    documents_.push_back(doc);
-    docIndex_[id] = documents_.size() - 1;
+    size_t newIdx = documents_.size();
+    documents_.push_back(std::move(doc));
+    docIndex_[id] = newIdx;
     totalDocs_++;
-    totalDocLen_ += doc.docLength;
+    totalDocLen_ += documents_[newIdx].docLength;
     avgDocLen_    = (double)totalDocLen_ / totalDocs_;
 
-    idfCache_.clear();
+    // HR-5: Add to inverted index
+    addToInvertedIndex(newIdx, documents_[newIdx]);
+
+    // HR-2: Invalidate IDF only for terms in the new document
+    for (const auto &[term, _] : documents_[newIdx].termFreq)
+        idfCache_.erase(term);
 }
 
 // ==========================================
@@ -324,7 +387,6 @@ Napi::Value HybridRetriever::AddDocumentWithEmbedding(const Napi::CallbackInfo &
             size_t label = hnswIndex_->current_label_;
             hnswIndex_->alg_hnsw_->addPoint(normalized.data(), label);
 
-            // ── FIXED: use meta_map_ instead of deleted id_map_ ──
             VectorMetadata meta;
             meta.id            = id;
             meta.namespaceName = "";
@@ -355,6 +417,13 @@ Napi::Value HybridRetriever::AddDocumentWithEmbedding(const Napi::CallbackInfo &
 
 // ==========================================
 // NODE.JS: HYBRID SEARCH
+//
+// HR-3: Query vector is now L2-normalized before HNSW search.
+//       Stored vectors are normalized at insert time (AddDocumentWithEmbedding).
+//       For IP-space HNSW, both query and stored vectors must be normalized
+//       for the distance to equal 1 - cosine_similarity.
+//
+// HR-8: Dense-only path now returns "combinedScore" to match hybrid path.
 // ==========================================
 Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
 {
@@ -378,11 +447,18 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
 
     std::vector<ScoredResult> results;
 
-    // ── Dense: HNSW ──
+    // ── Dense: HNSW ──────────────────────────────────────────────────────
     if (hnswIndex_ && hnswIndex_->alg_hnsw_ && hnswIndex_->current_label_ > 0)
     {
-        float *queryData   = queryVec.Data();
-        auto   hnswResults = hnswIndex_->alg_hnsw_->searchKnn(queryData, k * 3);
+        // HR-3: Normalize query vector to match normalized stored vectors.
+        // HNSW IP-space: distance = 1 - inner_product(normalized_a, normalized_b)
+        //                         = 1 - cosine_similarity
+        // So similarity = 1 - distance is correct ONLY when both are normalized.
+        auto normalizedQuery = L2Normalize(queryVec.Data(), dim_);
+
+        auto hnswResults = hnswIndex_->alg_hnsw_->searchKnn(
+            normalizedQuery.data(), k * 3
+        );
 
         while (!hnswResults.empty())
         {
@@ -392,12 +468,11 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
             float similarity = 1.0f - top.first;
             if (similarity >= threshold)
             {
-                // ── FIXED: use meta_map_ instead of deleted id_map_ ──
                 auto idIt = hnswIndex_->meta_map_.find(top.second);
                 if (idIt != hnswIndex_->meta_map_.end())
                 {
                     ScoredResult r;
-                    r.id            = idIt->second.id;  // .id from VectorMetadata
+                    r.id            = idIt->second.id;
                     r.denseScore    = similarity;
                     r.sparseScore   = 0.0;
                     r.combinedScore = 0.0;
@@ -407,7 +482,7 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
         }
     }
 
-    // ── Sparse: BM25 ──
+    // ── Sparse: BM25 ─────────────────────────────────────────────────────
     if (!(info.Length() >= 4 && info[3].IsString()))
     {
         // No query text — return dense-only results
@@ -422,8 +497,11 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
         for (size_t i = 0; i < results.size(); i++)
         {
             Napi::Object obj = Napi::Object::New(env);
-            obj.Set("id",    Napi::String::New(env, results[i].id));
-            obj.Set("score", Napi::Number::New(env, results[i].denseScore));
+            obj.Set("id",            Napi::String::New(env, results[i].id));
+            // HR-8: Use combinedScore field name for consistency with hybrid path
+            obj.Set("combinedScore", Napi::Number::New(env, results[i].denseScore));
+            obj.Set("denseScore",    Napi::Number::New(env, results[i].denseScore));
+            obj.Set("sparseScore",   Napi::Number::New(env, 0.0));
             jsResults.Set(i, obj);
         }
         return jsResults;
@@ -440,22 +518,32 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
             r.sparseScore = BM25Score(documents_[docIt->second], queryTokens);
     }
 
-    // Add BM25-only hits not found by HNSW
+    // ── Add BM25-only hits not found by HNSW ─────────────────────────────
+    // HR-5: Use inverted index for O(terms) candidate lookup
     std::unordered_set<std::string> foundIds;
     foundIds.reserve(results.size());
     for (const auto &r : results)
         foundIds.insert(r.id);
 
-    for (size_t i = 0; i < documents_.size(); i++)
+    std::unordered_set<size_t> candidateIndices;
+    for (const auto &term : queryTokens)
     {
-        if (foundIds.count(documents_[i].id))
-            continue;
+        auto iit = invertedIndex_.find(term);
+        if (iit != invertedIndex_.end())
+            for (size_t idx : iit->second)
+                candidateIndices.insert(idx);
+    }
 
-        double bm25 = BM25Score(documents_[i], queryTokens);
+    for (size_t idx : candidateIndices)
+    {
+        const std::string &docId = documents_[idx].id;
+        if (foundIds.count(docId)) continue;
+
+        double bm25 = BM25Score(documents_[idx], queryTokens);
         if (bm25 > 0.0)
         {
             ScoredResult r;
-            r.id            = documents_[i].id;
+            r.id            = docId;
             r.denseScore    = 0.0;
             r.sparseScore   = bm25;
             r.combinedScore = 0.0;
@@ -463,7 +551,7 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
         }
     }
 
-    // Normalize + combine
+    // ── Normalize + combine ───────────────────────────────────────────────
     double maxDense = 0.0, maxSparse = 0.0;
     for (const auto &r : results)
     {
@@ -512,6 +600,9 @@ Napi::Value HybridRetriever::HybridSearch(const Napi::CallbackInfo &info)
 
 // ==========================================
 // NODE.JS: SPARSE SEARCH (BM25-only)
+//
+// HR-5: Pre-filter now uses invertedIndex_ — O(terms) lookup
+//       instead of O(n×terms) full document scan.
 // ==========================================
 Napi::Value HybridRetriever::SparseSearch(const Napi::CallbackInfo &info)
 {
@@ -538,13 +629,15 @@ Napi::Value HybridRetriever::SparseSearch(const Napi::CallbackInfo &info)
     if (queryTokens.empty())
         return Napi::Array::New(env, 0);
 
-    // Pre-filter: only docs sharing ≥1 token
+    // HR-5: Use inverted index — O(terms) instead of O(n×terms)
     std::unordered_set<size_t> candidateIndices;
-    candidateIndices.reserve(documents_.size() / 4);
     for (const auto &term : queryTokens)
-        for (size_t i = 0; i < documents_.size(); i++)
-            if (documents_[i].termFreq.count(term))
-                candidateIndices.insert(i);
+    {
+        auto iit = invertedIndex_.find(term);
+        if (iit != invertedIndex_.end())
+            for (size_t idx : iit->second)
+                candidateIndices.insert(idx);
+    }
 
     if (candidateIndices.empty())
         return Napi::Array::New(env, 0);
@@ -604,6 +697,10 @@ Napi::Value HybridRetriever::SparseSearch(const Napi::CallbackInfo &info)
 
 // ==========================================
 // NODE.JS: REMOVE DOCUMENT
+//
+// HR-1: Replaced O(n) erase-from-middle with O(1) swap-with-last.
+// HR-2: Selective IDF cache invalidation.
+// HR-5: Inverted index maintenance.
 // ==========================================
 Napi::Value HybridRetriever::RemoveDocument(const Napi::CallbackInfo &info)
 {
@@ -622,16 +719,37 @@ Napi::Value HybridRetriever::RemoveDocument(const Napi::CallbackInfo &info)
     if (it != docIndex_.end())
     {
         size_t idx = it->second;
-        totalDocLen_ -= documents_[idx].docLength;
-        documents_.erase(documents_.begin() + idx);
-        docIndex_.erase(it);
+        const BM25Doc &doc = documents_[idx];
+
+        totalDocLen_ -= doc.docLength;
+
+        // HR-2: Selective cache invalidation
+        for (const auto &[term, _] : doc.termFreq)
+            idfCache_.erase(term);
+
+        // HR-5: Remove from inverted index
+        removeFromInvertedIndex(idx, doc);
+
+        // HR-1: O(1) swap-with-last
+        size_t lastIdx = documents_.size() - 1;
+        if (idx != lastIdx)
+        {
+            // Update inverted index for the moved document
+            for (const auto &[term, _] : documents_[lastIdx].termFreq)
+            {
+                auto iit = invertedIndex_.find(term);
+                if (iit != invertedIndex_.end())
+                    for (auto &entry : iit->second)
+                        if (entry == lastIdx) { entry = idx; break; }
+            }
+
+            documents_[idx] = std::move(documents_[lastIdx]);
+            docIndex_[documents_[idx].id] = idx;
+        }
+        documents_.pop_back();
+        docIndex_.erase(id);
         totalDocs_--;
 
-        for (auto &entry : docIndex_)
-            if (entry.second > idx)
-                entry.second--;
-
-        idfCache_.clear();
         avgDocLen_ = totalDocs_ > 0
                      ? (double)totalDocLen_ / totalDocs_
                      : 0.0;
@@ -654,5 +772,6 @@ Napi::Value HybridRetriever::GetStats(const Napi::CallbackInfo &info)
     stats.Set("averageDocLength",   Napi::Number::New(env, avgDocLen_));
     stats.Set("denseWeight",        Napi::Number::New(env, denseWeight_));
     stats.Set("embeddingDimension", Napi::Number::New(env, dim_));
+    stats.Set("invertedIndexTerms", Napi::Number::New(env, invertedIndex_.size()));
     return stats;
 }

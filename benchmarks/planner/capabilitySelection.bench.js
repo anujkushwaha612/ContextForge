@@ -60,9 +60,9 @@ async function setupPlanner() {
   // Real ONNX embedder — same as production
   const modelPath = path.join(
     __dirname,
-    "../../models/all-MiniLM-L6-v2-int8.onnx"
+    "../../contextforge_models/all-MiniLM-L6-v2-int8.onnx"
   );
-  const tokenizerPath = path.join(__dirname, "../../models/tokenizer.json");
+  const tokenizerPath = path.join(__dirname, "../../contextforge_models/tokenizer.json");
 
   onnxEmbedder = new native.OnnxEmbedder(modelPath, tokenizerPath, {
     dim: 384,

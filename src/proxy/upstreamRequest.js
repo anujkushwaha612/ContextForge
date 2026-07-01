@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { statsEmitter } from "./statsEmitter.js";
 
 import { countTokens } from "../compression/compressionHelper.js";
+import { interceptAndVaultMassiveToolResults } from "../compression/fatCatch.js";
 import { retrieveFromVault } from "../vaultRetriever.js";
 import { recordCCRSuccess } from "../ccr/index.js";
 import {
@@ -32,15 +33,39 @@ import {
   isReadFileChunkTool,
   executeReadFileChunk,
 } from "../graph/graphTools.js";
+import { getWorkspaceRoot } from "../graph/graphDb.js";
 import { isPatchToolCall, executePatchToolCall, PATCH_TOOL_NAME } from "../graph/patchTools.js";
 import { hasMemoryToolCalls, executeMemoryToolCalls } from "../memory/memoryTools.js";
 import { normalizeConceptKey } from "../graph/semanticResolver.js";
+import { invalidateRegistryEntry } from "../compression/semanticDedup.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+function normalizePathForCache(filePath) {
+  if (!filePath || typeof filePath !== "string") return filePath ?? "";
+
+  // Normalize separators
+  const p = filePath.replace(/\\/g, "/");
+
+  // Already absolute — normalize and lowercase
+  if (path.isAbsolute(filePath) || /^[A-Za-z]:\//.test(p)) {
+    return p.toLowerCase();
+  }
+
+  // Relative — resolve against workspace root for canonical form
+  try {
+    const workspaceRoot = getWorkspaceRoot();
+    return path.resolve(workspaceRoot, filePath).replace(/\\/g, "/").toLowerCase();
+  } catch {
+    // getWorkspaceRoot not ready yet — use normalized relative path
+    return p.toLowerCase();
+  }
+}
+
 const MAX_GHOST_RETRIES = 10;
 const MAX_GRAPH_ONLY_ROUNDS = 3;
+const MAX_HOP_COUNT = 15;
 
 // ── Chunk cache ──────────────────────────────────────────────────────────────
 // Caches file lines read during the session so overlapping reads
@@ -51,7 +76,7 @@ const CHUNK_CACHE = new Map();
 const CHUNK_CACHE_MAX = 100;
 
 function chunkCacheKey(filePath, startLine, endLine) {
-  return `${filePath}:${startLine}:${endLine}`;
+  return `${normalizePathForCache(filePath)}:${startLine}:${endLine}`;
 }
 
 function chunkCacheGet(filePath, startLine, endLine) {
@@ -114,9 +139,9 @@ function buildWorkspaceSummary() {
 }
 
 function chunkCacheInvalidateFile(filePath) {
-  // Remove all cached chunks for a file when it gets patched
+  const normalized = normalizePathForCache(filePath);
   for (const key of CHUNK_CACHE.keys()) {
-    if (key.startsWith(`${filePath}:`)) {
+    if (key.startsWith(`${normalized}:`)) {
       CHUNK_CACHE.delete(key);
     }
   }
@@ -132,6 +157,28 @@ const SESSION_CACHE_MAX = 200;
 function _sessionCacheKey(name, argsStr) {
   try {
     const parsed = JSON.parse(argsStr || "{}");
+
+    // ── Normalize contextforge_retrieve args ──────────────────────────
+    if (name === "contextforge_retrieve" || name?.includes("contextforge_retrieve")) {
+      const canonical = { vault_id: parsed.vault_id ?? "" };
+      const sq = (parsed.search_query ?? "").trim();
+      if (sq) canonical.search_query = sq;
+      return `${name}:${JSON.stringify(canonical)}`;
+    }
+
+    // ── Normalize read_file_chunk file_path ───────────────────────────
+    // The LLM passes absolute paths on some calls and relative paths on
+    // others for the same file. Normalize to canonical form so both
+    // produce the same cache key.
+    if (isReadFileChunkTool(name) && parsed.file_path) {
+      const canonical = {
+        file_path: normalizePathForCache(parsed.file_path),
+        start_line: parsed.start_line,
+        end_line: parsed.end_line,
+      };
+      return `${name}:${JSON.stringify(canonical)}`;
+    }
+
     const sorted = JSON.stringify(Object.fromEntries(Object.entries(parsed).sort()));
     return `${name}:${sorted}`;
   } catch {
@@ -151,102 +198,55 @@ function sessionCacheSet(name, argsStr, result) {
   SESSION_TOOL_CACHE.set(key, result);
 }
 
-/**
- * Surgical cache invalidation after a patch.
- *
- * Invalidation rules:
- *   1. If target_symbol is known → only clear find_symbol entries for
- *      that exact symbol. All other symbols stay cached.
- *   2. Always clear find_route entries for the patched file — routes
- *      may have shifted line numbers after a patch.
- *   3. Always clear chunk cache entries for the patched file — content
- *      has changed so any cached line ranges are stale.
- *   4. Never clear symbols from OTHER files — they are unaffected.
- *
- *
- * @param {string} filePath     - The file that was patched
- * @param {string|null} symbol  - The specific symbol that was modified, or null for global patches
- */
 export function invalidateCacheForPatch(filePath, symbol) {
-  const fileBasename = filePath.replace(/\\/g, "/").split("/").pop().toLowerCase();
+  // Normalize the file path to match how it was stored in the cache key
+  const normalizedPath = normalizePathForCache(filePath);
+  const fileBasename = normalizedPath.split("/").pop().replace(".js", "").toLowerCase();
 
   let cleared = 0;
 
   for (const key of SESSION_TOOL_CACHE.keys()) {
     const keyLower = key.toLowerCase();
 
-    // Always clear find_route for this file — line numbers may have shifted
-    if (keyLower.includes('"find_route"') && keyLower.includes(fileBasename.replace(".js", ""))) {
+    if (keyLower.includes('"find_route"') && keyLower.includes(fileBasename)) {
       SESSION_TOOL_CACHE.delete(key);
       cleared++;
       continue;
     }
 
-    // If we know the specific symbol, only clear that symbol's cache entry
     if (symbol) {
       const symbolLower = symbol.toLowerCase();
       if (keyLower.includes('"find_symbol"') && keyLower.includes(`"${symbolLower}"`)) {
         SESSION_TOOL_CACHE.delete(key);
         cleared++;
       }
-      // Leave all other find_symbol entries intact — they are still valid
       continue;
     }
 
-    // No symbol known (global patch) — clear all entries referencing this file
-    if (keyLower.includes(fileBasename.replace(".js", ""))) {
+    if (keyLower.includes(fileBasename)) {
       SESSION_TOOL_CACHE.delete(key);
       cleared++;
     }
   }
 
-  // Always clear chunk cache for the patched file — content has changed
-  chunkCacheInvalidateFile(filePath);
-
-  if (cleared > 0) {
-//     console.log(
-//       `[Ghost Interceptor] 🗑️  Invalidated ${cleared} cache entries` +
-//         (symbol ? ` for symbol '${symbol}'` : ` for file '${fileBasename}'`)
-//     );
-  }
+  chunkCacheInvalidateFile(filePath); // already normalized inside
 }
 
-/**
- * Surgical cache invalidation for external file modifications.
- *
- * Called by the file watcher when a file is saved externally
- * (not via patch). Clears all cache entries for THIS file only.
- *
- * Differs from invalidateCacheForPatch:
- *   - invalidateCacheForPatch: knows the specific symbol → ultra-surgical
- *   - invalidateCacheForFile: file changed externally → clear all symbols in this file
- *
- * @param {string} filePath - The file that was modified
- */
 export function invalidateCacheForFile(filePath) {
-  const fileBasename = filePath.replace(/\\/g, "/").split("/").pop().toLowerCase();
+  const normalizedPath = normalizePathForCache(filePath);
+  const fileBasename = normalizedPath.split("/").pop().replace(".js", "").toLowerCase();
 
   let cleared = 0;
 
   for (const key of SESSION_TOOL_CACHE.keys()) {
     const keyLower = key.toLowerCase();
-
-    // Clear all graph queries for this file
-    // (find_symbol, find_route, show_callers, etc.)
-    if (keyLower.includes(fileBasename.replace(".js", ""))) {
+    if (keyLower.includes(fileBasename)) {
       SESSION_TOOL_CACHE.delete(key);
       cleared++;
     }
   }
 
-  // Clear all chunk cache entries for this file
-  chunkCacheInvalidateFile(filePath);
-
-  if (cleared > 0) {
-//     console.log(
-//       `[Ghost Interceptor] 🗑️  Invalidated ${cleared} cache entries for file '${fileBasename}'`
-//     );
-  }
+  chunkCacheInvalidateFile(filePath); // already normalized inside
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -261,8 +261,53 @@ class ToolInterceptor {
     this.req = ctx.req;
     this._graphOnlyRounds = 0;
     this._retrievedVaultIds = new Set();
-    this._resolvedConcepts = new Map(); // normalizedKey → content string
+    this._resolvedConcepts = new Map();
     this._consecutivePatchFailures = 0;
+
+    // ── Stall detector ──────────────────────────────────────────────────
+    // Tracks how many times each tool+args combination has been called
+    // within this request chain. Key: "toolName:argsJson" → call count.
+    // If the same call appears MAX_IDENTICAL_CALLS times consecutively,
+    // the LLM is stuck in a loop — we interrupt with a hint.
+    this._callFrequency = new Map();
+    this._MAX_IDENTICAL_CALLS = 3;
+  }
+
+  /**
+   * Records a tool call and checks if it has been called too many times
+   * with identical arguments. Returns true if the call is a stall loop.
+   *
+   * Uses the same normalized key as sessionCacheGet so cache hits and
+   * stall detection are always in sync — if the session cache is working,
+   * a repeated call would have been served from cache and never reach here.
+   * A stall reaching this check means the cache missed (different args
+   * or cache was invalidated), and the LLM is genuinely re-requesting
+   * the same thing.
+   *
+   * @param {string} name    - Tool name
+   * @param {string} argsStr - Raw arguments JSON string
+   * @returns {{ isStall: boolean, count: number, hintMessage: string|null }}
+   */
+  _checkAndRecordCall(name, argsStr) {
+    const key = _sessionCacheKey(name, argsStr);
+    const count = (this._callFrequency.get(key) ?? 0) + 1;
+    this._callFrequency.set(key, count);
+
+    if (count >= this._MAX_IDENTICAL_CALLS) {
+      const hintMessage = JSON.stringify({
+        error: "STALL_DETECTED",
+        tool: name,
+        call_count: count,
+        hint:
+          `You have called ${name} with these exact arguments ${count} times. ` +
+          `The result will not change. ` +
+          `Stop calling this tool and proceed with what you already know, ` +
+          `or try a different approach (different query, different file, or different tool).`,
+      });
+      return { isStall: true, count, hintMessage };
+    }
+
+    return { isStall: false, count, hintMessage: null };
   }
 
   isBackgroundTool(name) {
@@ -281,30 +326,87 @@ class ToolInterceptor {
     return isGraph || isPatch || isRetrieve || isMemory || isReadChunk;
   }
 
-  async process(toolCalls, currentPayload, retryCount) {
+  async process(toolCalls, currentPayload, retryCount, hopCount = 0) {
+    // ── Dual circuit breaker ──────────────────────────────────────────────
+    // retryCount: failure budget — increments only on patch/vault failures
+    //             and stall detections. Catches broken operation loops.
+    // hopCount:   exploration budget — increments on every LLM round-trip.
+    //             Catches pure graph/read exploration loops that never fail
+    //             but also never make forward progress toward completion.
     if (retryCount >= MAX_GHOST_RETRIES) {
+      console.warn(
+        `[Ghost Interceptor] ⛔ Failure circuit breaker tripped ` +
+          `(${retryCount} failures >= ${MAX_GHOST_RETRIES} max)`
+      );
+      return { intercepted: true, circuitBreakerTripped: true, toolCalls };
+    }
+
+    if (hopCount >= MAX_HOP_COUNT) {
+      console.warn(
+        `[Ghost Interceptor] ⛔ Hop circuit breaker tripped ` +
+          `(${hopCount} hops >= ${MAX_HOP_COUNT} max)`
+      );
       return { intercepted: true, circuitBreakerTripped: true, toolCalls };
     }
 
     const backgroundCalls = toolCalls.filter((tc) => this.isBackgroundTool(tc.function?.name));
     if (backgroundCalls.length === 0) return { intercepted: false };
 
-    // ── Graph-only loop guard ─────────────────────────────────────────────
-    const allAreGraphQueries = backgroundCalls.every((tc) => {
+    // ── Exploration loop guard ────────────────────────────────────────────
+    // Tracks consecutive rounds where ALL calls are read-only exploration
+    // (graph queries + read_file_chunk). Resets when any write operation
+    // (patch, vault retrieve, memory) appears in the batch.
+    //
+    // FIX 1: Was "graph-only" — now covers read_file_chunk too since mixed
+    //         graph+read loops were bypassing the old allAreGraphQueries check.
+    //
+    // FIX 2: Was returning { intercepted: false } which let tool calls pass
+    //         through to the LLM WITHOUT executing them and WITHOUT tool result
+    //         messages. This caused API errors (tool call with no result) or
+    //         LLM hallucination. Now injects a navigation-timeout hint instead.
+    const allAreReadOnly = backgroundCalls.every((tc) => {
       const n = tc.function?.name || "";
-      return isGraphToolCall(n) && !normalizeGraphToolName(n).includes("contextforge_retrieve");
+      return (
+        (isGraphToolCall(n) && !normalizeGraphToolName(n).includes("contextforge_retrieve")) ||
+        isReadFileChunkTool(n)
+      );
     });
 
-    if (allAreGraphQueries) {
+    if (allAreReadOnly) {
       this._graphOnlyRounds++;
       if (this._graphOnlyRounds > MAX_GRAPH_ONLY_ROUNDS) {
-//         console.warn(
-//           `\n[Ghost Interceptor] ⚠️  Graph-only round ${this._graphOnlyRounds} — ` +
-//             `LLM stuck in navigation loop. Letting through to force decision.`
-//         );
-        return { intercepted: false };
+        console.warn(
+          `[Ghost Interceptor] ⚠️ Exploration loop detected ` +
+            `(${this._graphOnlyRounds} read-only rounds > ${MAX_GRAPH_ONLY_ROUNDS} max) ` +
+            `— injecting navigation-timeout hint`
+        );
+        // Inject a hint message for EACH stalled tool call so the LLM
+        // receives a valid tool result for every tool call it made.
+        // Returning { intercepted: false } here would leave tool calls
+        // without results, causing downstream API errors.
+        const timeoutResults = backgroundCalls.map((tc) => ({
+          tool_call_id: tc.id,
+          name: tc.function.name,
+          content: JSON.stringify({
+            error: "NAVIGATION_TIMEOUT",
+            hint:
+              `You have spent ${this._graphOnlyRounds} consecutive rounds on read-only exploration ` +
+              `(graph queries and file reads) without taking any action. ` +
+              `You have enough context to proceed. ` +
+              `Stop exploring and either: (1) apply a patch with contextforge_patch_ast, ` +
+              `(2) create the file directly, or (3) report what you found.`,
+          }),
+        }));
+        return {
+          intercepted: true,
+          results: timeoutResults,
+          toolCalls: backgroundCalls,
+          madeForwardProgress: false,
+          hadFailure: true, // increment retryCount so circuit breaker can catch runaway
+        };
       }
     } else {
+      // A write operation appeared — reset the read-only round counter
       this._graphOnlyRounds = 0;
     }
 
@@ -324,8 +426,27 @@ class ToolInterceptor {
       // ── Session cache ──
       const cachedResult = sessionCacheGet(name, argsStr);
       if (cachedResult !== null) {
-//         console.log(`[Ghost Interceptor] ♻️ Session cache hit: ${name}("${argsStr.slice(0, 60)}")`);
         results.push({ tool_call_id: tc.id, name, content: cachedResult });
+        continue;
+      }
+
+      // ── Stall detection ──────────────────────────────────────────────────────
+      // Only reaches here if the session cache missed — meaning the LLM is
+      // requesting a tool call we have NOT seen before (or cache was invalidated).
+      // If we have seen this EXACT call MAX_IDENTICAL_CALLS times already without
+      // a cache hit, the LLM is in a genuine stall loop.
+      const stallCheck = this._checkAndRecordCall(name, argsStr);
+      if (stallCheck.isStall) {
+        console.warn(
+          `[Ghost Interceptor] 🔁 Stall detected: ${name} called ${stallCheck.count}x ` +
+            `with identical args — injecting loop-break hint`
+        );
+        results.push({
+          tool_call_id: tc.id,
+          name,
+          content: stallCheck.hintMessage,
+        });
+        hadFailure = true; // treat stall as failure so retryCount increments
         continue;
       }
 
@@ -333,9 +454,9 @@ class ToolInterceptor {
       try {
         args = JSON.parse(argsStr);
       } catch (err) {
-//         console.error(
-//           `[Ghost Interceptor] ⚠️ Args JSON malformed for ${name}: "${argsStr.slice(0, 120)}"`
-//         );
+        console.error(
+          `[Ghost Interceptor] ⚠️ Args JSON malformed for ${name}: "${argsStr.slice(0, 120)}"`
+        );
         results.push({
           tool_call_id: tc.id,
           name,
@@ -360,10 +481,10 @@ class ToolInterceptor {
             const resolvedResult = this._resolvedConcepts.get(conceptKey);
 
             if (resolvedResult !== undefined) {
-//               console.log(
-//                 `[Ghost Interceptor] 🔁 Concept cache hit: find("${args.target}") ` +
-//                   `→ key "${conceptKey}" (${resolvedResult.length} chars)`
-//               );
+              //               console.log(
+              //                 `[Ghost Interceptor] 🔁 Concept cache hit: find("${args.target}") ` +
+              //                   `→ key "${conceptKey}" (${resolvedResult.length} chars)`
+              //               );
               // Set content and fall through — metrics, session cache, results.push all run normally
               content = resolvedResult;
               toolSucceeded = true;
@@ -394,9 +515,9 @@ class ToolInterceptor {
                   const conceptKey = normalizeConceptKey(args.target);
                   this._resolvedConcepts.set(conceptKey, content);
                   if (process.env.CF_DEBUG_GRAPH === "1") {
-//                     console.log(
-//                       `[Ghost Interceptor] 📌 Concept resolved: "${args.target}" → key "${conceptKey}"`
-//                     );
+                    console.log(
+                      `[Ghost Interceptor] 📌 Concept resolved: "${args.target}" → key "${conceptKey}"`
+                    );
                   }
                 }
               } catch {
@@ -414,10 +535,10 @@ class ToolInterceptor {
         const cachedChunk = chunkCacheGet(args.file_path, args.start_line, args.end_line);
         if (cachedChunk !== null) {
           content = cachedChunk;
-//           console.log(
-//             `[Ghost Interceptor] ♻️ Chunk cache hit: ${args.file_path}` +
-//               ` L${args.start_line}-${args.end_line} → ${content.length} chars`
-//           );
+          //           console.log(
+          //             `[Ghost Interceptor] ♻️ Chunk cache hit: ${args.file_path}` +
+          //               ` L${args.start_line}-${args.end_line} → ${content.length} chars`
+          //           );
         } else {
           content = executeReadFileChunk(args.file_path, args.start_line, args.end_line);
           chunkCacheSet(args.file_path, args.start_line, args.end_line, content);
@@ -431,23 +552,31 @@ class ToolInterceptor {
       } else if (isPatchToolCall(name)) {
         isActionTool = true;
         content = await executePatchToolCall(argsStr, this.semanticCache);
-//         console.log(`[Ghost Interceptor] 🩹 Patch tool executed`);
+        console.log(`[Ghost Interceptor] 🩹 Patch tool executed`);
         statsEmitter.recordAgentAction("astPatches");
 
         try {
           const parsed = JSON.parse(content);
           toolSucceeded = parsed.success === true;
           if (toolSucceeded) {
-//             console.log(`[Ghost Interceptor] ✅ Patch succeeded`);
+            console.log(`[Ghost Interceptor] ✅ Patch succeeded`);
             invalidateCacheForPatch(args.file_path, args.target_symbol || null);
             recordPatch(
               args.file_path,
               args.target_symbol || null,
               parsed.lines_changed ?? parsed.lines_inserted ?? 0
             );
-            this._consecutivePatchFailures = 0; // ← reset on success
+            this._consecutivePatchFailures = 0;
+
+            // ── Invalidate semantic dedup registry for this file ──────────────
+            // After a patch, the file content has changed. If the dedup registry
+            // still holds the pre-patch entry, the next turn will see the new
+            // content as a near-duplicate of the old version and emit a vault stub
+            // referencing stale content. Invalidating here forces the post-patch
+            // content to be registered fresh on the next turn.
+            invalidateRegistryEntry(args.file_path);
           } else {
-//             console.log(`[Ghost Interceptor] ❌ Patch failed: ${parsed.error?.slice(0, 100)}`);
+            console.log(`[Ghost Interceptor] ❌ Patch failed: ${parsed.error?.slice(0, 100)}`);
 
             // ← NEW: clear chunk cache so next read hits disk not stale cache
             chunkCacheInvalidateFile(args.file_path);
@@ -458,9 +587,9 @@ class ToolInterceptor {
             // ← NEW: consecutive failure guard
             this._consecutivePatchFailures = (this._consecutivePatchFailures ?? 0) + 1;
             if (this._consecutivePatchFailures >= 3) {
-//               console.warn(
-//                 `[Ghost Interceptor] ⚠️ ${this._consecutivePatchFailures} consecutive patch failures — forcing read hint`
-//               );
+              console.warn(
+                `[Ghost Interceptor] ⚠️ ${this._consecutivePatchFailures} consecutive patch failures — forcing read hint`
+              );
               content = JSON.stringify({
                 success: false,
                 error: parsed.error,
@@ -475,8 +604,9 @@ class ToolInterceptor {
       } else if (normalized.includes("contextforge_retrieve")) {
         isActionTool = true;
         let vaultedText = null;
-        const sq = (args.search_query || "").trim();
+        const sq = (args.search_query ?? "").trim();
 
+        // ── Graph shortcut for simple symbol queries ──────────────────────
         if (sq && /^[\w$]+$/.test(sq)) {
           try {
             const graphHits = await executeGraphQuery("find_symbol", sq);
@@ -486,7 +616,7 @@ class ToolInterceptor {
               vaultedText =
                 `[Graph result for '${sq}' from ${hit.file} lines ${hit.start_line}–${hit.end_line}]\n\n` +
                 hit.body;
-//               console.log(`[Ghost Interceptor] 🗺️ Graph shortcut hit for '${sq}'`);
+              console.log(`[Ghost Interceptor] 🗺️ Graph shortcut hit for '${sq}'`);
             }
           } catch {}
         }
@@ -495,17 +625,23 @@ class ToolInterceptor {
           try {
             vaultedText = await retrieveFromVault(
               args.vault_id,
-              args.search_query || null,
+              sq || null,
               currentPayload.messages,
               this.semanticCache,
               this.hybridRetriever
             );
           } catch (err) {
-//             console.error(`[Ghost Interceptor] ⚠️ Vault retrieval failed: ${err.message}`);
+            console.error(`[Ghost Interceptor] ⚠️ Vault retrieval failed: ${err.message}`);
           }
         }
 
         if (vaultedText) {
+          // ── Compress on first retrieval of this vault ─────────────────
+          // _retrievedVaultIds tracks vaults seen this request chain.
+          // First access: compress and cache the compressed form.
+          // Subsequent accesses: session cache hit returns compressed form
+          //   directly — this block is never reached again for the same
+          //   vault+query combination after Change 1 normalizes the key.
           if (!this._retrievedVaultIds.has(args.vault_id)) {
             this._retrievedVaultIds.add(args.vault_id);
             const { compressCodeOutput } = await import("../compression/astCompressor.js");
@@ -520,20 +656,29 @@ class ToolInterceptor {
                 `To get the FULL raw source for patching, call contextforge_retrieve ` +
                 `with vault_id="${args.vault_id}" again.\n\n` +
                 compressed.kept;
-//               console.log(
-//                 `[Ghost Interceptor] 📦 Vault ${args.vault_id} compressed on first access: ` +
-//                   `${vaultedText.length} chars (${reduction}% reduction)`
-//               );
+              console.log(
+                `[Ghost Interceptor] 📦 Vault ${args.vault_id} compressed on first access: ` +
+                  `${vaultedText.length} chars (${reduction}% reduction)`
+              );
             }
           }
 
           recordCCRSuccess(currentPayload, args.vault_id);
           statsEmitter.recordAgentAction("rawVaultOpens");
-//           console.log(
-//             `[Ghost Interceptor] ✅ Vault ${args.vault_id} opened (${vaultedText.length} chars)`
-//           );
+          console.log(
+            `[Ghost Interceptor] ✅ Vault ${args.vault_id} opened (${vaultedText.length} chars)`
+          );
           content = vaultedText;
           toolSucceeded = true;
+
+          // ── Cache the compressed form immediately ─────────────────────
+          // Write to session cache here rather than at the bottom of the
+          // loop so the cached value is always the compressed preview.
+          // The bottom-of-loop cache write is skipped for action tools
+          // unless isPatchToolCall is false — which creates the inconsistency
+          // where raw content gets cached on second retrieval.
+          // Writing here guarantees the compressed form is always cached.
+          sessionCacheSet(name, argsStr, content);
         } else {
           content = `Vault ${args.vault_id} empty or not found.`;
           toolSucceeded = false;
@@ -549,15 +694,23 @@ class ToolInterceptor {
         if (toolResults.length > 0) {
           content = toolResults[0].content;
           toolSucceeded = true;
-//           console.log("[Ghost Interceptor] 🧠 Memory tool executed successfully");
+          console.log("[Ghost Interceptor] 🧠 Memory tool executed successfully");
+          // Cache memory results — same user+query produces same result
+          // within a request chain. Prevents redundant memory searches
+          // if the LLM calls the same memory tool twice.
+          sessionCacheSet(name, argsStr, content);
         } else {
           content = "Memory tool returned no results.";
           toolSucceeded = false;
         }
       }
 
-      // Cache graph query results (not patches — those are write operations)
-      if (!isActionTool || isPatchToolCall(name) === false) {
+      // Cache read-only tool results (graph queries, read_file_chunk).
+      // Action tools manage their own cache writes inside their blocks:
+      //   - patch:    writes nothing (mutates disk, results not reusable)
+      //   - retrieve: writes compressed form immediately after compression
+      //   - memory:   writes on success inside the memory block above
+      if (!isActionTool) {
         sessionCacheSet(name, argsStr, content);
       }
 
@@ -582,13 +735,23 @@ class ToolInterceptor {
 // Retry counter logic
 // ─────────────────────────────────────────────────────────────────────────────
 
-function computeNextRetry(result, retryCount, maxRetries = MAX_GHOST_RETRIES) {
-  if (result.madeForwardProgress) {
-    return retryCount;
-  }
-  if (result.hadFailure) {
-    return retryCount + 1;
-  }
+/**
+ * Compute the next retryCount value after an intercepted tool round.
+ *
+ * Rules:
+ *   - Forward progress (patch success, vault success) → retryCount unchanged
+ *   - Failure (patch fail, vault miss, stall detection) → retryCount + 1
+ *   - Pure exploration (graph queries, reads) → retryCount unchanged
+ *     These are governed by MAX_HOP_COUNT in acc, not retryCount.
+ *
+ * @param {object} result      - Return value from interceptor.process()
+ * @param {number} retryCount  - Current failure budget counter
+ * @returns {number}
+ */
+function computeNextRetry(result, retryCount) {
+  if (result.madeForwardProgress) return retryCount;
+  if (result.hadFailure) return retryCount + 1;
+  // Pure exploration (graph/read) — retryCount unchanged, hop budget handles it
   return retryCount;
 }
 
@@ -663,26 +826,86 @@ export function createUpstreamHandler(ctx) {
         currentPayload = { ...currentPayload, model: modelOverride };
       }
 
-      // ── Inject WorkspaceState summary ─────────────────────────────────
-      // Tells the LLM what has already been patched this session so it
-      // doesn't re-search for symbols it already modified.
-      const workspaceSummary = process.env.CF_MODE === "passthrough" ? null : buildWorkspaceSummary();
+      // ── Inject WorkspaceState summary ─────────────────────────────────────────
+      // Only inject if:
+      //   1. Not in passthrough mode
+      //   2. There are actually modified files to report
+      //   3. The current hop has a user message to inject into
+      //   4. The workspace summary hasn't already been injected into THIS
+      //      specific message (guard against re-injection on recursive hops)
+      //
+      // FIX 1: Array content is now handled correctly — workspace state is
+      //         prepended as a new text block instead of converting the array
+      //         to a JSON string.
+      //
+      // FIX 2: Only inject on hops where a patch has actually occurred
+      //         (workspaceState.modifiedFiles.size > 0). Graph-only hops
+      //         that haven't patched anything don't need workspace state.
+      //
+      // FIX 3: The summary is built once and checked against a stable sentinel
+      //         marker rather than scanning the full content string.
+      const workspaceSummary =
+        process.env.CF_MODE === "passthrough" ? null : buildWorkspaceSummary();
+
       if (workspaceSummary && currentPayload.messages?.length > 0) {
         const msgs = currentPayload.messages;
-        const lastUserIdx = msgs.reduce((acc, m, i) => (m.role === "user" ? i : acc), -1);
+
+        // Find the last human-authored user message.
+        // Skip tool result messages (role:"tool" in OpenAI format,
+        // or role:"user" with all tool_result blocks in Anthropic format).
+        const lastUserIdx = msgs.reduce((acc, m, i) => {
+          if (m.role !== "user") return acc;
+          // Skip Anthropic-format tool result messages
+          if (
+            Array.isArray(m.content) &&
+            m.content.length > 0 &&
+            m.content.every((b) => b.type === "tool_result")
+          )
+            return acc;
+          return i;
+        }, -1);
+
         if (lastUserIdx !== -1) {
-          // Prepend workspace state to the last user message as a text block
           const lastUser = msgs[lastUserIdx];
-          const existingContent =
-            typeof lastUser.content === "string"
-              ? lastUser.content
-              : JSON.stringify(lastUser.content);
-          // Only inject if not already present (avoid duplication on retries)
-          if (!existingContent.includes("[ContextForge WorkspaceState]")) {
-            msgs[lastUserIdx] = {
-              ...lastUser,
-              content: `${workspaceSummary}\n\n---\n\n${existingContent}`,
-            };
+
+          // ── Check if already injected into this message ────────────────
+          // Use a stable sentinel check that works for both string and
+          // array content without stringifying the entire content.
+          let alreadyInjected = false;
+
+          if (typeof lastUser.content === "string") {
+            alreadyInjected = lastUser.content.includes("[ContextForge WorkspaceState]");
+          } else if (Array.isArray(lastUser.content)) {
+            // Check if any text block starts with the sentinel
+            alreadyInjected = lastUser.content.some(
+              (b) =>
+                b.type === "text" &&
+                typeof b.text === "string" &&
+                b.text.includes("[ContextForge WorkspaceState]")
+            );
+          }
+
+          if (!alreadyInjected) {
+            if (typeof lastUser.content === "string") {
+              // String content — prepend as plain text
+              msgs[lastUserIdx] = {
+                ...lastUser,
+                content: `${workspaceSummary}\n\n---\n\n${lastUser.content}`,
+              };
+            } else if (Array.isArray(lastUser.content)) {
+              // Array content (Anthropic format) — prepend as a new text block.
+              // FIX 1: Do NOT convert array to string. Insert a text block
+              // at the front of the array to preserve the block structure.
+              msgs[lastUserIdx] = {
+                ...lastUser,
+                content: [
+                  { type: "text", text: `${workspaceSummary}\n\n---` },
+                  ...lastUser.content,
+                ],
+              };
+            }
+            // If content is null/undefined (tool-only assistant message),
+            // skip injection — there is nowhere to put it.
           }
         }
       }
@@ -744,9 +967,9 @@ export function createUpstreamHandler(ctx) {
         : provider.hostname;
 
       if (retryCount === 0) {
-//         console.log(`\n[Route] ${req.url} -> ${providerBase}${outboundPath}`);
+        //         console.log(`\n[Route] ${req.url} -> ${providerBase}${outboundPath}`);
       } else {
-//         console.log(`\n[Ghost Interceptor] Retry #${retryCount} -> ${providerBase}${outboundPath}`);
+        //         console.log(`\n[Ghost Interceptor] Retry #${retryCount} -> ${providerBase}${outboundPath}`);
       }
 
       const isStreamRequest = currentPayload.stream === true;
@@ -770,6 +993,7 @@ export function createUpstreamHandler(ctx) {
         let toolCalls = [];
         let hasSeenToolCall = false;
         let heldEvents = [];
+        let isStandardToolStream = false;
 
         // SSE line buffer — handles chunks that split across TCP packets
         let sseLineBuffer = "";
@@ -876,11 +1100,34 @@ export function createUpstreamHandler(ctx) {
 
             if (clientAdapter.name === "anthropic" || clientAdapter.name === "gemini") {
               if (hasSeenToolCall && process.env.CF_MODE !== "passthrough") {
-                if (translatedEvents.length > 0) {
-                  isFirstChunk = false;
-                  heldEvents.push(...translatedEvents);
+                if (!isStandardToolStream) {
+                  const allNamesComplete =
+                    toolCalls.length > 0 &&
+                    toolCalls.every((tc) => tc.arguments && tc.arguments.length > 0);
+                  if (allNamesComplete) {
+                    const hasBackgroundTool = toolCalls.some((tc) =>
+                      interceptor.isBackgroundTool(tc.name)
+                    );
+                    if (!hasBackgroundTool) {
+                      isStandardToolStream = true;
+                      if (!res.headersSent) {
+                        res.writeHead(proxyRes.statusCode, clientAdapter.responseHeaders(true));
+                      }
+                      if (heldEvents.length > 0) {
+                        for (const event of heldEvents) res.write(event);
+                        heldEvents = [];
+                      }
+                    }
+                  }
                 }
-                continue;
+
+                if (!isStandardToolStream) {
+                  if (translatedEvents.length > 0) {
+                    isFirstChunk = false;
+                    heldEvents.push(...translatedEvents);
+                  }
+                  continue;
+                }
               }
             }
 
@@ -950,14 +1197,15 @@ export function createUpstreamHandler(ctx) {
                   const result = await interceptor.process(
                     validToolCalls,
                     currentPayload,
-                    retryCount
+                    retryCount,
+                    acc.hopCount // ← pass hop count for dual circuit breaker
                   );
 
                   if (result.intercepted) {
                     if (result.circuitBreakerTripped) {
-//                       console.warn(
-//                         `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on streaming path.`
-//                       );
+                      //                       console.warn(
+                      //                         `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on streaming path.`
+                      //                       );
                       currentPayload.messages.push(
                         {
                           role: "assistant",
@@ -977,7 +1225,7 @@ export function createUpstreamHandler(ctx) {
 
                     currentPayload.messages.push({
                       role: "assistant",
-                      content: null,
+                      content: fullStreamedText.length > 0 ? fullStreamedText : null,
                       // Include extra_content (thought_signature) so Gemini
                       // accepts the next hop without throwing HTTP 400
                       tool_calls: result.toolCalls,
@@ -989,9 +1237,11 @@ export function createUpstreamHandler(ctx) {
                         tool_call_id: r.tool_call_id,
                         name: r.name,
                         content: r.content,
-                        ...(r.__cf_raw ? { __cf_raw: true } : {})
+                        ...(r.__cf_raw ? { __cf_raw: true } : {}),
                       });
                     }
+
+                    interceptAndVaultMassiveToolResults(currentPayload);
 
                     const nextRetry = computeNextRetry(result, retryCount, maxRetries);
                     executeUpstreamRequest(currentPayload, nextRetry, acc)
@@ -1058,18 +1308,23 @@ export function createUpstreamHandler(ctx) {
 
             const message = jsonResponse.choices?.[0]?.message;
 
-            if (message?.tool_calls && message.tool_calls.length > 0 && process.env.CF_MODE !== "passthrough") {
+            if (
+              message?.tool_calls &&
+              message.tool_calls.length > 0 &&
+              process.env.CF_MODE !== "passthrough"
+            ) {
               const result = await interceptor.process(
                 message.tool_calls,
                 currentPayload,
-                retryCount
+                retryCount,
+                acc.hopCount // ← pass hop count for dual circuit breaker
               );
 
               if (result.intercepted) {
                 if (result.circuitBreakerTripped) {
-//                   console.warn(
-//                     `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on non-streaming path.`
-//                   );
+                  //                   console.warn(
+                  //                     `\n⚠️  [Ghost Interceptor] Circuit breaker TRIPPED on non-streaming path.`
+                  //                   );
                   currentPayload.messages.push(
                     {
                       role: "assistant",
@@ -1109,9 +1364,11 @@ export function createUpstreamHandler(ctx) {
                     tool_call_id: r.tool_call_id,
                     name: r.name,
                     content: r.content,
-                    ...(r.__cf_raw ? { __cf_raw: true } : {})
+                    ...(r.__cf_raw ? { __cf_raw: true } : {}),
                   });
                 }
+
+                interceptAndVaultMassiveToolResults(currentPayload);
 
                 const nextRetry = computeNextRetry(result, retryCount);
                 executeUpstreamRequest(currentPayload, nextRetry, acc).then(resolve).catch(reject);

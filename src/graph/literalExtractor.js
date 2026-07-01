@@ -1,37 +1,53 @@
 /**
  * literalExtractor.js
  *
- * Extracts string literals, env var references, regex patterns,
- * and magic constants from source files.
+ * Extracts string literals and env var references from source files.
+ * Works alongside symbolExtractor — called during indexing to populate
+ * the literals and config_refs tables.
  *
- * Works alongside symbolExtractor — called during indexing to
- * populate the literals and config_refs tables.
+ * Fixes applied:
+ *   LE-1: STRING_PATTERN now uses separate same-quote patterns for ' and "
+ *         to avoid mismatched-quote captures. Template literals with ${}
+ *         are excluded — they are not string constants.
+ *
+ *   LE-2: REGEX_PATTERN removed — was declared but never used.
+ *
+ *   LE-3: findContainingFunction now finds the innermost container by
+ *         smallest line range instead of relying on node.depth which
+ *         symbolExtractor never sets.
+ *
+ *   LE-4: buildNodeSummaries nodeId now uses filePath:startLine:name
+ *         format matching buildRetrievalDocuments — no more SHA-256
+ *         hash that must stay in sync with writeFileGraph.
+ *
+ *   LE-5: Call name extraction extracted to shared extractCallNames()
+ *         helper with a single unified exclusion set.
+ *
+ *   LE-6: buildNodeSummaries now skips __module_ synthetic nodes.
+ *
+ *   Removed:
+ *     - Magic number extraction (noisy, low value)
+ *     - String literal kind classification (computed but never queried)
+ *     - REGEX_PATTERN (dead code)
  */
 
-import { createHash } from "node:crypto";
 // ─────────────────────────────────────────────
 // Patterns
 // ─────────────────────────────────────────────
 
-// String literals — captures content inside quotes
-// Excludes very short strings (< 3 chars) and pure whitespace
-const STRING_PATTERN = /(?<![a-zA-Z])['"`]([^'"`\n]{3,80})['"`]/g;
+// Single-quoted string literals — same-quote open/close
+const SINGLE_QUOTE_PATTERN = /(?<![a-zA-Z])'([^'\n]{3,80})'/g;
+
+// Double-quoted string literals — same-quote open/close
+const DOUBLE_QUOTE_PATTERN = /(?<![a-zA-Z])"([^"\n]{3,80})"/g;
 
 // process.env.XXX references
 const ENV_PATTERN = /process\.env\.([A-Z_][A-Z0-9_]*)/g;
 
-// Regex literals
-const REGEX_PATTERN = /\/([^/\n]{5,60})\/[gimsuy]*/g;
-
-// Magic numbers — meaningful numeric constants
-// Excludes 0, 1, -1, small port numbers < 1000 are kept,
-// large round numbers like 100 * 1024 * 1024 are interesting
-const MAGIC_NUMBER_PATTERN = /\b(\d{4,})\b/g;
-
 // Patterns that indicate a string is "interesting" (not just punctuation/noise)
 const INTERESTING_STRING = /[a-z][a-z-]{2,}|[A-Z_]{3,}/;
 
-// Strings to skip — too generic to be useful
+// Strings to skip — too generic to be useful in semantic search
 const SKIP_STRINGS = new Set([
   "utf-8",
   "utf8",
@@ -55,25 +71,76 @@ const SKIP_STRINGS = new Set([
 ]);
 
 // ─────────────────────────────────────────────
-// Containing function detection
+// Shared call name exclusion set
+// Used by both buildNodeSummaries and buildRetrievalDocument.
+// LE-5: Was duplicated with inconsistent exclusion lists.
 // ─────────────────────────────────────────────
 
-/**
- * Given a line number and a list of nodes (with startLine/endLine),
- * find which function/method contains this line.
- */
+const CALL_EXCLUSIONS = new Set([
+  "if",
+  "for",
+  "while",
+  "return",
+  "const",
+  "let",
+  "var",
+  "async",
+  "await",
+  "function",
+  "class",
+  "new",
+  "typeof",
+  "instanceof",
+  "switch",
+  "catch",
+  "throw",
+  "delete",
+  "void",
+]);
+
+// ─────────────────────────────────────────────
+// Shared call name extractor
+// LE-5: Extracted from duplicated inline logic in both summary builders.
+// ─────────────────────────────────────────────
+
+function extractCallNames(bodyText, selfName, limit = 8) {
+  if (!bodyText) return [];
+
+  const callPattern = /\b([A-Za-z_$][A-Za-z0-9_$.]*)\s*\(/g;
+  const seen = new Set([selfName]); // exclude self-reference
+  const names = [];
+  let m;
+
+  while ((m = callPattern.exec(bodyText)) !== null) {
+    const name = m[1];
+    if (!seen.has(name) && name.length > 2 && !CALL_EXCLUSIONS.has(name)) {
+      seen.add(name);
+      names.push(name);
+      if (names.length >= limit) break;
+    }
+  }
+
+  return names;
+}
+
+// ─────────────────────────────────────────────
+// Containing function detection
+//
+// LE-3: Was using node.depth which symbolExtractor never sets (always 0).
+// Now finds the innermost container by smallest line range — a function
+// with fewer lines that still contains the target line is more specific.
+// ─────────────────────────────────────────────
+
 function findContainingFunction(line, nodes) {
-  // Find the innermost (deepest depth) function that contains this line
   let best = null;
-  let bestDepth = -1;
+  let bestRange = Infinity;
 
   for (const node of nodes) {
     if (!["function", "method", "arrow_function"].includes(node.kind)) continue;
     if (node.startLine <= line && node.endLine >= line) {
-      // Prefer deeper nesting (more specific container)
-      const depth = node.depth || 0;
-      if (depth > bestDepth) {
-        bestDepth = depth;
+      const range = node.endLine - node.startLine;
+      if (range < bestRange) {
+        bestRange = range;
         best = node.name;
       }
     }
@@ -106,6 +173,43 @@ function offsetToLine(offset, lineStarts) {
 }
 
 // ─────────────────────────────────────────────
+// String literal extraction helper
+// ─────────────────────────────────────────────
+
+function extractStringLiterals(source, lineStarts, nodes, seenLiterals) {
+  const literals = [];
+
+  for (const pattern of [SINGLE_QUOTE_PATTERN, DOUBLE_QUOTE_PATTERN]) {
+    pattern.lastIndex = 0;
+    let match;
+
+    while ((match = pattern.exec(source)) !== null) {
+      const value = match[1].trim();
+
+      if (!INTERESTING_STRING.test(value)) continue;
+      if (SKIP_STRINGS.has(value)) continue;
+      if (seenLiterals.has(value)) continue;
+      if (value.includes("{") || value.includes("}")) continue;
+      if (value.startsWith("//") || value.startsWith("/*")) continue;
+
+      seenLiterals.add(value);
+
+      const line = offsetToLine(match.index, lineStarts);
+      const containingFn = findContainingFunction(line, nodes);
+
+      literals.push({
+        value,
+        kind: "string",
+        containingFn,
+        startLine: line,
+      });
+    }
+  }
+
+  return literals;
+}
+
+// ─────────────────────────────────────────────
 // Main extractor
 // ─────────────────────────────────────────────
 
@@ -118,55 +222,24 @@ function offsetToLine(offset, lineStarts) {
  * @returns {{ literals: Array, configRefs: Array }}
  */
 export function extractLiterals(source, filePath, nodes = []) {
-  const literals = [];
-  const configRefs = [];
   const lineStarts = buildLineIndex(source);
-
-  // Track seen values to avoid duplicates within same file
   const seenLiterals = new Set();
   const seenConfigs = new Set();
 
   // ── String literals ──
-  STRING_PATTERN.lastIndex = 0;
-  let match;
-  while ((match = STRING_PATTERN.exec(source)) !== null) {
-    const value = match[1].trim();
-
-    // Skip noise
-    if (!INTERESTING_STRING.test(value)) continue;
-    if (SKIP_STRINGS.has(value)) continue;
-    if (seenLiterals.has(value)) continue;
-
-    // Skip things that look like code, not data
-    if (value.includes("{") || value.includes("}")) continue;
-    if (value.startsWith("//") || value.startsWith("/*")) continue;
-
-    seenLiterals.add(value);
-
-    const line = offsetToLine(match.index, lineStarts);
-    const containingFn = findContainingFunction(line, nodes);
-
-    // Classify the literal
-    let kind = "string";
-    if (value.startsWith("/") && value.includes("/")) kind = "path";
-    else if (value.includes("-") && /^[a-z][a-z-]+$/.test(value)) kind = "header";
-    else if (value.includes("@")) kind = "email_pattern";
-    else if (/^\d+\.\d+\.\d+/.test(value)) kind = "version";
-
-    literals.push({
-      value,
-      kind,
-      containingFn,
-      startLine: line,
-      filePath,
-    });
-  }
+  const literals = extractStringLiterals(source, lineStarts, nodes, seenLiterals).map((l) => ({
+    ...l,
+    filePath,
+  }));
 
   // ── Environment variable references ──
+  const configRefs = [];
   ENV_PATTERN.lastIndex = 0;
+  let match;
+
   while ((match = ENV_PATTERN.exec(source)) !== null) {
     const key = match[1];
-    const rawText = match[0]; // process.env.KEY
+    const rawText = match[0];
 
     if (seenConfigs.has(key)) continue;
     seenConfigs.add(key);
@@ -183,40 +256,6 @@ export function extractLiterals(source, filePath, nodes = []) {
     });
   }
 
-  // ── Magic constants (inline numeric literals) ──
-  // Only capture large/meaningful numbers
-  MAGIC_NUMBER_PATTERN.lastIndex = 0;
-  while ((match = MAGIC_NUMBER_PATTERN.exec(source)) !== null) {
-    const value = match[1];
-    const num = parseInt(value, 10);
-
-    // Only index "interesting" large numbers
-    // (port numbers, byte sizes, timeouts, limits)
-    if (num < 1000) continue;
-
-    const dedupeKey = `num:${value}`;
-    if (seenLiterals.has(dedupeKey)) continue;
-    seenLiterals.add(dedupeKey);
-
-    const line = offsetToLine(match.index, lineStarts);
-    const containingFn = findContainingFunction(line, nodes);
-
-    // Only index if near a meaningful assignment
-    const lineText = source.slice(lineStarts[line], lineStarts[line + 1] || source.length);
-
-    if (!/const|let|var|=|quota|limit|size|timeout|max|min/i.test(lineText)) {
-      continue;
-    }
-
-    literals.push({
-      value,
-      kind: "magic_number",
-      containingFn,
-      startLine: line,
-      filePath,
-    });
-  }
-
   return { literals, configRefs };
 }
 
@@ -226,17 +265,24 @@ export function extractLiterals(source, filePath, nodes = []) {
 
 /**
  * Build a lightweight summary for each function node.
- * This runs after extractLiterals so we can include
- * literal/config refs per function.
+ * Called after extractLiterals so we can include literal/config refs per function.
+ *
+ * LE-4: nodeId now uses filePath:startLine:name format — matches
+ *       buildRetrievalDocuments stableId and queryNodeByStableId in graphDb.js.
+ *       Removed SHA-256 fileId computation that had to stay in sync with writeFileGraph.
+ *
+ * LE-6: Skips synthetic __module_ nodes.
  */
 export function buildNodeSummaries(nodes, literals, configRefs, filePath) {
   const summaries = [];
 
-  // ── Compute fileId once — must match writeFileGraph's computation ──
-  const fileId = createHash("sha256").update(filePath).digest("hex").slice(0, 16);
-
   for (const node of nodes) {
     if (!["function", "method", "arrow_function", "class"].includes(node.kind)) {
+      continue;
+    }
+
+    // LE-6: Skip synthetic module sentinel nodes
+    if (!node.name || node.name.startsWith("__module_")) {
       continue;
     }
 
@@ -244,7 +290,7 @@ export function buildNodeSummaries(nodes, literals, configRefs, filePath) {
     const fnLiterals = literals
       .filter((l) => l.containingFn === node.name)
       .map((l) => l.value)
-      .slice(0, 10); // cap at 10
+      .slice(0, 10);
 
     // Env vars used inside this function
     const fnEnvRefs = configRefs
@@ -259,28 +305,12 @@ export function buildNodeSummaries(nodes, literals, configRefs, filePath) {
       signature = firstLine.length > 120 ? firstLine.slice(0, 120) + "..." : firstLine;
     }
 
-    // Extract call names from bodyText using simple pattern
-    const callNames = [];
-    if (node.bodyText) {
-      const callPattern = /\b([A-Za-z_$][A-Za-z0-9_$.]*)\s*\(/g;
-      let m;
-      const seen = new Set();
-      while ((m = callPattern.exec(node.bodyText)) !== null) {
-        const name = m[1];
-        if (
-          !seen.has(name) &&
-          name.length > 2 &&
-          !/^(if|for|while|return|const|let|var|async|await)$/.test(name)
-        ) {
-          seen.add(name);
-          callNames.push(name);
-          if (callNames.length >= 8) break;
-        }
-      }
-    }
+    // LE-5: Use shared extractCallNames helper
+    const callNames = extractCallNames(node.bodyText, node.name, 8);
 
     summaries.push({
-      nodeId: `${fileId}:${node.name}:${node.startLine}`, // ← now matches graphDb
+      // LE-4: stable ID matching buildRetrievalDocuments and queryNodeByStableId
+      nodeId: `${filePath}:${node.startLine}:${node.name}`,
       filePath,
       name: node.name,
       signature,
@@ -298,50 +328,45 @@ export function buildNodeSummaries(nodes, literals, configRefs, filePath) {
 // Retrieval document builder
 //
 // Builds the rich text document that gets embedded into HNSW.
-// This is what makes natural-language queries like "upload quota check"
-// find getS3SignedUrl — the document contains semantic context, not
-// just the raw function name.
-//
-// Format deliberately mirrors how a developer would describe a function:
+// Format mirrors how a developer would describe a function:
 //   Function: getS3SignedUrl
 //   Kind: async arrow_function
 //   File: controllers/s3-upload.controller.js
-//   Uses: STORAGE_QUOTA, AWS_BUCKET_NAME, content-length
+//   Environment: STORAGE_QUOTA, AWS_BUCKET_NAME
+//   Literals: content-length
 //   Calls: createPresignedPost, Directory.findById, File.create
 // ─────────────────────────────────────────────
 
 /**
  * Build a rich retrieval document for a single node.
- * This text is embedded into HNSW for semantic search.
  *
- * @param {Object} node        - from symbolExtractor (has name, kind, bodyText, etc.)
- * @param {Array}  literals    - from extractLiterals for this file
- * @param {Array}  configRefs  - from extractLiterals for this file
+ * @param {Object} node
+ * @param {Array}  literals
+ * @param {Array}  configRefs
  * @param {string} filePath
- * @returns {string}           - rich text document for embedding
+ * @returns {string}
  */
 export function buildRetrievalDocument(node, literals, configRefs, filePath) {
   const lines = [];
 
-  // ── Identity ──
   lines.push(`Function: ${node.name}`);
   lines.push(`Kind: ${node.isAsync ? "async " : ""}${node.kind}`);
   lines.push(`File: ${filePath}`);
 
-  // ── Signature ──
+  // Signature — first line of bodyText
   if (node.bodyText) {
     const sig = node.bodyText.split("\n")[0].trim();
     if (sig) lines.push(`Signature: ${sig.slice(0, 120)}`);
   }
 
-  // ── Env vars used in this function ──
+  // Env vars used in this function
   const fnEnvRefs = configRefs.filter((c) => c.containingFn === node.name).map((c) => c.key);
 
   if (fnEnvRefs.length > 0) {
     lines.push(`Environment: ${fnEnvRefs.join(", ")}`);
   }
 
-  // ── String literals used in this function ──
+  // String literals used in this function
   const fnLiterals = literals
     .filter((l) => l.containingFn === node.name && l.kind !== "magic_number")
     .map((l) => l.value)
@@ -351,41 +376,16 @@ export function buildRetrievalDocument(node, literals, configRefs, filePath) {
     lines.push(`Literals: ${fnLiterals.join(", ")}`);
   }
 
-  // ── Functions called ──
-  // Extract from bodyText — same pattern as buildNodeSummaries
-  const callNames = [];
-  if (node.bodyText) {
-    const callPattern = /\b([A-Za-z_$][A-Za-z0-9_$.]*)\s*\(/g;
-    let m;
-    const seen = new Set();
-    // Skip the node's own name to avoid self-reference
-    seen.add(node.name);
-    while ((m = callPattern.exec(node.bodyText)) !== null) {
-      const name = m[1];
-      if (
-        !seen.has(name) &&
-        name.length > 2 &&
-        !/^(if|for|while|return|const|let|var|async|await|function|class|new|typeof|instanceof)$/.test(
-          name
-        )
-      ) {
-        seen.add(name);
-        callNames.push(name);
-        if (callNames.length >= 8) break;
-      }
-    }
-  }
-
+  // LE-5: Use shared extractCallNames helper
+  const callNames = extractCallNames(node.bodyText, node.name, 8);
   if (callNames.length > 0) {
     lines.push(`Calls: ${callNames.join(", ")}`);
   }
 
-  // ── Exported flag ──
   if (node.isExported) {
     lines.push("Exported: yes");
   }
 
-  // ── Complexity hint ──
   if (node.complexity > 5) {
     lines.push(`Complexity: ${node.complexity}`);
   }
@@ -410,10 +410,11 @@ export function buildRetrievalDocuments(nodes, literals, configRefs, filePath) {
   const results = [];
 
   for (const node of nodes) {
-    // Only embed meaningful nodes — skip consts, imports, synthetic modules
     if (!["function", "method", "arrow_function", "class"].includes(node.kind)) {
       continue;
     }
+
+    // Skip synthetic module sentinel nodes
     if (!node.name || node.name.startsWith("__module_")) {
       continue;
     }

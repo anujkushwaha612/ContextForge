@@ -247,6 +247,25 @@ export const saveToVault = (droppedText) => {
   return id;
 };
 
+/**
+ * Check if content is already vaulted without inserting.
+ * Uses the same SHA-256 content hash as saveToVault.
+ * Sub-millisecond SQLite index lookup.
+ *
+ * Returns the existing vault ID if found, null otherwise.
+ * Used by the AST compressor to skip tree-sitter on already-vaulted content.
+ */
+export const lookupVaultByContent = (text) => {
+    if (!text || typeof text !== "string") return null;
+    const contentHash = crypto
+        .createHash("sha256")
+        .update(text)
+        .digest("hex")
+        .slice(0, 16);
+    const existing = getVaultByHash.get(contentHash);
+    return existing ? existing.vault_id : null;
+};
+
 export const saveChunksToVault = (vaultId, chunks) => {
   const insertMany = db.transaction((chunksArray) => {
     for (const chunk of chunksArray) {

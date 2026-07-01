@@ -1,6 +1,7 @@
 /**
- * MemoryDecision — canonical "should we inject memory context?" gate.
+ * memoryDecision.js
  *
+ * Canonical "should we inject memory context?" gate.
  *
  * Decision-only: gates whether the request bytes get mutated
  * (memory context injected). Does NOT gate background memory storage —
@@ -11,8 +12,13 @@
  *   2. no_handler      — no memory backend configured
  *   3. no_user_id      — per-request user_id missing
  *   4. mode_disabled   — CF_MEMORY_MODE=disabled
- *   5. mode_tool       — CF_MEMORY_MODE=tool (agent calls tools explicitly)
+ *   5. mode_tool       — CF_MEMORY_MODE=tool (agent calls tools explicitly,
+ *                        no auto-context injection but tools remain available)
  *   6. otherwise       — inject=true
+ *
+ * Fixes applied:
+ *   MD-3: JSDoc corrected — memoryHandler receives MemoryHandler instance,
+ *         not hybridRetriever.
  */
 
 import { isBypassEnabled } from "./compressionDecision.js";
@@ -27,7 +33,7 @@ export class MemoryDecision {
     modeName,
   }) {
     this.inject               = inject;
-    this.skipReason           = skipReason;           // null when injecting
+    this.skipReason           = skipReason;
     this.bypassHeaderSet      = bypassHeaderSet;
     this.memoryHandlerPresent = memoryHandlerPresent;
     this.memoryUserIdPresent  = memoryUserIdPresent;
@@ -38,10 +44,10 @@ export class MemoryDecision {
   /**
    * Factory — the only correct way to create a MemoryDecision.
    *
-   * @param {object}      headers        - Inbound request headers
-   * @param {object|null} memoryHandler  - The hybridRetriever or null
-   * @param {string|null} memoryUserId   - x-contextforge-user-id header value
-   * @param {string}      modeName       - "auto_tail" | "tool" | "disabled"
+   * @param {object}           headers       - Inbound request headers
+   * @param {MemoryHandler|null} memoryHandler - MemoryHandler instance or null
+   * @param {string|null}      memoryUserId  - x-contextforge-user-id header value
+   * @param {string}           modeName      - "auto_tail" | "tool" | "disabled"
    */
   static decide({ headers, memoryHandler, memoryUserId, modeName = "auto_tail" }) {
     const bypass     = isBypassEnabled(headers);
@@ -64,6 +70,9 @@ export class MemoryDecision {
       reason = "mode_disabled";
       inject = false;
     } else if (modeName === "tool") {
+      // tool mode: LLM calls memory tools explicitly.
+      // inject=false → skip auto-injection of "Relevant Memories" context block.
+      // Memory tools are still injected separately by injectMemoryTools() in Stage 1.
       reason = "mode_tool";
       inject = false;
     } else {

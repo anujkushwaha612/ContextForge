@@ -1,10 +1,19 @@
 /**
  * patchTools.js
  *
- * Added: insert_at_line operation + insert_line parameter.
- * This solves the anonymous handler problem — find_route returns
- * a line number, LLM uses insert_at_line to add code without needing
- * a named symbol to anchor to.
+ * Fixes applied:
+ *   PT-1: Verification reads now use result.file (the resolved absolute path
+ *         returned by executePatch) instead of raw args.file_path. Previously
+ *         the LLM-provided relative/absolute path was passed to executeReadFileChunk
+ *         which could resolve to a different location than where the patch was written.
+ *
+ *   PT-2: successDetail guard added — was undefined on failure path causing
+ *         "[PatchTool] ❌ operation failed: undefined" in logs.
+ *
+ *   GT-4: Verification snippet is now parsed and checked for error before
+ *         embedding in verified_state.content. Previously an error JSON string
+ *         like {"error":"File not found"} was sent to the LLM as the "verified
+ *         current file state", causing wrong decisions on next turn.
  */
 
 import { executePatch, PATCH_OPERATIONS } from "./patchEngine.js";
@@ -30,13 +39,13 @@ export function getPatchToolDefinition() {
       description:
         "Apply a surgical patch to a source file. " +
         "MANDATORY WORKFLOW — follow this sequence exactly: " +
-        "Step 1: call contextforge_query_graph(find_symbol, 'functionName') to get location and first 100 lines. " +
-        "Step 2: if body shows '// ... N more lines' truncation note, call contextforge_retrieve to get JUST that function. " +
-        "Step 3: call this tool with the complete body from step 1 or 2. " +
-        "\n\nFor adding a single line (e.g. console.log), use insert_after — no retrieve needed. " +
-        "For changing one line INSIDE a large function, use replace_string — no retrieve needed. " +
+        "Step 1: call contextforge_query_graph(find_symbol, 'functionName') to get location (file + line numbers). " +
+        "Step 2: call contextforge_query_graph(read_function, 'functionName') to get the full body. " +
+        "Step 3: call this tool with the complete body from step 2. " +
+        "\n\nFor adding a single line (e.g. console.log), use insert_after — no read needed. " +
+        "For changing one line INSIDE a function, use replace_string — no full read needed. " +
         "For anonymous handlers (SSE routes, http.createServer blocks) where find_route returns a line number, " +
-        "use insert_at_line with the line number — no symbol or retrieve needed. " +
+        "use insert_at_line with the line number — no symbol or read needed. " +
         "Never call replace_body without the complete current body confirmed in hand.",
       parameters: {
         type: "object",
@@ -59,8 +68,7 @@ export function getPatchToolDefinition() {
             type: "string",
             description:
               "Complete replacement — every line from declaration to closing brace. " +
-              "If find_symbol showed a truncation note ('// ... N more lines'), " +
-              "you MUST call contextforge_retrieve first to get the full body. " +
+              "You MUST call read_function first to get the full body before using replace_body. " +
               "Not required for replace_string or delete operations.",
           },
           operation: {
@@ -74,7 +82,7 @@ export function getPatchToolDefinition() {
               "insert_at_line",
             ],
             description:
-              "replace_body: replaces entire symbol — requires reading complete body first. " +
+              "replace_body: replaces entire symbol — requires reading complete body first via read_function. " +
               "insert_after: adds code after symbol — safe WITHOUT reading body first. " +
               "insert_before: adds code before symbol — safe WITHOUT reading body first. " +
               "delete: removes symbol entirely — safe WITHOUT reading body first. " +
@@ -148,29 +156,34 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
   }
 
   const result = await executePatch({
-    file_path: args.file_path,
-    target_symbol: args.target_symbol || null,
-    new_body: args.new_body || "",
-    operation: args.operation,
-    search_string: args.search_string ?? null,
+    file_path:          args.file_path,
+    target_symbol:      args.target_symbol || null,
+    new_body:           args.new_body || "",
+    operation:          args.operation,
+    search_string:      args.search_string      ?? null,
     replacement_string: args.replacement_string ?? null,
-    insert_line: args.insert_line ?? null, // ← new
+    insert_line:        args.insert_line        ?? null,
     semanticCache,
   });
 
   statsEmitter.recordPatchOperation?.({
-    file: args.file_path,
-    symbol: args.target_symbol || "GLOBAL",
+    file:      args.file_path,
+    symbol:    args.target_symbol || "GLOBAL",
     operation: args.operation,
-    success: result.success,
+    success:   result.success,
   });
 
-  const successDetail =
-    args.operation === "replace_string"
-      ? `${result.lines_changed ?? 0} line(s) changed`
-      : args.operation === "insert_at_line"
-        ? `${result.lines_inserted ?? 0} line(s) inserted at line ${args.insert_line}`
-        : result.diff_summary;
+  // PT-2: Guard successDetail so failures don't log "undefined"
+  let successDetail = "";
+  if (result.success) {
+    if (args.operation === "replace_string") {
+      successDetail = `${result.lines_changed ?? 0} line(s) changed`;
+    } else if (args.operation === "insert_at_line") {
+      successDetail = `${result.lines_inserted ?? 0} line(s) inserted at line ${args.insert_line}`;
+    } else {
+      successDetail = result.diff_summary ?? "applied";
+    }
+  }
 
   console.log(
     result.success
@@ -182,39 +195,62 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
   // On success, read back the patched region and embed it in the response.
   // This prevents the LLM from issuing a second patch on already-modified
   // content because it can SEE the current file state without another read.
-  // The search_string no longer exists — the LLM cannot miss this.
   if (result.success) {
-    // Determine which lines to read back for verification
-    // insert_at_line uses insert_line, replace_string uses patch_start_line,
-    // replace_body/insert_after/insert_before use lines_before/lines_after
     const verifyLine =
       result.patch_start_line ??
-      result.insert_line ??
-      result.lines_before ??
+      result.insert_line      ??
+      result.lines_before     ??
       null;
 
     if (verifyLine != null) {
       try {
+        // PT-1: Use result.file (resolved absolute path from executePatch)
+        // NOT args.file_path (raw LLM-provided path, may be relative or
+        // point to a different location than where the write actually happened).
         const { executeReadFileChunk } = await import("./graphTools.js");
+
         const verifyStart = Math.max(1, verifyLine - 2);
-        const verifyEnd =
+        const verifyEnd   =
           (result.patch_end_line ?? result.lines_after ?? verifyLine) + 4;
 
-        const snippet = executeReadFileChunk(
-          args.file_path,
-          verifyStart,
-          verifyEnd,
-        );
+        const snippetRaw = executeReadFileChunk(result.file, verifyStart, verifyEnd);
 
-        result.verified_state = {
-          message: "Patch applied and verified. File now contains:",
-          lines: `${verifyStart}-${verifyEnd}`,
-          content: snippet,
-          WARNING:
-            "The original search_string no longer exists in this form. " +
-            "Do NOT retry this patch. If further edits are needed, " +
-            "use the content above as your new reference.",
-        };
+        // GT-4: Parse the snippet and check for error before embedding.
+        // executeReadFileChunk returns a JSON string — if it contains an error
+        // (file not found, bad range) that error JSON would be sent to the LLM
+        // as the "verified current state", causing wrong decisions.
+        let snippetContent = null;
+        try {
+          const snippetParsed = JSON.parse(snippetRaw);
+          if (snippetParsed.error) {
+            // Read failed — don't embed error as file content
+            snippetContent = null;
+          } else {
+            // Use the content field (joined lines) not the raw JSON
+            snippetContent = snippetParsed.content ?? null;
+          }
+        } catch {
+          // JSON parse failed — use raw string as fallback
+          snippetContent = snippetRaw;
+        }
+
+        if (snippetContent !== null) {
+          result.verified_state = {
+            message: "Patch applied and verified. File now contains:",
+            lines:   `${verifyStart}-${verifyEnd}`,
+            content: snippetContent,
+            WARNING:
+              "The original search_string no longer exists in this form. " +
+              "Do NOT retry this patch. If further edits are needed, " +
+              "use the content above as your new reference.",
+          };
+        } else {
+          result.verified_state = {
+            message: "Patch applied successfully.",
+            WARNING:
+              "Do NOT retry this patch. Use read_file_chunk to verify current state.",
+          };
+        }
       } catch {
         result.verified_state = {
           message: "Patch applied successfully.",

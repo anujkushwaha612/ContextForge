@@ -4,18 +4,15 @@
 #include <sstream>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Init — register all methods
+// Init
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Object SemanticCache::Init(Napi::Env env, Napi::Object exports) {
     Napi::Function func = DefineClass(env, "SemanticCache", {
-        // ── Existing API (backward compatible) ──
         InstanceMethod("add",             &SemanticCache::Add),
         InstanceMethod("search",          &SemanticCache::Search),
         InstanceMethod("invalidate",      &SemanticCache::Invalidate),
         InstanceMethod("clearAll",        &SemanticCache::ClearAll),
-
-        // ── New API ──
         InstanceMethod("addWithMeta",     &SemanticCache::AddWithMeta),
         InstanceMethod("searchK",         &SemanticCache::SearchK),
         InstanceMethod("searchThreshold", &SemanticCache::SearchThreshold),
@@ -43,12 +40,13 @@ SemanticCache::SemanticCache(const Napi::CallbackInfo& info)
 {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsNumber()) {
-        Napi::TypeError::New(env, "Expected vector dimension").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Expected vector dimension")
+            .ThrowAsJavaScriptException();
         return;
     }
 
-    dim_     = info[0].As<Napi::Number>().Uint32Value();
-    space_   = new hnswlib::InnerProductSpace(dim_);
+    dim_      = info[0].As<Napi::Number>().Uint32Value();
+    space_    = new hnswlib::InnerProductSpace(dim_);
     alg_hnsw_ = new hnswlib::HierarchicalNSW<float>(space_, 100000, 16, 200);
 }
 
@@ -58,7 +56,32 @@ SemanticCache::~SemanticCache() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal helper — build a JS hit object from a label + similarity score
+// Internal: remove an existing label cleanly
+//
+// SC-2/SC-8: Shared deduplication logic used by both Add and AddWithMeta.
+// If the same ID is re-added, the old HNSW entry is marked deleted
+// and removed from both maps before the new entry is inserted.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void SemanticCache::removeByIdIfExists(const std::string& id) {
+    auto rev_it = id_to_label_.find(id);
+    if (rev_it == id_to_label_.end()) return;
+
+    hnswlib::labeltype old_label = rev_it->second;
+
+    try {
+        alg_hnsw_->markDelete(old_label);
+    } catch (...) {
+        // Already deleted or invalid — continue cleanup
+    }
+
+    meta_map_.erase(old_label);
+    id_to_label_.erase(rev_it);
+    if (active_count_ > 0) active_count_--;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Build hit object
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Object SemanticCache::BuildHitObject(Napi::Env env,
@@ -76,7 +99,7 @@ Napi::Object SemanticCache::BuildHitObject(Napi::Env env,
         hit.Set("type",      Napi::String::New(env, m.type));
         hit.Set("payload",   Napi::String::New(env, m.payload));
     } else {
-        // Fallback for vectors added via legacy Add() with no metadata
+        // Legacy Add() entry with no metadata
         hit.Set("id",        Napi::String::New(env, ""));
         hit.Set("label",     Napi::Number::New(env, static_cast<double>(label)));
         hit.Set("score",     Napi::Number::New(env, similarity));
@@ -89,9 +112,10 @@ Napi::Object SemanticCache::BuildHitObject(Napi::Env env,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Add (legacy — backward compatible)
-// add(Float32Array, stringId) → numeric label
-// Stores minimal metadata: id only, namespace/type/payload empty.
+// Add (legacy)
+//
+// SC-2: Now removes existing entry with same ID before inserting.
+// SC-6: addPoint wrapped in try/catch — throws JS error instead of crashing.
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Value SemanticCache::Add(const Napi::CallbackInfo& info) {
@@ -102,8 +126,20 @@ Napi::Value SemanticCache::Add(const Napi::CallbackInfo& info) {
     Napi::Float32Array arr = info[0].As<Napi::Float32Array>();
     std::string db_id      = info[1].As<Napi::String>().Utf8Value();
 
+    // SC-2: Remove existing entry for this ID to prevent orphaned HNSW entries
+    removeByIdIfExists(db_id);
+
     size_t label = current_label_;
-    alg_hnsw_->addPoint(arr.Data(), label);
+
+    // SC-6: Catch addPoint exceptions — prevents Node.js process crash
+    try {
+        alg_hnsw_->addPoint(arr.Data(), label);
+    } catch (const std::exception& e) {
+        Napi::Error::New(env,
+            std::string("[SemanticCache] addPoint failed: ") + e.what())
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
 
     VectorMetadata meta;
     meta.id            = db_id;
@@ -111,7 +147,7 @@ Napi::Value SemanticCache::Add(const Napi::CallbackInfo& info) {
     meta.type          = "";
     meta.payload       = "";
 
-    meta_map_[label]   = meta;
+    meta_map_[label]    = meta;
     id_to_label_[db_id] = label;
     current_label_++;
     active_count_++;
@@ -121,8 +157,9 @@ Napi::Value SemanticCache::Add(const Napi::CallbackInfo& info) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AddWithMeta (new)
-// addWithMeta(Float32Array, id, namespace, type, payload?) → numeric label
-// Full metadata stored — enables clearPrefix(), stats(), typed search.
+//
+// SC-8: Now removes existing entry with same ID before inserting.
+// SC-6: addPoint wrapped in try/catch.
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Value SemanticCache::AddWithMeta(const Napi::CallbackInfo& info) {
@@ -145,14 +182,26 @@ Napi::Value SemanticCache::AddWithMeta(const Napi::CallbackInfo& info) {
     meta.namespaceName = info[2].As<Napi::String>().Utf8Value();
     meta.type          = info[3].As<Napi::String>().Utf8Value();
     meta.payload       = (info.Length() >= 5 && info[4].IsString())
-                             ? info[4].As<Napi::String>().Utf8Value()
-                             : "";
+                         ? info[4].As<Napi::String>().Utf8Value()
+                         : "";
+
+    // SC-8: Remove existing entry for this ID to prevent orphaned HNSW entries
+    removeByIdIfExists(meta.id);
 
     size_t label = current_label_;
-    alg_hnsw_->addPoint(arr.Data(), label);
 
-    meta_map_[label]         = meta;
-    id_to_label_[meta.id]    = label;
+    // SC-6: Catch addPoint exceptions
+    try {
+        alg_hnsw_->addPoint(arr.Data(), label);
+    } catch (const std::exception& e) {
+        Napi::Error::New(env,
+            std::string("[SemanticCache] addPoint failed: ") + e.what())
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    meta_map_[label]       = meta;
+    id_to_label_[meta.id]  = label;
     current_label_++;
     active_count_++;
 
@@ -160,10 +209,10 @@ Napi::Value SemanticCache::AddWithMeta(const Napi::CallbackInfo& info) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SearchK (new — core primitive)
-// searchK(Float32Array, k) → Array<{id, label, score, namespace, type, payload}>
-// Returns k nearest neighbors sorted by descending similarity.
-// JS decides thresholds — C++ does not bake them in.
+// SearchK (new)
+//
+// SC-1: Clamp to active_count_ not current_label_.
+//       current_label_ includes deleted entries — active_count_ is accurate.
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Value SemanticCache::SearchK(const Napi::CallbackInfo& info) {
@@ -177,24 +226,24 @@ Napi::Value SemanticCache::SearchK(const Napi::CallbackInfo& info) {
     if (active_count_ == 0 || k == 0)
         return Napi::Array::New(env, 0);
 
-    // Clamp k to actual indexed points to avoid HNSW assertion
-    size_t actual_k = std::min(k, (size_t)current_label_);
+    // SC-1: Clamp to active_count_ — current_label_ includes deleted entries
+    size_t actual_k = std::min(k, active_count_);
 
     auto result = alg_hnsw_->searchKnn(query.Data(), actual_k);
 
-    // HNSW returns a max-heap (worst first) — collect then reverse
+    // Collect from max-heap (largest distance at top) then reverse for
+    // descending similarity order (best match first)
     std::vector<std::pair<float, hnswlib::labeltype>> hits;
     hits.reserve(result.size());
     while (!result.empty()) {
         hits.push_back(result.top());
         result.pop();
     }
-    // Now hits[0] = worst, hits.back() = best — reverse for descending score
     std::reverse(hits.begin(), hits.end());
 
     Napi::Array out = Napi::Array::New(env, hits.size());
     for (size_t i = 0; i < hits.size(); i++) {
-        float similarity = 1.0f - hits[i].first;  // InnerProductSpace: dist = 1 - dot
+        float similarity = 1.0f - hits[i].first;
         out[i] = BuildHitObject(env, hits[i].second, similarity);
     }
 
@@ -202,9 +251,7 @@ Napi::Value SemanticCache::SearchK(const Napi::CallbackInfo& info) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Search (legacy — backward compatible)
-// search(Float32Array, similarityThreshold) → stringId | null
-// Kept for all existing callers (vaultRetriever, cacheDb, etc.)
+// Search (legacy)
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Value SemanticCache::Search(const Napi::CallbackInfo& info) {
@@ -212,17 +259,17 @@ Napi::Value SemanticCache::Search(const Napi::CallbackInfo& info) {
     if (info.Length() < 2 || !info[0].IsTypedArray() || !info[1].IsNumber())
         return env.Null();
 
-    Napi::Float32Array query      = info[0].As<Napi::Float32Array>();
-    float similarity_threshold    = info[1].As<Napi::Number>().FloatValue();
-    float distance_threshold      = 1.0f - similarity_threshold;
+    Napi::Float32Array query   = info[0].As<Napi::Float32Array>();
+    float similarity_threshold = info[1].As<Napi::Number>().FloatValue();
+    float distance_threshold   = 1.0f - similarity_threshold;
 
     if (active_count_ == 0) return env.Null();
 
     auto result = alg_hnsw_->searchKnn(query.Data(), 1);
     if (result.empty()) return env.Null();
 
-    float distance             = result.top().first;
-    hnswlib::labeltype label   = result.top().second;
+    float              distance = result.top().first;
+    hnswlib::labeltype label    = result.top().second;
 
     if (distance <= distance_threshold) {
         auto it = meta_map_.find(label);
@@ -235,19 +282,18 @@ Napi::Value SemanticCache::Search(const Napi::CallbackInfo& info) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SearchThreshold (new — explicit alias for Search)
-// searchThreshold(Float32Array, threshold) → stringId | null
-// Same as Search() but with a name that makes the intent obvious.
+// SearchThreshold (new — alias for Search)
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Value SemanticCache::SearchThreshold(const Napi::CallbackInfo& info) {
-    // Identical implementation — delegates to the same HNSW call.
     return Search(info);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Invalidate (updated — now decrements active_count_)
-// invalidate(numericLabel) → boolean
+// Invalidate
+//
+// SC-4: Now returns true only if the label was actually found and deleted.
+//       Previously always returned true — callers could not detect failure.
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Value SemanticCache::Invalidate(const Napi::CallbackInfo& info) {
@@ -259,38 +305,45 @@ Napi::Value SemanticCache::Invalidate(const Napi::CallbackInfo& info) {
     }
 
     size_t target_label = info[0].As<Napi::Number>().Uint32Value();
+    bool   deleted      = false;
 
     try {
         alg_hnsw_->markDelete(target_label);
 
-        // Clean up metadata and reverse index
         auto it = meta_map_.find(target_label);
         if (it != meta_map_.end()) {
             id_to_label_.erase(it->second.id);
             meta_map_.erase(it);
             if (active_count_ > 0) active_count_--;
+            deleted = true;
         }
     } catch (const std::exception&) {
-        // Label doesn't exist — safe to ignore
+        // Label does not exist — deleted stays false
     }
 
-    return Napi::Boolean::New(env, true);
+    return Napi::Boolean::New(env, deleted);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ClearAll (updated — resets both maps and active_count_)
-// clearAll() → boolean
+// ClearAll
+//
+// SC-5: Set alg_hnsw_ to nullptr before reallocation so a failed `new`
+//       does not leave a dangling pointer that subsequent calls dereference.
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Value SemanticCache::ClearAll(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     try {
         delete alg_hnsw_;
+        alg_hnsw_ = nullptr;  // SC-5: safe state before reallocation
+
         alg_hnsw_ = new hnswlib::HierarchicalNSW<float>(space_, 100000, 16, 200);
+
         meta_map_.clear();
         id_to_label_.clear();
         current_label_ = 0;
         active_count_  = 0;
+
         return Napi::Boolean::New(env, true);
     } catch (const std::exception& e) {
         Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
@@ -299,11 +352,7 @@ Napi::Value SemanticCache::ClearAll(const Napi::CallbackInfo& info) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ClearPrefix (new)
-// clearPrefix("PLANNER__") → number of vectors removed
-// Marks all vectors whose ID starts with prefix as deleted.
-// Does NOT rebuild the graph — uses markDelete for each match.
-// Safe to call while other namespaces are active.
+// ClearPrefix
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Value SemanticCache::ClearPrefix(const Napi::CallbackInfo& info) {
@@ -315,12 +364,12 @@ Napi::Value SemanticCache::ClearPrefix(const Napi::CallbackInfo& info) {
     }
 
     std::string prefix = info[0].As<Napi::String>().Utf8Value();
-    size_t removed     = 0;
+    size_t      removed = 0;
 
     // Collect matching labels first to avoid iterator invalidation
     std::vector<hnswlib::labeltype> to_remove;
     for (const auto& [label, meta] : meta_map_) {
-        if (meta.id.rfind(prefix, 0) == 0) {   // starts_with
+        if (meta.id.rfind(prefix, 0) == 0) {
             to_remove.push_back(label);
         }
     }
@@ -342,8 +391,7 @@ Napi::Value SemanticCache::ClearPrefix(const Napi::CallbackInfo& info) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Size (new)
-// size() → number of active (non-deleted) vectors
+// Size
 // ─────────────────────────────────────────────────────────────────────────────
 
 Napi::Value SemanticCache::Size(const Napi::CallbackInfo& info) {
@@ -351,21 +399,24 @@ Napi::Value SemanticCache::Size(const Napi::CallbackInfo& info) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Stats (new)
-// stats() → { size, dim, namespaces: { "PLANNER": 37, "CACHE": 120 } }
+// Stats
+//
+// SC-9: Empty-string namespace entries (from legacy Add()) are filtered out
+//       so the stats output only shows meaningful named namespaces.
 // ─────────────────────────────────────────────────────────────────────────────
 
-Napi::Value SemanticCache::Stats(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
+Napi::Value SemanticCache::Stats(const Napi::Env env) const {
     Napi::Object out = Napi::Object::New(env);
 
     out.Set("size", Napi::Number::New(env, static_cast<double>(active_count_)));
     out.Set("dim",  Napi::Number::New(env, static_cast<double>(dim_)));
 
-    // Count vectors per namespace
     std::unordered_map<std::string, size_t> ns_counts;
     for (const auto& [label, meta] : meta_map_) {
-        ns_counts[meta.namespaceName]++;
+        // SC-9: Skip empty-string namespace from legacy Add() calls
+        if (!meta.namespaceName.empty()) {
+            ns_counts[meta.namespaceName]++;
+        }
     }
 
     Napi::Object ns_obj = Napi::Object::New(env);
@@ -375,4 +426,12 @@ Napi::Value SemanticCache::Stats(const Napi::CallbackInfo& info) {
     out.Set("namespaces", ns_obj);
 
     return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stats — NAPI entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+Napi::Value SemanticCache::Stats(const Napi::CallbackInfo& info) {
+    return Stats(info.Env());
 }

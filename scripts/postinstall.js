@@ -16,7 +16,7 @@
  */
 
 import { execSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -167,7 +167,7 @@ function checkNativeBinary() {
 // ─────────────────────────────────────────────
 
 async function ensureOnnxModel() {
-  const modelsDir = path.join(ROOT, "models");
+  const modelsDir = path.join(ROOT, "contextforge_models");
   const modelFile = path.join(modelsDir, "all-MiniLM-L6-v2-int8.onnx");
   const tokenizerFile = path.join(modelsDir, "tokenizer.json");
 
@@ -190,14 +190,14 @@ async function ensureOnnxModel() {
       "-File", path.join(ROOT, "scripts", "setup-onnx.ps1")
     ], { stdio: "inherit", shell: true });
     if (result.status !== 0) {
-      warn("Model download failed — you can retry with: npm run setup:models");
+      warn("Model download failed — you can retry with: npm run setup:contextforge_models");
     }
   } else {
     const result = spawnSync("bash", [
       path.join(ROOT, "scripts", "setup-onnx.sh")
     ], { stdio: "inherit" });
     if (result.status !== 0) {
-      warn("Model download failed — you can retry with: npm run setup:models");
+      warn("Model download failed — you can retry with: npm run setup:contextforge_models");
     }
   }
 }
@@ -221,7 +221,6 @@ function ensureEnvFile() {
   }
 
   try {
-    const { copyFileSync } = await import("node:fs");
     copyFileSync(envExample, envFile);
     ok(".env created from .env.example");
     warn("Edit .env and add your API keys before starting");
@@ -238,7 +237,7 @@ async function main() {
   // Skip heavy setup in CI — CI builds the native module explicitly
   if (isCI() && !isDocker()) {
     log("CI environment detected — skipping postinstall setup");
-    log("CI should run: npm run build:native && npm run setup:models");
+    log("CI should run: npm run build:native && npm run setup:contextforge_models");
     process.exit(0);
   }
 

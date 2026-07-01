@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-MODELS_DIR="./models"
+MODELS_DIR="./contextforge_models"
 MODEL_FILE="${MODELS_DIR}/all-MiniLM-L6-v2-int8.onnx"
 TOKENIZER_FILE="${MODELS_DIR}/tokenizer.json"
 

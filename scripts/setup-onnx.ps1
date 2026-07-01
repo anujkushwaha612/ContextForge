@@ -3,7 +3,7 @@
 # Run with: powershell -ExecutionPolicy Bypass -File scripts\setup-onnx.ps1
 # ─────────────────────────────────────────────────────────────────────────────
 
-$ModelsDir = ".\models"
+$ModelsDir = ".\contextforge_models"
 $ModelFile = "$ModelsDir\all-MiniLM-L6-v2-int8.onnx"
 $TokenizerFile = "$ModelsDir\tokenizer.json"
 

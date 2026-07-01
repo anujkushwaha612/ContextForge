@@ -86,7 +86,7 @@ export class AnthropicAdapter {
       role: "assistant",
       content: [],
       model: openAIResponse.model || "contextforge",
-      stop_reason: "end_turn",
+      stop_reason: openAIResponse.choices?.[0]?.finish_reason === "length" ? "max_tokens" : "end_turn",
       stop_sequence: null,
       usage: {
         input_tokens: openAIResponse.usage?.prompt_tokens || 0,

@@ -1,21 +1,35 @@
 /**
- * MemoryHandler — orchestrates persistent cross-session memory.
+ * memoryHandler.js
+ *
+ * Orchestrates persistent cross-session memory.
  *
  * Stack:
  *   PersistentMemoryStore (C++)  → SQLite + HNSW vector storage
- *   GloVe-50d embedder           → via native.cosineSimilarityStatic path
- *                                   (we compute embeddings in JS using
- *                                    the loaded GloVe table)
  *   HybridRetriever              → BM25 fallback when no embedding match
  *
+ * Fixes applied:
+ *   MH-1: appendContextToMessages now handles array-content user messages
+ *         by prepending a text block instead of skipping them. Prevents
+ *         the fallback path that created consecutive user messages.
+ *
+ *   MH-2: _buildQueryFromMessages now extracts text blocks from
+ *         array-content user messages (not just tool_result blocks).
+ *         Removed dead Anthropic tool_result block path.
+ *
+ *   MH-3: _buildQueryFromMessages now filters out system messages
+ *         before building the embedding query.
+ *
+ *   MH-4: RecencyBoostRanker detects Unix seconds vs milliseconds
+ *         and normalizes to milliseconds before computing age.
+ *
+ *   MH-5: BM25 fallback guards against missing sparseSearch method
+ *         with a clear error instead of silent TypeError.
+ *
+ *   MH-6: savedId validated after store.save() before addDocument.
  */
 
 import crypto from "node:crypto";
-import path from "node:path";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { getEmbedder } from "./embedder.js";
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─────────────────────────────────────────────
 // RecencyBoostRanker
@@ -37,7 +51,7 @@ class RecencyBoostRanker {
       return { idx, candidate: c, boostedScore: c.score * factor };
     });
 
-    // Stable sort descending — same input → same output (cache stable)
+    // Stable sort descending
     boosted.sort((a, b) =>
       b.boostedScore !== a.boostedScore
         ? b.boostedScore - a.boostedScore
@@ -51,20 +65,26 @@ class RecencyBoostRanker {
   }
 
   _recencyFactor(nowMs, createdAtMs) {
-    if (!createdAtMs) return 1.0; // unknown → neutral
-    const ageDays = (nowMs - createdAtMs) / 86_400_000;
-    if (ageDays <= 0) return 1.0; // future timestamp → neutral
+    if (!createdAtMs) return 1.0;
+
+    // MH-4: Detect Unix seconds vs milliseconds.
+    // Unix seconds are ~10 digits (1.7B in 2024).
+    // Unix milliseconds are ~13 digits (1.7T in 2024).
+    // SQLite CURRENT_TIMESTAMP returns seconds — normalize to ms.
+    const ts = createdAtMs < 1e10 ? createdAtMs * 1000 : createdAtMs;
+
+    const ageDays = (nowMs - ts) / 86_400_000;
+    if (ageDays <= 0) return 1.0;
     return Math.exp(-ageDays / this._decayDays);
   }
 }
 
 // ─────────────────────────────────────────────
 // Token budget cap
-// Port of memory_injection.py MemoryInjectionBudget
 // ─────────────────────────────────────────────
 
 function applyTokenBudget(text, maxTokens) {
-  const charBudget = maxTokens * 4; // 4 chars/token heuristic
+  const charBudget = maxTokens * 4;
   if (text.length <= charBudget) return text;
   const cut = text.lastIndexOf("\n", charBudget);
   return cut > 0 ? text.slice(0, cut + 1) : text.slice(0, charBudget);
@@ -85,40 +105,31 @@ export class MemoryHandler {
     hybridRetriever,
     { maxTokens = 1024, maxEntries = 10, minScore = 0.3, decayDays = 30 } = {},
   ) {
-    this._store = memoryStore;
-    this._retriever = hybridRetriever;
-    this._ranker = new RecencyBoostRanker(decayDays);
-    this._maxTokens = maxTokens;
-    this._maxEntries = maxEntries;
-    this._minScore = minScore;
+    this._store       = memoryStore;
+    this._retriever   = hybridRetriever;
+    this._ranker      = new RecencyBoostRanker(decayDays);
+    this._maxTokens   = maxTokens;
+    this._maxEntries  = maxEntries;
+    this._minScore    = minScore;
   }
 
   _embed(text) {
-    // Returns Float32Array(384) — synchronous path not available
-    // Memory operations become async
     return getEmbedder().embed(text); // Promise<Float32Array>
   }
 
   // ─────────────────────────────────────────────
-  // Save a memory — public API
-  // Called by memory tool handler
+  // Save a memory
   // ─────────────────────────────────────────────
 
-  async save({
-    userId,
-    workspace = "",
-    content,
-    importance = 0.5,
-    metadata = {},
-  }) {
+  async save({ userId, workspace = "", content, importance = 0.5, metadata = {} }) {
     if (!content?.trim()) {
       console.warn("[Memory] ⚠️  Attempted to save empty content — skipping.");
       return null;
     }
 
-    const id = "mem_" + crypto.randomBytes(8).toString("hex");
-    const embedding = await this._embed(content); // now async
-    const now = Date.now();
+    const id        = "mem_" + crypto.randomBytes(8).toString("hex");
+    const embedding = await this._embed(content);
+    const now       = Date.now();
 
     const savedId = this._store.save({
       id,
@@ -131,13 +142,19 @@ export class MemoryHandler {
       metadata: JSON.stringify(metadata),
     });
 
+    // MH-6: Validate savedId before using it
+    if (!savedId) {
+      console.warn("[Memory] ⚠️  store.save() returned falsy — save may have failed.");
+      return null;
+    }
+
     try {
       this._retriever.addDocument(savedId, content);
-    } catch (_) {}
+    } catch (_) {
+      // BM25 index failure is non-fatal — vector search still works
+    }
 
-    console.log(
-      `[Memory] Saved: ${savedId} (user=${userId} workspace=${workspace})`,
-    );
+    console.log(`[Memory] Saved: ${savedId} (user=${userId} workspace=${workspace})`);
     return savedId;
   }
 
@@ -151,8 +168,8 @@ export class MemoryHandler {
       return [];
     }
 
-    const floor = minScore ?? this._minScore;
-    const embedding = await this._embed(query); // now async
+    const floor     = minScore ?? this._minScore;
+    const embedding = await this._embed(query);
 
     let results = [];
     try {
@@ -165,14 +182,25 @@ export class MemoryHandler {
       });
     } catch (err) {
       console.warn("[Memory] Vector search failed:", err.message);
+
+      // MH-5: Guard against missing sparseSearch method on HybridRetriever.
+      // The native API uses hybridSearch — sparseSearch may not exist.
+      if (typeof this._retriever.sparseSearch !== "function") {
+        console.warn(
+          "[Memory] BM25 fallback unavailable — sparseSearch not found on retriever. " +
+          "Returning empty results."
+        );
+        return [];
+      }
+
       try {
         const bm25 = this._retriever.sparseSearch(query, topK, 1.0);
-        return bm25.map((r) => ({
-          id: r.id,
-          content: r.breadcrumb || "",
-          score: r.sparseScore,
+        return (Array.isArray(bm25) ? bm25 : []).map((r) => ({
+          id:        r.id,
+          content:   r.breadcrumb || "",
+          score:     r.sparseScore,
           createdAt: null,
-          metadata: "{}",
+          metadata:  "{}",
         }));
       } catch (e2) {
         console.warn("[Memory] BM25 fallback also failed:", e2.message);
@@ -181,7 +209,7 @@ export class MemoryHandler {
     }
 
     return this._ranker
-      .rank(results)
+      .rank(Array.isArray(results) ? results : [])
       .filter((r) => r.score >= floor)
       .slice(0, this._maxEntries);
   }
@@ -208,12 +236,12 @@ export class MemoryHandler {
       console.warn("[Memory] ⚠️  Attempted to update with empty content — skipping.");
       return false;
     }
-    const embedding = await this._embed(content); // now async
-    const ok = this._store.update({ id, content, embedding });
+    const embedding = await this._embed(content);
+    const ok        = this._store.update({ id, content, embedding });
     if (ok) {
       try {
         this._retriever.addDocument(id, content);
-      } catch (_) {}
+      } catch (_) { /* non-fatal */ }
     }
     return ok;
   }
@@ -231,8 +259,8 @@ export class MemoryHandler {
     const results = await this.search({
       userId,
       workspace,
-      query: queryText,
-      topK: this._maxEntries,
+      query:    queryText,
+      topK:     this._maxEntries,
       minScore: this._minScore,
     });
 
@@ -247,16 +275,14 @@ export class MemoryHandler {
     ];
 
     for (let i = 0; i < results.length; i++) {
-      const r = results[i];
-      const preview =
-        r.content.length > 200 ? r.content.slice(0, 200) + "..." : r.content;
+      const r       = results[i];
+      const preview = r.content.length > 200
+        ? r.content.slice(0, 200) + "..."
+        : r.content;
       lines.push(`${i + 1}. [${r.id}] ${preview}`);
     }
 
-    lines.push(
-      ``,
-      `Pass the ID in brackets to memory_update or memory_delete.`,
-    );
+    lines.push(``, `Pass the ID in brackets to memory_update or memory_delete.`);
 
     return applyTokenBudget(lines.join("\n"), this._maxTokens);
   }
@@ -278,80 +304,120 @@ export class MemoryHandler {
   }
 
   // ─────────────────────────────────────────────
-  // Append context to latest user message tail
-  // Invariant: never mutates system prompt / frozen prefix
+  // Append context to latest user message
+  //
+  // MH-1: Now handles three content shapes:
+  //   1. string content  → append as plain text
+  //   2. array content   → prepend as a new text block (preserves block structure)
+  //   3. no user message → inject as new user message (last resort)
+  //
+  // The old code skipped array-content messages and fell through to the
+  // fallback which created consecutive user messages — an API error.
   // ─────────────────────────────────────────────
 
   appendContextToMessages(messages, contextText) {
     if (!messages?.length || !contextText) return messages;
 
-    // Find last user message with string content (not tool_result blocks)
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
       if (msg.role !== "user") continue;
-      if (typeof msg.content !== "string") continue;
+
+      // Skip Anthropic-format tool result messages
+      // (role:"user" where all blocks are type:"tool_result")
+      if (
+        Array.isArray(msg.content) &&
+        msg.content.length > 0 &&
+        msg.content.every((b) => b.type === "tool_result")
+      ) continue;
 
       const updated = [...messages];
-      updated[i] = {
-        ...updated[i],
-        content: updated[i].content + "\n\n" + contextText,
-      };
+
+      if (typeof msg.content === "string") {
+        // String content — append directly
+        updated[i] = {
+          ...msg,
+          content: msg.content + "\n\n" + contextText,
+        };
+      } else if (Array.isArray(msg.content)) {
+        // Array content — prepend as a new text block.
+        // Do NOT convert to string — preserves the block structure
+        // that the workspace state injector and other stages depend on.
+        updated[i] = {
+          ...msg,
+          content: [
+            { type: "text", text: contextText },
+            ...msg.content,
+          ],
+        };
+      } else {
+        // Null/undefined content — set as string
+        updated[i] = {
+          ...msg,
+          content: contextText,
+        };
+      }
+
       return updated;
     }
 
-    // Fallback: no user message found → inject as new user message
+    // Last resort: no suitable user message found
     console.warn(
-      "[Memory] ⚠️  No user message found in conversation history — " +
-      "injecting memory context as new user message at end of array."
+      "[Memory] ⚠️  No user message found — injecting memory context as new user message."
     );
-    return [
-      ...messages,
-      { role: "user", content: contextText }
-    ];
+    return [...messages, { role: "user", content: contextText }];
   }
 
   // ─────────────────────────────────────────────
   // Multi-source query builder
-  // Port of MemoryQuery.from_messages() + to_embedding_input()
-  // No truncation — GloVe mean-pools the whole input
+  //
+  // MH-2: Now extracts text blocks from array-content user messages.
+  //       Removed dead Anthropic tool_result block path (post-translation,
+  //       only role:"tool" exists for tool results).
+  //
+  // MH-3: System messages excluded from query — they contain project
+  //       context (file listings, cwd, shell) that pollutes the embedding.
   // ─────────────────────────────────────────────
 
   _buildQueryFromMessages(
     messages,
     { lookbackAssistant = 2, lookbackTools = 3 } = {},
   ) {
-    let latestUser = "";
+    let latestUser       = "";
     const assistantParts = [];
-    const toolParts = [];
+    const toolParts      = [];
 
     for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      const role = msg.role;
+      const msg     = messages[i];
+      const role    = msg.role;
       const content = msg.content;
+
+      // MH-3: Skip system messages — they pollute the embedding query
+      // with project structure, file listings, and shell context.
+      if (role === "system") continue;
 
       if (role === "user") {
         if (typeof content === "string" && !latestUser) {
+          // Plain string user message — this is the primary query signal
           latestUser = content;
-        } else if (Array.isArray(content)) {
-          for (const block of content) {
-            if (
-              block?.type === "tool_result" &&
-              toolParts.length < lookbackTools
-            ) {
-              const t =
-                typeof block.content === "string"
-                  ? block.content
-                  : Array.isArray(block.content)
-                    ? block.content.map((b) => b.text || "").join("\n")
-                    : "";
-              if (t) toolParts.push(t);
-            }
+
+        } else if (Array.isArray(content) && !latestUser) {
+          // MH-2: Array-content user message — extract text blocks.
+          // After workspace state injection, the last user message may be
+          // an array with a workspace state text block prepended.
+          // We want the actual user instruction, not the injected context.
+          const textParts = content
+            .filter((b) => b?.type === "text" && b.text?.trim())
+            .map((b) => b.text);
+
+          if (textParts.length > 0) {
+            // Use the last text block as the user query — the injected
+            // workspace state is prepended, so the user's actual message
+            // is at the end of the array.
+            latestUser = textParts[textParts.length - 1];
           }
         }
-      } else if (
-        role === "assistant" &&
-        assistantParts.length < lookbackAssistant
-      ) {
+
+      } else if (role === "assistant" && assistantParts.length < lookbackAssistant) {
         const t =
           typeof content === "string"
             ? content
@@ -362,14 +428,15 @@ export class MemoryHandler {
                   .join("\n")
               : "";
         if (t) assistantParts.push(t);
+
       } else if (role === "tool" && toolParts.length < lookbackTools) {
+        // OpenAI format tool results — role:"tool" with string content
         if (typeof content === "string" && content) {
           toolParts.push(content);
         }
       }
     }
 
-    // Assemble: assistant (oldest→newest) + tools + user last
     const parts = [
       ...assistantParts.reverse(),
       ...toolParts.reverse(),

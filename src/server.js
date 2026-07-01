@@ -32,8 +32,6 @@ import { detectMutation, hashFile } from "./utils/fileUtils.js";
 import { minimizeToolSchemas } from "./proxy/translator.js";
 import { interceptAndVaultMassiveToolResults } from "./compression/fatCatch.js";
 import { scrubToolResults, tagToolResults } from "./compression/toolScrubber.js";
-import { pruneToolResults } from "./compression/pruner.js";
-import { sliceJsonToolResults } from "./compression/jsonSlicer.js";
 import { injectContextForgeRule, deduplicateSystemMessages } from "./proxy/systemMessages.js";
 import { stripAnthropicSpecificFields } from "./proxy/translator.js";
 
@@ -41,7 +39,6 @@ import { stripAnthropicSpecificFields } from "./proxy/translator.js";
 import { compressCodeToolResults } from "./compression/astCompressor.js";
 import { getPolicyForModel } from "./compression/compressionPolicy.js";
 import { CompressionDecision, getOptimizeFlag } from "./proxy/compressionDecision.js";
-import { alignCachePrefix } from "./compression/cacheAligner.js";
 import { MemoryDecision, getMemoryMode } from "./proxy/memoryDecision.js";
 import { StageTimer, STAGES } from "./proxy/stageTimer.js";
 import { savingsTracker } from "./proxy/savingsTracker.js";
@@ -92,8 +89,8 @@ console.log("Initializing ContextForge Native Engine...");
 // and would hit ReferenceError if these are declared below it.
 
 const onnxEmbedder = new native.OnnxEmbedder(
-  path.join(__dirname, "../models/all-MiniLM-L6-v2-int8.onnx"),
-  path.join(__dirname, "../models/tokenizer.json"),
+  path.join(__dirname, "../contextforge_models/all-MiniLM-L6-v2-int8.onnx"),
+  path.join(__dirname, "../contextforge_models/tokenizer.json"),
   { dim: 384, cacheSize: 512, batchWaitMs: 1 }
 );
 
@@ -443,6 +440,19 @@ const server = http.createServer((req, res) => {
     const mockUpstreamPort = req.headers["x-cf-mock-port"]
       ? parseInt(req.headers["x-cf-mock-port"], 10)
       : null;
+
+    // ─────────────────────────────────────────────
+    // Gemini inline file content extraction
+    // ─────────────────────────────────────────────
+    if (clientAdapter.name === "gemini") {
+      payload = extractGeminiInlineContent(payload);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // TRUE BASELINE
+    // ─────────────────────────────────────────────────────────────────────────────
+    const trueBaselineTokens = countTokens(payload);
+
     // ── Bind upstream handler for this request ──
     const executeUpstreamRequest = createUpstreamHandler({
       req,
@@ -455,34 +465,11 @@ const server = http.createServer((req, res) => {
       onnxEmbedder,
       memoryHandler,
       maxRetries,
-      mockUpstreamPort, // <-- ADD THIS
+      mockUpstreamPort,
+      trueBaselineTokens, // <-- ADD THIS
     });
 
-    // ─────────────────────────────────────────────
-    // Gemini inline file content extraction
-    // ─────────────────────────────────────────────
-    if (clientAdapter.name === "gemini") {
-      payload = extractGeminiInlineContent(payload);
-    }
-
     // ─────────────────────────────────────────────────────────────────────────────
-    // TRUE BASELINE
-    //
-    // Measured AFTER clientAdapter.toInternal() normalizes the incoming request
-    // to OpenAI internal format. This is intentional — all downstream pipeline
-    // measurements (afterAlwaysOnTokens, finalTokens, wireTokens) are also in
-    // OpenAI internal format, so the delta (tokensSaved) is format-consistent.
-    //
-    // What this excludes from the baseline:
-    //   - Anthropic cache_control markers stripped during translation (~4 tokens
-    //     per block — typically <1% of total tokens)
-    //   - Gemini inline content restructuring (handled separately by
-    //     extractGeminiInlineContent before this measurement)
-    //
-    // For academic benchmarking: capture rawRequestBytes = Buffer.byteLength(rawBody)
-    // before JSON.parse as a format-independent baseline reference.
-    // ─────────────────────────────────────────────────────────────────────────────
-    const trueBaselineTokens = countTokens(payload);
 
     // ─────────────────────────────────────────────────────────────────────────────
     // PASSTHROUGH MODE (CF_MODE=passthrough)
@@ -512,20 +499,15 @@ const server = http.createServer((req, res) => {
 
       console.log(`[Metrics] Total E2E Latency: ${passthroughLatencyMs.toFixed(2)}ms`);
       if (passthroughGhostRetries > 0) {
-        console.log(`[Metrics] Ghost Retries:      ${passthroughGhostRetries}`);
+        console.log(
+          `[Metrics] Background Hops:    ${passthroughGhostRetries} extra (${passthroughGhostRetries + 1} total LLM calls)`
+        );
         console.log(`[Metrics] Total Wire Tokens:  ${passthroughWireTokens}`);
       }
       return;
     }
 
     // ── Always-on stages ──
-    timer.time(STAGES.MINIMIZE_TOOLS, () => {
-      payload = minimizeToolSchemas(payload);
-      if (payload._cf_minimizeTokensSaved) {
-        timer.recordTokenSavings(STAGES.MINIMIZE_TOOLS, payload._cf_minimizeTokensSaved);
-        delete payload._cf_minimizeTokensSaved;
-      }
-    });
     timer.time(STAGES.DEDUPLICATE, () => {
       payload = injectContextForgeRule(payload);
       payload = deduplicateSystemMessages(payload);
@@ -713,13 +695,6 @@ const server = http.createServer((req, res) => {
       });
     }
 
-    // 3. Prune Tool Results
-    if (hasCompressibleContent) {
-      timer.time(STAGES.PRUNE, () => {
-        payload = pruneToolResults(payload);
-      });
-    }
-
     // 4. Tag Tool Results
     if (hasCompressibleContent) {
       await timer.timeAsync(STAGES.TAG, async () => {
@@ -731,13 +706,6 @@ const server = http.createServer((req, res) => {
     if (hasCompressibleContent) {
       await timer.timeAsync(STAGES.SEMANTIC_DEDUP, async () => {
         payload = await applySemanticDedup(payload);
-      });
-    }
-
-    // 6. Slice JSON Tool Results
-    if (hasCompressibleContent) {
-      timer.time(STAGES.SLICE_CODE, () => {
-        payload = sliceJsonToolResults(payload);
       });
     }
 
@@ -782,6 +750,20 @@ const server = http.createServer((req, res) => {
       payload = applyCCRPipeline(payload, ccrBaseline);
     });
 
+    // 11b. Minimize Tool Schemas — runs AFTER all tool injection
+    // Graph tool, patch tool, read tool (injected in GRAPH_INJECT) and
+    // retrieve tool (injected in CCR_PIPELINE) are now all present.
+    // Minimizing here ensures every injected tool schema gets truncated.
+    // The internal hash cache means already-minimized combinations are
+    // returned instantly on subsequent turns with identical tool sets.
+    timer.time(STAGES.MINIMIZE_TOOLS, () => {
+      payload = minimizeToolSchemas(payload);
+      if (payload._cf_minimizeTokensSaved) {
+        timer.recordTokenSavings(STAGES.MINIMIZE_TOOLS, payload._cf_minimizeTokensSaved);
+        delete payload._cf_minimizeTokensSaved;
+      }
+    });
+
     // 12. Inject Memory Context
     await timer.timeAsync(STAGES.MEMORY_CONTEXT, async () => {
       const memDecision = MemoryDecision.decide({
@@ -800,11 +782,6 @@ const server = http.createServer((req, res) => {
           console.log(`[Memory] Injected ${ctx.length} chars for user=${userId}`);
         }
       }
-    });
-
-    // 13. Align Cache Prefix
-    timer.time(STAGES.CACHE_ALIGN, () => {
-      payload = alignCachePrefix(payload, clientAdapter.name);
     });
 
     const pipelineLatencyMs = performance.now() - startTime;
@@ -925,8 +902,13 @@ const server = http.createServer((req, res) => {
       );
     }
     if (ghostRetries > 0) {
-      console.log(`[Metrics] Ghost Retries:      ${ghostRetries}`);
-      console.log(`[Metrics] Total Wire Tokens:  ${wireTokens} (${ghostRetries + 1} LLM hops)`);
+      // ghostRetries = hopCount - 1 = total extra LLM round-trips beyond the first
+      // This includes both exploration hops (graph/read) and failure retries.
+      // The failure budget (retryCount) is tracked separately inside the interceptor.
+      console.log(
+        `[Metrics] Background Hops:    ${ghostRetries} extra (${ghostRetries + 1} total LLM calls)`
+      );
+      console.log(`[Metrics] Total Wire Tokens:  ${wireTokens}`);
     }
     console.log(`[Metrics] Pipeline Latency:   ${pipelineLatencyMs.toFixed(2)}ms`);
     console.log(`[Metrics] Total E2E Latency:  ${totalLatencyMs.toFixed(2)}ms`);

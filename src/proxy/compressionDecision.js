@@ -1,41 +1,45 @@
 /**
- * CompressionDecision — canonical "should this request be compressed?" gate.
+ * compressionDecision.js
  *
+ * Canonical "should this request be compressed?" gate.
  *
  * Pre-this-module, compression ran unconditionally on every request.
  * This caused:
- * - Token counting pings (empty messages) running through the full pipeline
+ * - Token counting pings (empty messages) running through full pipeline
  * - No way to bypass compression for debugging
  * - No observability into WHY a request was not compressed
  *
  * Precedence (highest first):
- *   1. bypass_header   — x-contextforge-bypass: true
+ *   1. bypass_header        — x-contextforge-bypass: true
  *   2. compression_disabled — CF_OPTIMIZE=false env var
- *   3. no_messages     — empty/missing messages array
- *   4. otherwise       — compress
+ *   3. no_messages          — empty/missing messages array
+ *   4. token_minimum        — below 500 tokens (ping/trivial request)
+ *   5. otherwise            — compress
+ *
+ * Fixes applied:
+ *   CD-2: bypass header checked BEFORE token counting — header check is O(1),
+ *         countTokens is O(n). Bypassed requests no longer pay token count cost.
+ *
+ *   CD-3: precomputedTokens now accepted and used — server.js computes
+ *         trueBaselineTokens before this call and passes it. Previously
+ *         ignored, causing a redundant O(n) token count on every request.
+ *
+ *   CD-6: JSDoc updated to document precomputedTokens parameter.
  */
+
+import { countTokens } from "../compression/compressionHelper.js";
 
 // ─────────────────────────────────────────────
 // Bypass header detection
 // ─────────────────────────────────────────────
 
-/**
- * Check if the request has an explicit bypass header.
- */
-
-import { countTokens } from "../compression/compressionHelper.js";
-
 export function isBypassEnabled(headers) {
-  // Direct bypass header
-  const bypass =
-    headers["x-contextforge-bypass"] || "";
+  const bypass = headers["x-contextforge-bypass"] || "";
   if (["true", "1", "yes", "on"].includes(bypass.toLowerCase().trim())) {
     return true;
   }
 
-  // Mode header
-  const mode =
-    headers["x-contextforge-mode"] || "";
+  const mode = headers["x-contextforge-mode"] || "";
   if (mode.toLowerCase().trim() === "passthrough") {
     return true;
   }
@@ -55,69 +59,90 @@ export class CompressionDecision {
     configOptimizeEnabled,
     hasMessages,
   }) {
-    // Freeze so downstream code cannot mutate the decision
-    this.shouldCompress = shouldCompress;
-    this.passthroughReason = passthroughReason; // null when compressing
-    this.bypassHeaderSet = bypassHeaderSet;
+    this.shouldCompress        = shouldCompress;
+    this.passthroughReason     = passthroughReason;
+    this.bypassHeaderSet       = bypassHeaderSet;
     this.configOptimizeEnabled = configOptimizeEnabled;
-    this.hasMessages = hasMessages;
+    this.hasMessages           = hasMessages;
     Object.freeze(this);
   }
 
   /**
    * Factory — the only correct way to create a CompressionDecision.
    *
-   * @param {object} headers    - Inbound request headers object
-   * @param {boolean} optimize  - From config/env (CF_OPTIMIZE env var)
-   * @param {Array}   messages  - messages array from parsed payload
+   * @param {object}      headers            - Inbound request headers
+   * @param {boolean}     optimize           - From CF_OPTIMIZE env var
+   * @param {Array}       messages           - messages array from payload
+   * @param {object}      payload            - Full payload (fallback for token count)
+   * @param {number}      [precomputedTokens] - Token count already computed upstream.
+   *                                           Pass trueBaselineTokens to avoid
+   *                                           redundant O(n) recount.
    */
-  static decide({ headers, optimize = true, messages, payload }) {
-    const tokenCount = countTokens(payload);
+  static decide({ headers, optimize = true, messages, payload, precomputedTokens }) {
+    // CD-2: Check cheap conditions first — bypass header is O(1).
+    // Previously countTokens ran before bypass check, wasting O(n) on
+    // every bypassed request.
 
-    if (tokenCount < 500) {
+    const bypass   = isBypassEnabled(headers);
+    const configOk = Boolean(optimize);
+    const hasMsgs  = Array.isArray(messages) && messages.length > 0;
+
+    if (bypass) {
       return new CompressionDecision({
-        shouldCompress: false,
-        passthroughReason: `${tokenCount} tokens below minimum (500)`,
-        bypassHeaderSet: false,
-        configOptimizeEnabled: Boolean(optimize),
-        hasMessages: Array.isArray(messages) && messages.length > 0,
+        shouldCompress:        false,
+        passthroughReason:     "bypass_header",
+        bypassHeaderSet:       true,
+        configOptimizeEnabled: configOk,
+        hasMessages:           hasMsgs,
       });
     }
 
-    const bypass = isBypassEnabled(headers);
-    const configOk = Boolean(optimize);
-    const hasMsgs = Array.isArray(messages) && messages.length > 0;
+    if (!configOk) {
+      return new CompressionDecision({
+        shouldCompress:        false,
+        passthroughReason:     "compression_disabled",
+        bypassHeaderSet:       false,
+        configOptimizeEnabled: false,
+        hasMessages:           hasMsgs,
+      });
+    }
 
-    let reason = null;
-    let should = false;
+    if (!hasMsgs) {
+      return new CompressionDecision({
+        shouldCompress:        false,
+        passthroughReason:     "no_messages",
+        bypassHeaderSet:       false,
+        configOptimizeEnabled: configOk,
+        hasMessages:           false,
+      });
+    }
 
-    if (bypass) {
-      reason = "bypass_header";
-      should = false;
-    } else if (!configOk) {
-      reason = "compression_disabled";
-      should = false;
-    } else if (!hasMsgs) {
-      reason = "no_messages";
-      should = false;
-    } else {
-      reason = null;
-      should = true;
+    // CD-3: Use precomputed token count if available — avoids redundant O(n)
+    // recount. server.js computes trueBaselineTokens before this call and
+    // passes it as precomputedTokens. Only fall back to countTokens if not provided.
+    const tokenCount = (typeof precomputedTokens === "number" && precomputedTokens > 0)
+      ? precomputedTokens
+      : countTokens(payload);
+
+    if (tokenCount < 500) {
+      return new CompressionDecision({
+        shouldCompress:        false,
+        passthroughReason:     `${tokenCount} tokens below minimum (500)`,
+        bypassHeaderSet:       false,
+        configOptimizeEnabled: configOk,
+        hasMessages:           hasMsgs,
+      });
     }
 
     return new CompressionDecision({
-      shouldCompress: should,
-      passthroughReason: reason,
-      bypassHeaderSet: bypass,
+      shouldCompress:        true,
+      passthroughReason:     null,
+      bypassHeaderSet:       false,
       configOptimizeEnabled: configOk,
-      hasMessages: hasMsgs,
+      hasMessages:           hasMsgs,
     });
   }
 
-  /**
-   * Stamp the passthrough reason into a tags object for observability.
-   * No-op when shouldCompress is true.
-   */
   applyToTags(tags) {
     if (this.passthroughReason !== null) {
       tags.passthrough_reason = this.passthroughReason;

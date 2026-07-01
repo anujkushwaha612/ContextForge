@@ -1,159 +1,133 @@
 #pragma once
+
 #include <napi.h>
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <queue>
 #include <sqlite3.h>
-
-// Forward declare hnswlib types (already vendored for SemanticCache)
 #include "hnswlib/hnswlib/hnswlib.h"
 
 namespace contextforge {
 
 // ─────────────────────────────────────────────
-// One memory entry (mirrors SQLite row)
+// MemoryEntry — one memory row
 // ─────────────────────────────────────────────
 struct MemoryEntry {
-  std::string id;
-  std::string user_id;
-  std::string workspace;
-  std::string content;
-  float       importance;
-  int64_t     created_at;
-  int64_t     updated_at;
-  std::string metadata_json;
-
-  // Embedding vector (dim = 50 for GloVe-50d)
-  std::vector<float> embedding;
+    std::string        id;
+    std::string        user_id;
+    std::string        workspace;
+    std::string        content;
+    float              importance;
+    int64_t            created_at;
+    int64_t            updated_at;
+    std::string        metadata_json;
+    std::vector<float> embedding;
 };
 
 // ─────────────────────────────────────────────
-// Search result
+// MemorySearchResult — one search result row
 // ─────────────────────────────────────────────
 struct MemorySearchResult {
-  std::string id;
-  std::string content;
-  float       score;         // cosine similarity
-  int64_t     created_at;
-  std::string metadata_json;
+    std::string id;
+    std::string content;
+    float       score;
+    int64_t     created_at;
+    std::string metadata_json;
 };
 
 // ─────────────────────────────────────────────
 // PersistentMemoryStore
-// SQLite-backed vector store with HNSW index
-// Survives server restarts
+//
+// SQLite-backed vector store with in-memory HNSW index.
+// Survives server restarts — HNSW is rebuilt from SQLite on startup.
+//
+// Changes from original header:
+//   - vector_dim default changed from 50 (GloVe) to 384 (all-MiniLM-L6-v2)
+//   - freed_labels_ queue added for PM-8 label recycling
+//   - textSearch() removed from public interface (stub was silent empty array)
+//   - insertRow/deleteRow removed (direct SQL in .cpp, no separate helpers needed)
+//   - JS_* methods removed (NAPI wrapper is a separate class)
 // ─────────────────────────────────────────────
 class PersistentMemoryStore {
 public:
-  explicit PersistentMemoryStore(
-    const std::string& db_path,
-    int                vector_dim = 50  // GloVe-50d
-  );
-  ~PersistentMemoryStore();
+    // PM-10: Default dim changed to 384 — matches all-MiniLM-L6-v2
+    explicit PersistentMemoryStore(
+        const std::string& db_path,
+        int                vector_dim = 384);
+    ~PersistentMemoryStore();
 
-  // Save a memory entry with pre-computed embedding
-  std::string save(const MemoryEntry& entry);
+    std::string save(const MemoryEntry& entry);
 
-  // Search by embedding vector — returns top-k results
-  std::vector<MemorySearchResult> search(
-    const std::vector<float>& query_embedding,
-    const std::string&        user_id,
-    const std::string&        workspace,
-    int                       top_k,
-    float                     min_similarity
-  );
+    std::vector<MemorySearchResult> search(
+        const std::vector<float>& query_embedding,
+        const std::string&        user_id,
+        const std::string&        workspace,
+        int                       top_k,
+        float                     min_similarity);
 
-  // BM25 text search (delegates to tokenized content)
-  std::vector<MemorySearchResult> textSearch(
-    const std::string& query,
-    const std::string& user_id,
-    const std::string& workspace,
-    int                top_k
-  );
+    std::vector<MemorySearchResult> list(
+        const std::string& user_id,
+        const std::string& workspace,
+        int                limit);
 
-  // List recent entries
-  std::vector<MemorySearchResult> list(
-    const std::string& user_id,
-    const std::string& workspace,
-    int                limit
-  );
+    bool update(
+        const std::string&        id,
+        const std::string&        new_content,
+        const std::vector<float>& new_embedding);
 
-  // Update content + re-embed
-  bool update(
-    const std::string& id,
-    const std::string& new_content,
-    const std::vector<float>& new_embedding
-  );
+    bool remove(const std::string& id);
 
-  // Delete entry
-  bool remove(const std::string& id);
-
-  // Get entry count
-  int count(const std::string& user_id, const std::string& workspace);
-
-  // N-API registration
-  static Napi::Object Init(Napi::Env env, Napi::Object exports);
+    int count(const std::string& user_id, const std::string& workspace);
 
 private:
-  sqlite3*    db_;
-  int         dim_;
-  std::string db_path_;
+    sqlite3*    db_;
+    int         dim_;
+    std::string db_path_;
 
-  // In-memory HNSW index (rebuilt from SQLite on startup)
-  hnswlib::HierarchicalNSW<float>* hnsw_;
-  hnswlib::InnerProductSpace*      space_;
+    hnswlib::HierarchicalNSW<float>* hnsw_;
+    hnswlib::InnerProductSpace*      space_;
 
-  // Map: HNSW label → memory id
-  std::unordered_map<hnswlib::labeltype, std::string> label_to_id_;
-  // Map: memory id → HNSW label
-  std::unordered_map<std::string, hnswlib::labeltype> id_to_label_;
-  hnswlib::labeltype next_label_ = 0;
+    std::unordered_map<hnswlib::labeltype, std::string> label_to_id_;
+    std::unordered_map<std::string, hnswlib::labeltype> id_to_label_;
+    hnswlib::labeltype next_label_ = 0;
 
-  // SQLite helpers
-  void initSchema();
-  void loadAllIntoHNSW();
-  void insertRow(const MemoryEntry& entry);
-  void deleteRow(const std::string& id);
+    // PM-8: Freed label recycling — prevents next_label_ growing unboundedly
+    // after many delete+insert cycles would eventually exceed max_elements.
+    std::queue<hnswlib::labeltype> freed_labels_;
 
-  // HNSW helpers
-  void addToHNSW(const std::string& id, const std::vector<float>& embedding);
-  void removeFromHNSW(const std::string& id);
+    void initSchema();
+    void loadAllIntoHNSW();
 
-  // Cosine similarity (L2-normalized → inner product)
-  static std::vector<float> l2Normalize(const std::vector<float>& v);
+    void addToHNSW(const std::string& id, const std::vector<float>& embedding);
+    void removeFromHNSW(const std::string& id);
 
-  // N-API instance methods
-  Napi::Value JS_Save(const Napi::CallbackInfo& info);
-  Napi::Value JS_Search(const Napi::CallbackInfo& info);
-  Napi::Value JS_TextSearch(const Napi::CallbackInfo& info);
-  Napi::Value JS_List(const Napi::CallbackInfo& info);
-  Napi::Value JS_Update(const Napi::CallbackInfo& info);
-  Napi::Value JS_Remove(const Napi::CallbackInfo& info);
-  Napi::Value JS_Count(const Napi::CallbackInfo& info);
-
-  static Napi::Object EntryToJS(
-    Napi::Env env,
-    const MemorySearchResult& r
-  );
+    static std::vector<float> l2Normalize(const std::vector<float>& v);
 };
 
+// ─────────────────────────────────────────────
 // N-API wrapper
+//
+// PM-11: textSearch removed from registered methods — the stub always
+//        returned an empty array with no warning. Text search is handled
+//        in JS via hybridRetriever.sparseSearch.
+// ─────────────────────────────────────────────
 class PersistentMemoryStoreNAPI
-  : public Napi::ObjectWrap<PersistentMemoryStoreNAPI> {
+    : public Napi::ObjectWrap<PersistentMemoryStoreNAPI> {
 public:
-  static Napi::Object Init(Napi::Env env, Napi::Object exports);
-  explicit PersistentMemoryStoreNAPI(const Napi::CallbackInfo& info);
+    static Napi::Object Init(Napi::Env env, Napi::Object exports);
+    explicit PersistentMemoryStoreNAPI(const Napi::CallbackInfo& info);
 
 private:
-  std::unique_ptr<PersistentMemoryStore> store_;
+    std::unique_ptr<PersistentMemoryStore> store_;
 
-  Napi::Value Save(const Napi::CallbackInfo& info);
-  Napi::Value Search(const Napi::CallbackInfo& info);
-  Napi::Value TextSearch(const Napi::CallbackInfo& info);
-  Napi::Value List(const Napi::CallbackInfo& info);
-  Napi::Value Update(const Napi::CallbackInfo& info);
-  Napi::Value Remove(const Napi::CallbackInfo& info);
-  Napi::Value Count(const Napi::CallbackInfo& info);
+    Napi::Value Save(const Napi::CallbackInfo& info);
+    Napi::Value Search(const Napi::CallbackInfo& info);
+    Napi::Value List(const Napi::CallbackInfo& info);
+    Napi::Value Update(const Napi::CallbackInfo& info);
+    Napi::Value Remove(const Napi::CallbackInfo& info);
+    Napi::Value Count(const Napi::CallbackInfo& info);
+    // TextSearch intentionally omitted — handled in JS layer
 };
 
 } // namespace contextforge

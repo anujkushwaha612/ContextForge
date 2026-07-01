@@ -6,34 +6,35 @@ import crypto from "node:crypto";
 
 class SessionState {
   constructor(workspaceKey) {
-    this.workspaceKey     = workspaceKey;
-    this.hasDoneCCR       = false;
-    this.turnNumber       = 0;
-    this.createdAt        = Date.now();
-    this.lastActiveAt     = Date.now();
-    this.vaultIdsInjected = new Set();
+    this.workspaceKey = workspaceKey;
+    this.turnNumber = 0;
+    this.createdAt = Date.now();
+    this.lastActiveAt = Date.now();
 
-    // ── NEW ──
-    // Vault IDs seen across ALL prior turns in this session.
-    // Used by applyCCRPipeline to avoid re-scanning history messages
-    // for markers — instead we carry forward what we already know.
-    this.knownVaultIds = new Set();
+    // Vault IDs discovered in any message in this session.
+    // Used to avoid re-scanning old messages.
+    this.discoveredVaultIds = new Set();
+
+    // Vault IDs the LLM has SUCCESSFULLY retrieved via contextforge_retrieve.
+    // These are excluded from injection — content is already in context.
+    // FIX: Replaces hasDoneCCR (permanent boolean) and knownVaultIds
+    // (used to force inject=true forever). Now tracks per-vault retrieval
+    // so injection only fires for genuinely unretrieved stubs.
+    this.retrievedVaultIds = new Set();
   }
 
-  markCCRDone(vaultId) {
-    this.hasDoneCCR = true;
+  // Called when a [CF_VAULT:] stub is found in a message
+  addDiscoveredVaultId(vaultId) {
+    if (vaultId) this.discoveredVaultIds.add(vaultId);
+  }
+
+  // Called when the LLM successfully retrieves a vault
+  markVaultRetrieved(vaultId) {
     if (vaultId) {
-      this.vaultIdsInjected.add(vaultId);
-      this.knownVaultIds.add(vaultId);  // ── NEW: keep in sync
+      this.retrievedVaultIds.add(vaultId);
+      this.discoveredVaultIds.add(vaultId); // keep in sync
     }
     this.lastActiveAt = Date.now();
-  }
-
-  // ── NEW ──
-  // Called by applyCCRPipeline when a vault ID is found
-  // in new messages. Persists it so future turns don't rescan.
-  addKnownVaultId(vaultId) {
-    if (vaultId) this.knownVaultIds.add(vaultId);
   }
 
   incrementTurn() {
@@ -49,8 +50,8 @@ class SessionState {
 
 export class SessionRegistry {
   constructor({ sessionTtlMs = 2 * 60 * 60 * 1000 } = {}) {
-    this._sessions        = new Map();
-    this._sessionTtlMs    = sessionTtlMs;
+    this._sessions = new Map();
+    this._sessionTtlMs = sessionTtlMs;
 
     this._cleanupInterval = setInterval(
       () => this._cleanup(),
@@ -63,8 +64,8 @@ export class SessionRegistry {
     if (!this._sessions.has(sessionId)) {
       this._sessions.set(sessionId, new SessionState(workspaceKey));
     }
-    const session         = this._sessions.get(sessionId);
-    session.lastActiveAt  = Date.now();
+    const session = this._sessions.get(sessionId);
+    session.lastActiveAt = Date.now();
     return session;
   }
 
@@ -72,9 +73,10 @@ export class SessionRegistry {
     const messages = payload.messages || [];
     for (const msg of messages) {
       if (msg.role === "user") {
-        const content = typeof msg.content === "string"
-          ? msg.content
-          : JSON.stringify(msg.content);
+        const content =
+          typeof msg.content === "string"
+            ? msg.content
+            : JSON.stringify(msg.content);
         return crypto
           .createHash("sha256")
           .update(content.slice(0, 500))
@@ -89,9 +91,10 @@ export class SessionRegistry {
     const messages = payload.messages || [];
     for (const msg of messages) {
       if (msg.role === "system") {
-        const content = typeof msg.content === "string"
-          ? msg.content
-          : JSON.stringify(msg.content);
+        const content =
+          typeof msg.content === "string"
+            ? msg.content
+            : JSON.stringify(msg.content);
 
         const cwdMatch = content.match(
           /(?:cwd|working.?dir(?:ectory)?)[:\s]+([^\n]+)/i,
@@ -130,9 +133,9 @@ export class SessionRegistry {
 
   getStats() {
     return {
-      activeSessions:  this._sessions.size,
-      sessionsWithCCR: [...this._sessions.values()].filter(
-        (s) => s.hasDoneCCR,
+      activeSessions: this._sessions.size,
+      sessionsWithRetrievals: [...this._sessions.values()].filter(
+        (s) => s.retrievedVaultIds.size > 0,
       ).length,
     };
   }

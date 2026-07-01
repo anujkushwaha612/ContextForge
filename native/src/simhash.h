@@ -1,27 +1,19 @@
+// simhash.h
 #pragma once
 #include <napi.h>
-#include <string>
-#include <vector>
 #include <cstdint>
 
 namespace contextforge {
 
-// ─────────────────────────────────────────────
-// Core SimHash — FNV-1a 4-grams, 64-bit fingerprint
-// ~200x faster than JS crypto.createHash MD5
-// ─────────────────────────────────────────────
-
+// FNV-1a 64-bit SimHash over 4-grams.
+// Used by semanticDedup.js to fingerprint tool result content.
 uint64_t simhash64(const char* text, size_t len);
 
+// Hamming distance between two 64-bit fingerprints.
+// Maps to a single POPCNT instruction on x86/ARM.
 uint32_t hammingDistance64(uint64_t a, uint64_t b);
 
-// Count unique items using SimHash clustering
-uint32_t countUniqueSimhash(
-  const std::vector<std::string>& items,
-  uint32_t threshold = 3
-);
-
-// N-API registration
+// N-API registration — exports: simhash, hammingDistance
 Napi::Object InitSimHash(Napi::Env env, Napi::Object exports);
 
 } // namespace contextforge
