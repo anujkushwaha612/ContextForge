@@ -16,6 +16,7 @@ namespace contextforge {
 
 struct StmtGuard {
     sqlite3_stmt* stmt = nullptr;
+    StmtGuard() = default;
     ~StmtGuard() { if (stmt) sqlite3_finalize(stmt); }
     StmtGuard(const StmtGuard&)            = delete;
     StmtGuard& operator=(const StmtGuard&) = delete;

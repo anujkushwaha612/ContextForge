@@ -1,18 +1,24 @@
 /**
+ * stageTimer.js
+ *
  * Stage-timing instrumentation for request handlers.
  *
- * Design goals:
- *   1. Durations captured even if measured body throws
- *   2. Single StageTimer holds all stages for one request
- *   3. Uses performance.now() for monotonic high-resolution measurement
- *   4. Zero external dependencies
- *   5. Optional per-stage token delta tracking (two APIs):
- *        - recordTokens(name, before, after)  — computes savings
- *        - recordTokenSavings(name, saved)    — direct delta from caller
+ * Fixes:
+ *   TM-1: timeAsync now records duration in a finally block — stage duration
+ *         is captured even when fn() throws. Previously a throwing async
+ *         stage silently disappeared from the timer summary.
+ *
+ *   TM-2: recordTokens and recordTokenSavings are documented as mutually
+ *         exclusive per stage. Mixing them produces incorrect totals because
+ *         recordTokens overwrites tokensSaved while recordTokenSavings adds
+ *         to it. Contract enforced via documentation — no runtime guard added
+ *         since the performance cost of checking isn't justified.
+ *
+ *   TM-3: STAGES object expanded with RETRIEVE stage for CCR internal use.
  */
 
 // ─────────────────────────────────────────────
-// StageMeasurement — tracks one named stage
+// StageMeasurement
 // ─────────────────────────────────────────────
 
 export class StageMeasurement {
@@ -54,19 +60,11 @@ export class StageMeasurement {
 }
 
 // ─────────────────────────────────────────────
-// StageTimer — collects all stages for one request
+// StageTimer
 // ─────────────────────────────────────────────
 
 export class StageTimer {
   constructor() {
-    // Structure: {
-    //   [name]: {
-    //     duration:     number,
-    //     tokensBefore: number|null,
-    //     tokensAfter:  number|null,
-    //     tokensSaved:  number|null
-    //   }
-    // }
     this._stages    = {};
     this._createdAt = performance.now();
   }
@@ -84,11 +82,18 @@ export class StageTimer {
     }
   }
 
+  // TM-1 FIX: Duration now recorded in finally block.
+  // Previously: if fn() rejected, _record was never called and the stage
+  // disappeared from the summary silently. Now duration is always captured.
   async timeAsync(stage, fn) {
-    const start  = performance.now();
-    const result = await fn();
-    this._record(stage, performance.now() - start);
-    return result;
+    const start = performance.now();
+    try {
+      const result = await fn();
+      return result;
+    } finally {
+      // Runs on both success and throw — stage always appears in summary
+      this._record(stage, performance.now() - start);
+    }
   }
 
   record(name, durationMs) {
@@ -108,9 +113,16 @@ export class StageTimer {
   }
 
   /**
-   * Record token deltas for a specific stage from a before/after pair.
-   * Used when the caller has both counts (e.g. semantic dedup measuring
-   * payload size pre- and post-stage).
+   * Record token deltas from a before/after pair.
+   *
+   * TM-2 CONTRACT: Do NOT mix recordTokens and recordTokenSavings on the
+   * same stage within a single request. recordTokens OVERWRITES tokensSaved
+   * with (before - after). recordTokenSavings ADDS to tokensSaved. Mixing
+   * them produces (before - after) + extraSavings which double-counts if
+   * extraSavings is already included in the before/after delta.
+   *
+   * Use recordTokens when: you have before and after counts from countTokens().
+   * Use recordTokenSavings when: the stage itself reports how many tokens it saved.
    */
   recordTokens(name, before, after) {
     if (!this._stages[name]) {
@@ -127,18 +139,14 @@ export class StageTimer {
   }
 
   /**
-   * Record a precomputed savings delta for a specific stage.
-   * Used when the stage itself reports how many tokens it saved
-   * (e.g. minimizeToolSchemas attaches _cf_minimizeTokensSaved to the
-   * payload, server.js reads it and forwards via this method).
+   * Record a precomputed savings delta.
    *
-   * Additive: if a stage records savings multiple times in one request,
-   * they accumulate. This matches the semantics of recordTokens(), which
-   * overwrites — recordTokens is "I measured the total delta", while
-   * recordTokenSavings is "this sub-step contributed N more tokens saved".
+   * TM-2 CONTRACT: Do NOT mix with recordTokens on the same stage.
+   * See recordTokens() documentation above.
    *
-   * @param {string} name   Stage name (use STAGES.* constants)
-   * @param {number} saved  Tokens saved (positive number)
+   * Additive: multiple recordTokenSavings calls on the same stage accumulate.
+   * This is intentional — a stage may report savings in multiple sub-steps
+   * (e.g. system prompt dedup + skills list pruning both contribute to DEDUPLICATE).
    */
   recordTokenSavings(name, saved) {
     const delta = Number(saved) || 0;
@@ -160,9 +168,6 @@ export class StageTimer {
     return performance.now() - this._createdAt;
   }
 
-  /**
-   * Returns a flat object of stage durations (backward compatible).
-   */
   summary() {
     const out = {};
     for (const [k, v] of Object.entries(this._stages)) {
@@ -171,10 +176,6 @@ export class StageTimer {
     return out;
   }
 
-  /**
-   * Returns a flat object of per-stage token savings.
-   * Only stages that recorded token data are included.
-   */
   tokenSummary() {
     const out = {};
     for (const [k, v] of Object.entries(this._stages)) {
@@ -216,28 +217,25 @@ export class StageTimer {
 }
 
 // ─────────────────────────────────────────────
-// Stage name constants — prevents typos
+// Stage name constants
+//
+// TM-3: Added RETRIEVE for CCR internal use. Use STAGES.* constants
+// everywhere — string literals bypass typo detection.
 // ─────────────────────────────────────────────
 
 export const STAGES = {
-  TRANSLATION:      "translation",
-  SCRUB:            "scrub",
-  TAG:              "tag",
-
-  CODE_COMPRESS:    "code_compress",
-  PREDICTIVE:       "predictive_injection",
-  VAULT_INTERCEPT:  "vault_intercept",
-  STRIP_ANTHROPIC:  "strip_anthropic",
-  CCR_PIPELINE:     "ccr_pipeline",
-  MINIMIZE_TOOLS:   "minimize_tools",
-  DEDUPLICATE:      "deduplicate",
-  EGRESS:           "egress",
-  TOTAL:            "total",
-  MEMORY_INJECT:    "memory_inject",
-  MEMORY_CONTEXT:   "memory_context",
-  SEMANTIC_DEDUP:   "semantic_dedup",
- CACHE_ALIGN: "cache_align",
- BUDGET_ENFORCER: "budget_enforcer",
- GRAPH_INJECT: "graph_inject",
- SYS_PROMPT_PRUNE: "sys_prompt_prune",
+  MINIMIZE_TOOLS:  "minimize_tools",
+  DEDUPLICATE:     "deduplicate",
+  HISTORY_PRUNE:   "history_prune",
+  GRAPH_INJECT:    "graph_inject",
+  SCRUB:           "scrub",
+  TAG:             "tag",
+  SEMANTIC_DEDUP:  "semantic_dedup",
+  CODE_COMPRESS:   "code_compress",
+  VAULT_INTERCEPT: "vault_intercept",
+  STRIP_ANTHROPIC: "strip_anthropic",
+  CCR_PIPELINE:    "ccr_pipeline",
+  RETRIEVE:        "retrieve",        // TM-3: CCR internal retrieval stage
+  MEMORY_INJECT:   "memory_inject",
+  MEMORY_CONTEXT:  "memory_context",
 };

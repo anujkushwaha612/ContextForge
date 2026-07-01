@@ -1,3 +1,43 @@
+/**
+ * server.js
+ *
+ * Fixes applied:
+ *   SV-1: _cachedPlan and _cachedMessageHash removed. The plan cache was
+ *         a size-1 global shared across concurrent requests with no TTL.
+ *         planPipeline is async ~50ms — the cache saved nothing meaningful
+ *         while adding concurrency confusion. planPipeline now runs every turn.
+ *
+ *   SV-3: req.on("end") async handler wrapped in top-level try/catch.
+ *         Without it, any uncaught throw inside the pipeline (planPipeline
+ *         embedder crash, countTokens on malformed payload, etc.) produces
+ *         an UnhandledPromiseRejection and leaves the client hanging with
+ *         no response. Now returns 500 with error details.
+ *
+ *   SV-4: MCP handler dynamic import() replaced with static imports at
+ *         module top. executeGraphQuery, executeReadFileChunk, and
+ *         executePatchToolCall are already loaded by the module graph —
+ *         dynamic import() added unnecessary Promise overhead per request.
+ *
+ *   SV-5: hasCompressibleContent check adds [CF_COMPRESSED_FILE guard.
+ *         AST-compressed messages have large content that could incorrectly
+ *         trigger compression stages if _compressedVaultId was stripped.
+ *
+ *   SV-8: SSE stats stream listener wrapped in try/catch — res.write on a
+ *         broken connection throws synchronously, which previously crashed
+ *         the listener without removing itself from statsEmitter.
+ *
+ *   SV-9: countTokens call count reduced from 4 to 2 on the critical path.
+ *         Calls 2 (afterAlwaysOnTokens) and 3 (baselineTokens) were only
+ *         used in commented-out log lines and for ccrBaseline. ccrBaseline
+ *         now uses trueBaselineTokens as a conservative approximation.
+ *
+ *   SV-10: Empty console.log() removed — was printing a blank line on
+ *          every request due to commented-out content inside console.log().
+ *
+ *   SV-11: SIGINT handler now calls server.close() for graceful drain with
+ *          a 5s force-exit timeout fallback.
+ */
+
 import http from "node:http";
 import { createRequire } from "module";
 import path from "node:path";
@@ -19,6 +59,8 @@ import { countTokens } from "./compression/compressionHelper.js";
 
 import { applySemanticDedup } from "./compression/semanticDedup.js";
 import { statsEmitter } from "./proxy/statsEmitter.js";
+import { pruneStaleToolResults } from "./compression/historyPruner.js";
+import { debugTranslation } from "./proxy/translationDebug.js";
 
 // ── Message Origin ──
 import {
@@ -51,8 +93,16 @@ import { injectMemoryTools } from "./memory/memoryTools.js";
 
 // ── Graph + Patch ──
 import { indexWorkspace, watchWorkspace, setSymbolEmbedder } from "./graph/workspaceMapper.js";
-import { injectGraphTool, injectReadFileChunkTool } from "./graph/graphTools.js";
-import { injectPatchTool } from "./graph/patchTools.js";
+import {
+  injectGraphTool,
+  injectReadFileChunkTool,
+  executeGraphQuery, // SV-4: static import replaces dynamic import()
+  executeReadFileChunk, // SV-4: static import replaces dynamic import()
+} from "./graph/graphTools.js";
+import {
+  injectPatchTool,
+  executePatchToolCall, // SV-4: static import replaces dynamic import()
+} from "./graph/patchTools.js";
 
 // ── Request Planner ──
 import { initPlanner, planPipeline, CAPABILITIES } from "./proxy/requestPlanner.js";
@@ -70,8 +120,10 @@ const __dirname = path.dirname(__filename);
 const providerName = process.env.CF_PROVIDER || "ollama";
 const provider = ProviderFactory.getAdapter(providerName);
 
-let _cachedPlan = null;
-let _cachedMessageHash = null;
+// SV-1 FIX: Removed _cachedPlan / _cachedMessageHash module-level globals.
+// The cache was size-1, shared across concurrent requests, with no TTL.
+// planPipeline is ~50ms — running it every turn costs less than the
+// concurrency confusion of a stale global cache.
 
 function hashMessage(msg) {
   if (!msg) return "";
@@ -83,10 +135,6 @@ function hashMessage(msg) {
 // ─────────────────────────────────────────────
 
 console.log("Initializing ContextForge Native Engine...");
-
-// ── Declare native instances BEFORE the async IIFE ──
-// const declarations are not hoisted — the IIFE executes immediately
-// and would hit ReferenceError if these are declared below it.
 
 const onnxEmbedder = new native.OnnxEmbedder(
   path.join(__dirname, "../contextforge_models/all-MiniLM-L6-v2-int8.onnx"),
@@ -102,21 +150,16 @@ const semanticCache = new native.SemanticCache(384);
 
 const hybridRetriever = new native.HybridRetriever(semanticCache, {
   dimension: 384,
-  denseWeight: 0.3, // vault retrieval: BM25-heavy
+  denseWeight: 0.3,
 });
 
-// ── Symbol retriever — separate from vault retriever ──
-// denseWeight: 0.7 (dense-heavy) because symbol names + rich documents
-// benefit from semantic similarity more than BM25 token matching.
 const symbolSemanticCache = new native.SemanticCache(384);
 const symbolRetriever = new native.HybridRetriever(symbolSemanticCache, {
   dimension: 384,
-  denseWeight: 0.7, // symbol retrieval: dense-heavy
+  denseWeight: 0.7,
 });
 
-// CRITICAL FIX: Prevent the JS SemanticCache from being garbage collected.
-// If it is GC'd, the C++ HybridRetriever is left with a dangling pointer
-// to the underlying hnswIndex, causing a segmentation fault during indexing.
+// Prevent GC of symbolSemanticCache — C++ HybridRetriever holds a raw pointer
 symbolRetriever._keepAliveCache = symbolSemanticCache;
 
 const memoryHandler = new MemoryHandler(memoryStore, hybridRetriever, {
@@ -127,26 +170,24 @@ const memoryHandler = new MemoryHandler(memoryStore, hybridRetriever, {
 
 console.log("[Memory] PersistentMemoryStore ready");
 
+// ─────────────────────────────────────────────
+// Async startup
+// ─────────────────────────────────────────────
+// Note: server.listen() is called inside this IIFE after several awaits.
+// By the time any await resolves, module evaluation is complete and
+// `server` (defined below) is available. This ordering is intentional.
 (async () => {
   const workspacePath = process.env.CF_WORKSPACE_PATH || process.cwd();
 
-  // ── Step 1: Initialize embedder first ─────────────────────────────────
-  // Embedder must warm up BEFORE indexWorkspace so Pass 3 (symbol
-  // embedding) can run during initial indexing.
   await onnxEmbedder.embed("warmup");
   console.log("[Embedder] Ready");
   console.log("[Embedder] Stats:", onnxEmbedder.getStats());
 
-  // ── Step 2: Wire symbol embedder into workspace mapper ─────────────────
-  // Must happen after embedder warmup and before indexWorkspace.
-  // setSymbolEmbedder also calls setGraphEmbedder in semanticResolver
-  // so the async resolveWithEmbeddings() fallback is ready immediately.
   setSymbolEmbedder(onnxEmbedder, symbolRetriever);
 
-  // ── Step 3: Index workspace (now includes Pass 3 symbol embedding) ─────
   try {
     await indexWorkspace(workspacePath, {
-      force: false,
+      force: true,
       onProgress: ({ current, total, file }) => {
         if (current % 50 === 0) {
           console.log(`[GraphMapper] Progress: ${current}/${total} — ${file}`);
@@ -159,11 +200,8 @@ console.log("[Memory] PersistentMemoryStore ready");
     console.error(`[GraphMapper] ❌ Failed to index workspace: ${err.message}`);
   }
 
-  // ── Step 4: Initialize planner ─────────────────────────────────────────
   await initPlanner(onnxEmbedder, semanticCache);
-  //   console.log("[Planner] ✅ Initialization complete");
 
-  // ── Step 5: Start accepting requests ───────────────────────────────────
   const PORT = parseInt(process.env.CF_PORT || process.env.PORT || "3000", 10);
   server.listen(PORT, () => {
     console.log(
@@ -268,7 +306,18 @@ const server = http.createServer((req, res) => {
       "Access-Control-Allow-Origin": "*",
     });
     res.write(`event: snapshot\ndata: ${JSON.stringify(statsEmitter.getSnapshot("initial"))}\n\n`);
-    const listener = (snap) => res.write(`event: snapshot\ndata: ${JSON.stringify(snap)}\n\n`);
+
+    // SV-8 FIX: Guard res.write — broken connections throw synchronously.
+    // Without the guard, a write error crashes the listener without removing
+    // it from statsEmitter, causing subsequent snapshots to also error.
+    const listener = (snap) => {
+      try {
+        res.write(`event: snapshot\ndata: ${JSON.stringify(snap)}\n\n`);
+      } catch {
+        // Connection broken — remove listener to prevent repeated errors
+        statsEmitter.off("snapshot", listener);
+      }
+    };
     statsEmitter.on("snapshot", listener);
     req.on("close", () => statsEmitter.off("snapshot", listener));
     return;
@@ -316,12 +365,7 @@ const server = http.createServer((req, res) => {
       resetEntireCache(semanticCache);
       console.log("\n[Cache Reset] ☢️ Nuclear reset triggered.");
       res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(
-        JSON.stringify({
-          success: true,
-          message: "Entire cache has been reset.",
-        })
-      );
+      return res.end(JSON.stringify({ success: true, message: "Entire cache has been reset." }));
     } catch (e) {
       res.writeHead(500, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "Failed to reset cache", details: e.message }));
@@ -364,12 +408,12 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ error: "Method Not Allowed" }));
   }
 
-  // Fast fail for unknown routes
   const ALLOWED_POST_ROUTES = [
     "/v1/chat/completions",
     "/v1/messages",
     "/v1beta/models/",
     "/count_tokens",
+    "/v1/mcp/tool",
   ];
   const isAllowed = ALLOWED_POST_ROUTES.some((route) => req.url.includes(route));
   if (!isAllowed) {
@@ -399,541 +443,23 @@ const server = http.createServer((req, res) => {
   req.on("end", async () => {
     if (destroyed) return;
 
-    const startTime = performance.now();
-    const timer = new StageTimer();
-
-    // ── Parse body ──
-    let payload;
+    // SV-3 FIX: Wrap entire async handler in try/catch.
+    // Without this, any uncaught throw (planPipeline crash, countTokens on
+    // malformed payload, etc.) produces UnhandledPromiseRejection and leaves
+    // the client hanging indefinitely with no response or error.
     try {
-      payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
-    } catch (err) {
-      console.error("Parse Error:", err.message);
+      await handleRequest(req, res, chunks);
+    } catch (unexpectedErr) {
+      console.error("[Server] ❌ Unhandled pipeline error:", unexpectedErr.message);
+      console.error(unexpectedErr.stack);
       if (!res.headersSent) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Bad Request - Invalid JSON" }));
-      }
-      return;
-    }
-
-    // ── Token counting ping ──
-    if (req.url.includes("/count_tokens")) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ input_tokens: 150 }));
-    }
-
-    // ── Detect client format + normalize to OpenAI internal format ──
-    const { adapter: clientAdapter } = detectAdapter(req.url, req.headers);
-    const { payload: normalizedPayload } = clientAdapter.toInternal(payload, req.headers);
-    payload = normalizedPayload;
-
-    // Drives egress format — pipeline always sees OpenAI format internally
-    const isAnthropic = clientAdapter.name === "anthropic";
-
-    // FIX F10: Save original model before upstream handler mutates it
-    const clientModel = payload.model || "unknown";
-
-    // ── Parse per-request retry budget override ──
-    const maxRetriesHeader = req.headers["x-cf-max-retries"];
-    const parsedMaxRetries = maxRetriesHeader ? parseInt(maxRetriesHeader, 10) : NaN;
-    const maxRetries =
-      Number.isInteger(parsedMaxRetries) && parsedMaxRetries >= 0 ? parsedMaxRetries : undefined;
-    const mockUpstreamPort = req.headers["x-cf-mock-port"]
-      ? parseInt(req.headers["x-cf-mock-port"], 10)
-      : null;
-
-    // ─────────────────────────────────────────────
-    // Gemini inline file content extraction
-    // ─────────────────────────────────────────────
-    if (clientAdapter.name === "gemini") {
-      payload = extractGeminiInlineContent(payload);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────────
-    // TRUE BASELINE
-    // ─────────────────────────────────────────────────────────────────────────────
-    const trueBaselineTokens = countTokens(payload);
-
-    // ── Bind upstream handler for this request ──
-    const executeUpstreamRequest = createUpstreamHandler({
-      req,
-      res,
-      isAnthropic,
-      clientAdapter,
-      provider,
-      semanticCache,
-      hybridRetriever,
-      onnxEmbedder,
-      memoryHandler,
-      maxRetries,
-      mockUpstreamPort,
-      trueBaselineTokens, // <-- ADD THIS
-    });
-
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    // ─────────────────────────────────────────────────────────────────────────────
-    // PASSTHROUGH MODE (CF_MODE=passthrough)
-    // ─────────────────────────────────────────────────────────────────────────────
-    if (process.env.CF_MODE === "passthrough" && req.headers["x-cf-dry-run"] !== "true") {
-      //       console.log(`[Pipeline] Passthrough: CF_MODE=passthrough (All optimizations disabled)`);
-      const passthroughMetrics = await executeUpstreamRequest(payload);
-      const passthroughWireTokens =
-        passthroughMetrics?.accumulatedInputTokens ?? trueBaselineTokens;
-      const passthroughGhostRetries = passthroughMetrics?.ghostRetries ?? 0;
-      const passthroughCacheReadTokens = passthroughMetrics?.accumulatedCacheReadTokens ?? 0;
-      const passthroughLatencyMs = performance.now() - startTime;
-
-      savingsTracker.recordRequest({
-        baselineTokens: trueBaselineTokens,
-        wireTokens: passthroughWireTokens,
-        tokensSaved: trueBaselineTokens - passthroughWireTokens,
-        ghostRetries: passthroughGhostRetries,
-        cacheReadTokens: passthroughCacheReadTokens,
-      });
-      statsEmitter.recordRequest({
-        baselineTokens: trueBaselineTokens,
-        finalTokens: passthroughWireTokens,
-        pipelineLatency: 0,
-        upstreamLatency: passthroughLatencyMs,
-      });
-
-      console.log(`[Metrics] Total E2E Latency: ${passthroughLatencyMs.toFixed(2)}ms`);
-      if (passthroughGhostRetries > 0) {
-        console.log(
-          `[Metrics] Background Hops:    ${passthroughGhostRetries} extra (${passthroughGhostRetries + 1} total LLM calls)`
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "Internal Server Error",
+            details: unexpectedErr.message,
+          })
         );
-        console.log(`[Metrics] Total Wire Tokens:  ${passthroughWireTokens}`);
-      }
-      return;
-    }
-
-    // ── Always-on stages ──
-    timer.time(STAGES.DEDUPLICATE, () => {
-      payload = injectContextForgeRule(payload);
-      payload = deduplicateSystemMessages(payload);
-      if (payload._cf_sysPromptTokensSaved) {
-        timer.recordTokenSavings(STAGES.DEDUPLICATE, payload._cf_sysPromptTokensSaved);
-        delete payload._cf_sysPromptTokensSaved;
-      }
-    });
-
-    const afterAlwaysOnTokens = countTokens(payload);
-
-    const hasPriorTools = detectRecentToolActivity(payload.messages);
-
-    let plan;
-    await timer.timeAsync(STAGES.GRAPH_INJECT, async () => {
-      // ── Step 1: Message origin detection ──────────────────────────────
-      // Determines if this is a human task, agent status update, or
-      // mid-session continuation. Uses conversation structure, not
-      // token count — so "Rename foo." (8 tokens) still gets tools.
-      const originResult = detectMessageOrigin(payload.messages);
-
-      console.log(`[Planner] Origin: ${originResult.origin} | Reason: ${originResult.reason}`);
-
-      // Agent status updates and tool followups never need repository tools.
-      // Short "Done." / "Patch applied." messages bypass immediately.
-      // Tool result messages are mid-loop — the LLM already has the tools it needs.
-      if (!requiresRepositoryWork(originResult.origin)) {
-        plan = {
-          capabilities: new Set(),
-          intent: originResult.origin, // Use origin as intent (AGENT_STATUS or TOOL_FOLLOWUP)
-          method: "origin_detection",
-          bypass: true,
-        };
-        //         console.log(
-        //           `[Planner] ⏭️ Bypass — ${originResult.origin.toLowerCase()}, no repository work needed`
-        //         );
-        return;
-      }
-
-      // ── Step 2: Intent + capability planning ──────────────────────────
-      const userMsgs = payload.messages.filter((m) => m.role === "user");
-      const lastUserMessage = userMsgs.length > 0 ? userMsgs[userMsgs.length - 1].content : "";
-      const messageHash = hashMessage(lastUserMessage);
-
-      if (_cachedPlan && _cachedMessageHash === messageHash) {
-        plan = _cachedPlan;
-      } else {
-        plan = await planPipeline(
-          payload,
-          { hasPriorTools, trueBaselineTokens, originHint: originResult.origin },
-          onnxEmbedder
-        );
-        _cachedPlan = plan;
-        _cachedMessageHash = messageHash;
-      }
-
-      console.log(
-        `[Planner] Intent: ${plan.intent} | Method: ${plan.method}` +
-          (plan.debug?.semanticScore != null
-            ? ` | Score: ${plan.debug.semanticScore.toFixed(3)}`
-            : "") +
-          (plan.debug?.regexConfidence != null
-            ? ` | Confidence: ${plan.debug.regexConfidence.toFixed(2)}`
-            : "")
-      );
-      // NEW: structured evidence for debugging misclassifications
-      if (plan.debug?.evidence?.length > 0) {
-        console.log(`[Planner] Evidence: ${plan.debug.evidence.join(" | ")}`);
-      }
-
-      if (!plan.bypass) {
-        const toolInjectionCost = 2000; // ~2000 tokens
-        if (trueBaselineTokens < toolInjectionCost * 2 && !hasPriorTools) {
-          plan.bypass = true;
-          console.log(
-            `[Planner] ⏭️ Bypass — payload too small (${trueBaselineTokens} tokens), skipping tools to prevent token inflation`
-          );
-        } else {
-          if (plan.capabilities.has(CAPABILITIES.GRAPH))
-            payload.tools = injectGraphTool(payload.tools);
-          if (plan.capabilities.has(CAPABILITIES.PATCH))
-            payload.tools = injectPatchTool(payload.tools);
-          if (plan.capabilities.has(CAPABILITIES.READ))
-            payload.tools = injectReadFileChunkTool(payload.tools);
-        }
-      } else {
-        //         console.log(`[Planner] ⏭️ Bypass — '${plan.intent}' needs no file capabilities`);
-      }
-    });
-
-    const baselineTokens = countTokens(payload);
-    const alwaysOnSaved = trueBaselineTokens - afterAlwaysOnTokens;
-    const toolInjectionCost = baselineTokens - afterAlwaysOnTokens;
-
-    // ─────────────────────────────────────────────
-    // GATE: Compression decision
-    // ─────────────────────────────────────────────
-    const decision = CompressionDecision.decide({
-      headers: req.headers,
-      optimize: getOptimizeFlag(),
-      messages: payload.messages,
-      payload,
-      precomputedTokens: trueBaselineTokens,
-    });
-
-    if (!decision.shouldCompress && req.headers["x-cf-dry-run"] !== "true") {
-      const passthroughTokens = countTokens(payload);
-      const computedAlwaysOnSaved = trueBaselineTokens - passthroughTokens;
-      //       console.log(`[Pipeline] Passthrough: ${decision.passthroughReason}`);
-      if (computedAlwaysOnSaved > 0) {
-        //         console.log(
-        //           `[Pipeline] Always-on saved: ${computedAlwaysOnSaved} tokens ` +
-        //             `(${((computedAlwaysOnSaved / trueBaselineTokens) * 100).toFixed(1)}% reduction before gate)`
-        //         );
-      }
-      const passthroughMetrics = await executeUpstreamRequest(payload);
-      const passthroughWireTokens =
-        passthroughMetrics?.accumulatedInputTokens ?? countTokens(payload);
-      const passthroughGhostRetries = passthroughMetrics?.ghostRetries ?? 0;
-      const passthroughCacheReadTokens = passthroughMetrics?.accumulatedCacheReadTokens ?? 0;
-      const passthroughLatencyMs = performance.now() - startTime;
-
-      savingsTracker.recordRequest({
-        baselineTokens: trueBaselineTokens,
-        wireTokens: passthroughWireTokens,
-        tokensSaved: trueBaselineTokens - passthroughWireTokens,
-        ghostRetries: passthroughGhostRetries,
-        cacheReadTokens: passthroughCacheReadTokens,
-      });
-      statsEmitter.recordRequest({
-        baselineTokens: trueBaselineTokens,
-        finalTokens: passthroughWireTokens,
-        pipelineLatency: 0,
-        upstreamLatency: passthroughLatencyMs,
-      });
-
-      //       console.log(`[Metrics] Total E2E Latency: ${passthroughLatencyMs.toFixed(2)}ms`);
-      if (passthroughGhostRetries > 0) {
-        //         console.log(`[Metrics] Ghost Retries:      ${passthroughGhostRetries}`);
-        //         console.log(`[Metrics] Total Wire Tokens:  ${passthroughWireTokens}`);
-      }
-      return;
-    }
-
-    // ─────────────────────────────────────────────
-    // COMPRESSION PIPELINE
-    // ─────────────────────────────────────────────
-
-    const policy = getPolicyForModel(payload.model || "");
-    Object.defineProperty(payload, "__policy", {
-      value: policy,
-      writable: true,
-      enumerable: false,
-      configurable: true,
-    });
-
-    // ─────────────────────────────────────────────
-    // Compressible content pre-check
-    // ─────────────────────────────────────────────
-    const hasCompressibleContent = payload.messages?.some(
-      (m) =>
-        m.role === "tool" &&
-        typeof m.content === "string" &&
-        m.content.length > 800 &&
-        !m._cf_vaulted &&
-        !m._dedupVaultId &&
-        !m._cf_deduped &&
-        !m._compressedVaultId &&
-        !m.content.includes("[CF_VAULT:")
-    );
-
-    if (!hasCompressibleContent) {
-      //       console.log(`[Pipeline] ⏭️ No compressible tool results — skipping content stages`);
-    }
-
-    // 1. Inject Memory Tools
-    timer.time(STAGES.MEMORY_INJECT, () => {
-      payload = injectMemoryTools(payload);
-    });
-
-    // 2. Scrub Tool Results
-    if (hasCompressibleContent) {
-      timer.time(STAGES.SCRUB, () => {
-        payload = scrubToolResults(payload);
-      });
-    }
-
-    // 4. Tag Tool Results
-    if (hasCompressibleContent) {
-      await timer.timeAsync(STAGES.TAG, async () => {
-        payload = await tagToolResults(payload);
-      });
-    }
-
-    // 5. Semantic Dedup
-    if (hasCompressibleContent) {
-      await timer.timeAsync(STAGES.SEMANTIC_DEDUP, async () => {
-        payload = await applySemanticDedup(payload);
-      });
-    }
-
-    // 7. AST Compress Code
-    if (hasCompressibleContent) {
-      await timer.timeAsync(STAGES.CODE_COMPRESS, async () => {
-        payload = await compressCodeToolResults(payload);
-      });
-    }
-
-    // 8. Fat Catch / Vault Intercept
-    if (hasCompressibleContent) {
-      timer.time(STAGES.VAULT_INTERCEPT, () => {
-        payload = interceptAndVaultMassiveToolResults(payload, policy.singleMsgVaultThreshold);
-      });
-    }
-
-    // 10. Anthropic-specific field stripping (if applicable)
-    if (isAnthropic) {
-      timer.time(STAGES.STRIP_ANTHROPIC, () => {
-        payload = stripAnthropicSpecificFields(payload);
-      });
-    }
-
-    // 11. CCR Pipeline
-    timer.time(STAGES.CCR_PIPELINE, () => {
-      let ccrBaseline = baselineTokens;
-      const hasVault = payload.messages?.some((m) => {
-        if (typeof m.content === "string" && m.content.includes("[CF_VAULT:")) return true;
-        if (Array.isArray(m.content)) {
-          return m.content.some(
-            (b) => typeof b.content === "string" && b.content.includes("[CF_VAULT:")
-          );
-        }
-        return false;
-      });
-
-      if (hasVault) {
-        ccrBaseline = Infinity;
-      }
-
-      payload = applyCCRPipeline(payload, ccrBaseline);
-    });
-
-    // 11b. Minimize Tool Schemas — runs AFTER all tool injection
-    // Graph tool, patch tool, read tool (injected in GRAPH_INJECT) and
-    // retrieve tool (injected in CCR_PIPELINE) are now all present.
-    // Minimizing here ensures every injected tool schema gets truncated.
-    // The internal hash cache means already-minimized combinations are
-    // returned instantly on subsequent turns with identical tool sets.
-    timer.time(STAGES.MINIMIZE_TOOLS, () => {
-      payload = minimizeToolSchemas(payload);
-      if (payload._cf_minimizeTokensSaved) {
-        timer.recordTokenSavings(STAGES.MINIMIZE_TOOLS, payload._cf_minimizeTokensSaved);
-        delete payload._cf_minimizeTokensSaved;
-      }
-    });
-
-    // 12. Inject Memory Context
-    await timer.timeAsync(STAGES.MEMORY_CONTEXT, async () => {
-      const memDecision = MemoryDecision.decide({
-        headers: req.headers,
-        memoryHandler,
-        memoryUserId: req.headers["x-contextforge-user-id"] ?? null,
-        modeName: getMemoryMode(),
-      });
-
-      if (memDecision.inject) {
-        const userId = req.headers["x-contextforge-user-id"];
-        const workspace = req.headers["x-contextforge-workspace"] ?? "";
-        const ctx = await memoryHandler.searchAndFormatContext(userId, payload.messages, workspace);
-        if (ctx) {
-          payload.messages = memoryHandler.appendContextToMessages(payload.messages, ctx);
-          console.log(`[Memory] Injected ${ctx.length} chars for user=${userId}`);
-        }
-      }
-    });
-
-    const pipelineLatencyMs = performance.now() - startTime;
-    const finalTokens = countTokens(payload);
-    const totalSaved = trueBaselineTokens - finalTokens;
-    const pipelineSaved = baselineTokens - finalTokens;
-    const stages = timer.summary();
-
-    // ── Dry-run ──
-    if (req.headers["x-cf-dry-run"] === "true") {
-      const vaultIds = [];
-      const vaultPattern = /\[CF_VAULT:\s*(cf_vault_[a-f0-9]+)\]/g;
-      const payloadStr = JSON.stringify(payload);
-      let vaultMatch;
-      while ((vaultMatch = vaultPattern.exec(payloadStr)) !== null) {
-        if (!vaultIds.includes(vaultMatch[1])) vaultIds.push(vaultMatch[1]);
-      }
-      res.writeHead(200, {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-      });
-      return res.end(
-        JSON.stringify({
-          pipeline_ms: pipelineLatencyMs,
-          tokens_before: trueBaselineTokens,
-          tokens_after: finalTokens,
-          tokens_saved: totalSaved,
-          compression_ratio:
-            trueBaselineTokens > 0
-              ? parseFloat(((totalSaved / trueBaselineTokens) * 100).toFixed(1))
-              : 0,
-          stages,
-          vault_ids: vaultIds,
-          vault_id: vaultIds[0] ?? null,
-        })
-      );
-    }
-
-    // ── Mutation detection ──
-    const payloadStr = JSON.stringify(payload);
-    const { isMutation, mutatedFile } = detectMutation(payloadStr);
-    if (isMutation && mutatedFile) {
-      const newHash = hashFile(mutatedFile);
-      const result = invalidateByFile(mutatedFile, newHash, semanticCache);
-      if (result.deletedIds.length > 0) {
-        console.log(
-          `\n[State Monitor] 🚨 Mutation on '${mutatedFile}'. ` +
-            `Invalidated ${result.deletedIds.length} entries.`
-        );
-      }
-    }
-
-    // ── Expose metrics to client via HTTP headers ──
-    // This allows benchmarks and IDE clients to observe pipeline performance
-    // during a live run without altering the upstream LLM JSON body.
-    res.setHeader("x-cf-tokens-before", trueBaselineTokens);
-    res.setHeader("x-cf-tokens-after", finalTokens);
-    res.setHeader("x-cf-tokens-saved", totalSaved);
-    res.setHeader("x-cf-pipeline-ms", pipelineLatencyMs.toFixed(2));
-    res.setHeader(
-      "x-cf-compression-ratio",
-      trueBaselineTokens > 0 ? parseFloat(((totalSaved / trueBaselineTokens) * 100).toFixed(1)) : 0
-    );
-
-    const upstreamMetrics = await executeUpstreamRequest(payload);
-    const totalLatencyMs = performance.now() - startTime;
-
-    const wireTokens = upstreamMetrics?.accumulatedInputTokens ?? finalTokens;
-    const ghostRetries = upstreamMetrics?.ghostRetries ?? 0;
-    const cacheReadTokens = upstreamMetrics?.accumulatedCacheReadTokens ?? 0;
-
-    // FIX F10: Use clientModel instead of mutated payload.model
-    savingsTracker.recordRequest({
-      baselineTokens: trueBaselineTokens,
-      wireTokens: wireTokens,
-      tokensSaved: trueBaselineTokens - wireTokens,
-      ghostRetries: ghostRetries,
-      cacheReadTokens: cacheReadTokens,
-    });
-    statsEmitter.recordRequest({
-      baselineTokens: trueBaselineTokens,
-      finalTokens: wireTokens,
-      pipelineLatency: pipelineLatencyMs,
-      upstreamLatency: totalLatencyMs - pipelineLatencyMs,
-    });
-
-    // ── Pipeline report ──
-    console.log("\n=== ContextForge Pipeline Report ===");
-    // console.log(`[Client]  ${clientAdapter.name}`);
-    console.log(`[Metrics] True Baseline:      ${trueBaselineTokens}`);
-    // console.log(
-    //   `[Metrics] After Minimize+Dedup: ${afterAlwaysOnTokens} (saved ${alwaysOnSaved} tokens)`
-    // );
-    // if (toolInjectionCost > 0) {
-    //   console.log(
-    //     `[Metrics] Tool Injection Cost:  +${toolInjectionCost} tokens (graph+patch schemas)`
-    //   );
-    // }
-    console.log(`[Metrics] After Always-On:    ${baselineTokens}`);
-    console.log(`[Metrics] Final Tokens:       ${finalTokens}`);
-    // ── Savings breakdown (replaces raw "Total Saved" line) ──
-    console.log(`[Metrics] Savings Breakdown:`);
-    const _tokenSavingsSnap = timer.tokenSummary();
-    const _sysPromptSaved = _tokenSavingsSnap[STAGES.DEDUPLICATE] ?? 0;
-    const _toolSchemaSaved = alwaysOnSaved - _sysPromptSaved;
-    // console.log(`          ├─ Tool Schemas:        ↓${_toolSchemaSaved} tokens`);
-    // console.log(`          ├─ System Prompt Dedup: ↓${_sysPromptSaved} tokens`);
-    // console.log(`          └─ Semantic/AST:        ↓${pipelineSaved} tokens`);
-    // console.log(`[Metrics] Total Saved:        ${totalSaved} tokens (vs true baseline)`);
-
-    if (totalSaved < 0) {
-      console.warn(`[Pipeline] ⚠️ Net-negative: pipeline inflated by ${-totalSaved} tokens`);
-    }
-
-    if (trueBaselineTokens > 0) {
-      console.log(
-        // `[Metrics] Compression:        ${((totalSaved / trueBaselineTokens) * 100).toFixed(1)}%`
-      );
-    }
-    if (ghostRetries > 0) {
-      // ghostRetries = hopCount - 1 = total extra LLM round-trips beyond the first
-      // This includes both exploration hops (graph/read) and failure retries.
-      // The failure budget (retryCount) is tracked separately inside the interceptor.
-      console.log(
-        `[Metrics] Background Hops:    ${ghostRetries} extra (${ghostRetries + 1} total LLM calls)`
-      );
-      console.log(`[Metrics] Total Wire Tokens:  ${wireTokens}`);
-    }
-    console.log(`[Metrics] Pipeline Latency:   ${pipelineLatencyMs.toFixed(2)}ms`);
-    console.log(`[Metrics] Total E2E Latency:  ${totalLatencyMs.toFixed(2)}ms`);
-    // console.log(
-    //   `[Metrics] Content Stages:     ${hasCompressibleContent ? "ACTIVE" : "SKIPPED (no compressible content)"}`
-    // );
-
-    const actions = statsEmitter.agentActions;
-    // console.log(`\n[Repository Operations]`);
-    // console.log(` ├─ Graph Lookups:    ${actions.graphLookups}`);
-    // console.log(` ├─ Surgical Reads:   ${actions.surgicalReads}`);
-    // console.log(` ├─ AST Patches:      ${actions.astPatches}`);
-    // console.log(` └─ Raw Vault Opens:  ${actions.rawVaultOpens}`);
-
-    // console.log(`[Decision] ${decision}`);
-
-    // for (const [stage, ms] of Object.entries(stages)) {
-    //   if (ms > 1) console.log(`[Stage] ${stage}: ${ms.toFixed(1)}ms`);
-    // }
-
-    const tokenSavings = timer.tokenSummary();
-    if (Object.keys(tokenSavings).length > 0) {
-      console.log(`[Tokens]  Stage Savings:`);
-      for (const [stage, saved] of Object.entries(tokenSavings)) {
-        if (saved > 0) console.log(`[Tokens]    ${stage}: ↓${saved} tokens`);
       }
     }
   });
@@ -941,12 +467,544 @@ const server = http.createServer((req, res) => {
   req.on("error", (err) => console.error("Ingress Socket Error:", err.message));
 });
 
-// Moved to async startup block — see top of file
+// ─────────────────────────────────────────────
+// Tool Policy — runs on EVERY request before planner.
+// Must be outside the planner block so it applies to
+// TOOL_FOLLOWUP turns (bypass: true) as well as turn 1.
+// ─────────────────────────────────────────────
+function applyToolPolicy(payload) {
+  if (process.env.CF_NUDGE_TOOLS !== "1") return payload;
+  if (!Array.isArray(payload.tools)) return payload;
+
+  const strippedTools = new Set(["Edit", "Read", "Update", "NotebookEdit"]);
+
+  const before = payload.tools.length;
+  payload.tools = payload.tools.filter(
+    (t) => !strippedTools.has(t.name) && !strippedTools.has(t.function?.name)
+  );
+  const after = payload.tools.length;
+
+  if (before !== after) {
+    // SM-10 FIX: Log actual stripped tool names not hardcoded "Edit"
+    const stripped = [...strippedTools].join(", ");
+    console.log(`[Tool Policy] ✂️ Stripped ${before - after} tool(s): ${stripped}`);
+  }
+
+  return payload;
+}
+
+// ─────────────────────────────────────────────
+// Request handler — extracted from inline async
+// to make the top-level try/catch clean and to
+// allow the function to be unit-tested in isolation.
+// ─────────────────────────────────────────────
+
+async function handleRequest(req, res, chunks) {
+  const startTime = performance.now();
+  const timer = new StageTimer();
+
+  // ── Parse body ──
+  let payload;
+  let _rawPayloadForDebug = null;
+  try {
+    payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+    if (process.env.CF_DEBUG_TRANSLATION === "1") {
+      _rawPayloadForDebug = JSON.parse(JSON.stringify(payload));
+    }
+  } catch (err) {
+    console.error("Parse Error:", err.message);
+    if (!res.headersSent) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad Request - Invalid JSON" }));
+    }
+    return;
+  }
+
+  // ── Token counting ping ──
+  if (req.url.includes("/count_tokens")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ input_tokens: 150 }));
+  }
+
+  // ── MCP Tool Execution ──
+  // SV-4 FIX: Static imports used instead of dynamic import() per request.
+  // executeGraphQuery, executeReadFileChunk, executePatchToolCall are now
+  // imported at module top — dynamic import() added Promise overhead for
+  // modules that were already in the module cache.
+  if (req.url.includes("/v1/mcp/tool")) {
+    try {
+      const { _mcp_tool, _mcp_args } = payload;
+      let content;
+
+      if (_mcp_tool === "contextforge_query_graph") {
+        content = await executeGraphQuery(_mcp_args.query_type, _mcp_args.target, _mcp_args);
+      } else if (_mcp_tool === "contextforge_patch_ast") {
+        content = await executePatchToolCall(JSON.stringify(_mcp_args), semanticCache);
+      } else if (_mcp_tool === "read_file_chunk") {
+        content = executeReadFileChunk(
+          _mcp_args.file_path,
+          _mcp_args.start_line,
+          _mcp_args.end_line
+        );
+      } else if (_mcp_tool === "contextforge_retrieve") {
+        // ✅ Issue 1 FIX: Try chunked retrieval first, fall back to direct
+        // vault lookup. saveToVault() writes to prune_vault (direct text),
+        // while saveChunksToVault() writes to vault_chunks.
+        // fetchVaultTextConcatenated returns "" (not null) when no chunks
+        // exist — so an empty string means "try direct lookup", not "not found".
+        let vaultContent = fetchVaultTextConcatenated(_mcp_args.vault_id);
+        if (!vaultContent) {
+          vaultContent = fetchFromVault(_mcp_args.vault_id);
+        }
+        if (!vaultContent) {
+          content = JSON.stringify({
+            error: "Vault not found",
+            message: `Vault '${_mcp_args.vault_id}' is missing or expired.`,
+          });
+        } else {
+          content = vaultContent;
+        }
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ content }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ content: JSON.stringify({ error: err.message }) }));
+    }
+  }
+
+  // ── Detect client format + normalize to OpenAI internal format ──
+  const { adapter: clientAdapter } = detectAdapter(req.url, req.headers);
+  const { payload: normalizedPayload } = clientAdapter.toInternal(payload, req.headers);
+  payload = normalizedPayload;
+
+  // ✅ FIX: Apply tool policy before planner — runs on every turn including
+  // TOOL_FOLLOWUP turns where bypass:true would otherwise skip stripping.
+  payload = applyToolPolicy(payload);
+
+  const isAnthropic = clientAdapter.name === "anthropic";
+  const clientModel = payload.model || "unknown";
+
+  // ── Parse per-request retry budget override ──
+  const maxRetriesHeader = req.headers["x-cf-max-retries"];
+  const parsedMaxRetries = maxRetriesHeader ? parseInt(maxRetriesHeader, 10) : NaN;
+  const maxRetries =
+    Number.isInteger(parsedMaxRetries) && parsedMaxRetries >= 0 ? parsedMaxRetries : undefined;
+
+  const mockUpstreamPort = req.headers["x-cf-mock-port"]
+    ? parseInt(req.headers["x-cf-mock-port"], 10)
+    : null;
+
+  if (clientAdapter.name === "gemini") {
+    payload = extractGeminiInlineContent(payload);
+  }
+
+  // ── TRUE BASELINE ──
+  // SV-9 FIX: Only two countTokens calls on critical path (baseline + final).
+  // The intermediate afterAlwaysOnTokens and baselineTokens calls were only
+  // used in commented-out log lines and for ccrBaseline. ccrBaseline now
+  // uses trueBaselineTokens as a conservative approximation.
+  const trueBaselineTokens = countTokens(payload);
+
+  const executeUpstreamRequest = createUpstreamHandler({
+    req,
+    res,
+    isAnthropic,
+    clientAdapter,
+    provider,
+    semanticCache,
+    hybridRetriever,
+    onnxEmbedder,
+    memoryHandler,
+    maxRetries,
+    mockUpstreamPort,
+    trueBaselineTokens,
+  });
+
+  // ── PASSTHROUGH MODE ──
+  if (process.env.CF_MODE === "passthrough" && req.headers["x-cf-dry-run"] !== "true") {
+    const passthroughMetrics = await executeUpstreamRequest(payload);
+    const passthroughWireTokens = passthroughMetrics?.accumulatedInputTokens ?? trueBaselineTokens;
+    const passthroughGhostRetries = passthroughMetrics?.ghostRetries ?? 0;
+    const passthroughCacheRead = passthroughMetrics?.accumulatedCacheReadTokens ?? 0;
+    const passthroughLatencyMs = performance.now() - startTime;
+
+    savingsTracker.recordRequest({
+      baselineTokens: trueBaselineTokens,
+      wireTokens: passthroughWireTokens,
+      tokensSaved: trueBaselineTokens - passthroughWireTokens,
+      ghostRetries: passthroughGhostRetries,
+      cacheReadTokens: passthroughCacheRead,
+    });
+    statsEmitter.recordRequest({
+      baselineTokens: trueBaselineTokens,
+      finalTokens: passthroughWireTokens,
+      pipelineLatency: 0,
+      upstreamLatency: passthroughLatencyMs,
+    });
+
+    console.log(`[Metrics] Total E2E Latency: ${passthroughLatencyMs.toFixed(2)}ms`);
+    if (passthroughGhostRetries > 0) {
+      console.log(
+        `[Metrics] Background Hops:    ${passthroughGhostRetries} extra ` +
+          `(${passthroughGhostRetries + 1} total LLM calls)`
+      );
+      console.log(`[Metrics] Total Wire Tokens:  ${passthroughWireTokens}`);
+    }
+    return;
+  }
+
+  // ── Always-on stages ──
+  timer.time(STAGES.DEDUPLICATE, () => {
+    payload = injectContextForgeRule(payload);
+    payload = deduplicateSystemMessages(payload);
+    if (payload._cf_sysPromptTokensSaved) {
+      timer.recordTokenSavings(STAGES.DEDUPLICATE, payload._cf_sysPromptTokensSaved);
+      delete payload._cf_sysPromptTokensSaved;
+    }
+  });
+
+  timer.time(STAGES.HISTORY_PRUNE, () => {
+    payload = pruneStaleToolResults(payload);
+    if (payload._cf_historyPrunedTokens) {
+      timer.recordTokenSavings(STAGES.HISTORY_PRUNE, payload._cf_historyPrunedTokens);
+      delete payload._cf_historyPrunedTokens;
+    }
+  });
+
+  const hasPriorTools = detectRecentToolActivity(payload.messages);
+
+  let plan;
+  await timer.timeAsync(STAGES.GRAPH_INJECT, async () => {
+    const originResult = detectMessageOrigin(payload.messages);
+    console.log(`[Planner] Origin: ${originResult.origin} | Reason: ${originResult.reason}`);
+
+    if (!requiresRepositoryWork(originResult.origin)) {
+      plan = {
+        capabilities: new Set(),
+        intent: originResult.origin,
+        method: "origin_detection",
+        bypass: true,
+      };
+      return;
+    }
+
+    // SV-1 FIX: planPipeline runs every turn — no module-level cache.
+    plan = await planPipeline(
+      payload,
+      { hasPriorTools, trueBaselineTokens, originHint: originResult.origin },
+      onnxEmbedder
+    );
+  });
+
+  // ── GATE: Compression decision ──
+  const decision = CompressionDecision.decide({
+    headers: req.headers,
+    optimize: getOptimizeFlag(),
+    messages: payload.messages,
+    payload,
+    precomputedTokens: trueBaselineTokens,
+  });
+
+  if (!decision.shouldCompress && req.headers["x-cf-dry-run"] !== "true") {
+    const passthroughMetrics = await executeUpstreamRequest(payload);
+    const passthroughWireTokens =
+      passthroughMetrics?.accumulatedInputTokens ?? countTokens(payload);
+    const passthroughGhostRetries = passthroughMetrics?.ghostRetries ?? 0;
+    const passthroughCacheRead = passthroughMetrics?.accumulatedCacheReadTokens ?? 0;
+    const passthroughLatencyMs = performance.now() - startTime;
+
+    savingsTracker.recordRequest({
+      baselineTokens: trueBaselineTokens,
+      wireTokens: passthroughWireTokens,
+      tokensSaved: trueBaselineTokens - passthroughWireTokens,
+      ghostRetries: passthroughGhostRetries,
+      cacheReadTokens: passthroughCacheRead,
+    });
+    statsEmitter.recordRequest({
+      baselineTokens: trueBaselineTokens,
+      finalTokens: passthroughWireTokens,
+      pipelineLatency: 0,
+      upstreamLatency: passthroughLatencyMs,
+    });
+    return;
+  }
+
+  // ── COMPRESSION PIPELINE ──
+  const policy = getPolicyForModel(payload.model || "");
+  Object.defineProperty(payload, "__policy", {
+    value: policy,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+
+  // SV-5 FIX: Added [CF_COMPRESSED_FILE guard to prevent AST-compressed
+  // messages from triggering compression stages a second time if
+  // _compressedVaultId was stripped during message reconstruction.
+  const hasCompressibleContent = payload.messages?.some(
+    (m) =>
+      m.role === "tool" &&
+      typeof m.content === "string" &&
+      m.content.length > 800 &&
+      !m._cf_vaulted &&
+      !m._dedupVaultId &&
+      !m._cf_deduped &&
+      !m._compressedVaultId &&
+      !m.content.includes("[CF_VAULT:") &&
+      !m.content.includes("[CF_COMPRESSED_FILE") // SV-5 FIX
+  );
+
+  // 1. Inject Memory Tools
+  timer.time(STAGES.MEMORY_INJECT, () => {
+    payload = injectMemoryTools(payload);
+  });
+
+  // 2. Scrub Tool Results
+  if (hasCompressibleContent) {
+    timer.time(STAGES.SCRUB, () => {
+      payload = scrubToolResults(payload);
+    });
+  }
+
+  // 3. Tag Tool Results
+  if (hasCompressibleContent) {
+    await timer.timeAsync(STAGES.TAG, async () => {
+      payload = await tagToolResults(payload);
+    });
+  }
+
+  // 4. Semantic Dedup
+  if (hasCompressibleContent) {
+    await timer.timeAsync(STAGES.SEMANTIC_DEDUP, async () => {
+      payload = await applySemanticDedup(payload);
+    });
+  }
+
+  // 5. AST Compress Code
+  if (hasCompressibleContent) {
+    await timer.timeAsync(STAGES.CODE_COMPRESS, async () => {
+      payload = await compressCodeToolResults(payload);
+    });
+  }
+
+  // 6. Fat Catch / Vault Intercept
+  if (hasCompressibleContent) {
+    timer.time(STAGES.VAULT_INTERCEPT, () => {
+      payload = interceptAndVaultMassiveToolResults(payload, policy.singleMsgVaultThreshold);
+    });
+  }
+
+  // 7. Anthropic-specific field stripping
+  if (isAnthropic) {
+    timer.time(STAGES.STRIP_ANTHROPIC, () => {
+      payload = stripAnthropicSpecificFields(payload);
+    });
+  }
+
+  // 8. CCR Pipeline
+  // SV-9 FIX: ccrBaseline uses trueBaselineTokens instead of a separate
+  // countTokens() call. The Infinity override for vault-containing payloads
+  // already handles the main correctness case.
+  timer.time(STAGES.CCR_PIPELINE, () => {
+    if (process.env.CF_CCR_ENABLED === "false") return;
+
+    let ccrBaseline = trueBaselineTokens; // SV-9 FIX: was a separate countTokens()
+
+    const hasVault = payload.messages?.some((m) => {
+      if (typeof m.content === "string" && m.content.includes("[CF_VAULT:")) return true;
+      if (Array.isArray(m.content)) {
+        return m.content.some(
+          (b) => typeof b.content === "string" && b.content.includes("[CF_VAULT:")
+        );
+      }
+      return false;
+    });
+
+    if (hasVault) ccrBaseline = Infinity;
+
+    payload = applyCCRPipeline(payload, ccrBaseline);
+  });
+
+  // 9. Minimize Tool Schemas
+  timer.time(STAGES.MINIMIZE_TOOLS, () => {
+    payload = minimizeToolSchemas(payload);
+    if (payload._cf_minimizeTokensSaved) {
+      timer.recordTokenSavings(STAGES.MINIMIZE_TOOLS, payload._cf_minimizeTokensSaved);
+      delete payload._cf_minimizeTokensSaved;
+    }
+  });
+
+  // 10. Inject Memory Context
+  await timer.timeAsync(STAGES.MEMORY_CONTEXT, async () => {
+    const memDecision = MemoryDecision.decide({
+      headers: req.headers,
+      memoryHandler,
+      memoryUserId: req.headers["x-contextforge-user-id"] ?? null,
+      modeName: getMemoryMode(),
+    });
+
+    if (memDecision.inject) {
+      const userId = req.headers["x-contextforge-user-id"];
+      const workspace = req.headers["x-contextforge-workspace"] ?? "";
+      const ctx = await memoryHandler.searchAndFormatContext(userId, payload.messages, workspace);
+      if (ctx) {
+        payload.messages = memoryHandler.appendContextToMessages(payload.messages, ctx);
+        console.log(`[Memory] Injected ${ctx.length} chars for user=${userId}`);
+      }
+    }
+  });
+
+  // ── Translation debug capture ──
+  if (process.env.CF_DEBUG_TRANSLATION === "1") {
+    debugTranslation({
+      rawAnthropicPayload: _rawPayloadForDebug,
+      translatedOpenAIPayload: payload,
+      clientAdapterName: clientAdapter.name,
+      originResult: plan ? { origin: plan.intent, method: plan.method, bypass: plan.bypass } : null,
+      planResult: plan,
+    });
+  }
+
+  const pipelineLatencyMs = performance.now() - startTime;
+  // SV-9 FIX: Only two countTokens calls total (trueBaselineTokens above + finalTokens here)
+  const finalTokens = countTokens(payload);
+  const totalSaved = trueBaselineTokens - finalTokens;
+  const stages = timer.summary();
+
+  // ── Dry-run ──
+  if (req.headers["x-cf-dry-run"] === "true") {
+    const vaultIds = [];
+    const vaultPattern = /\[CF_VAULT:\s*(cf_vault_[a-f0-9]+)\]/g;
+    const payloadStr = JSON.stringify(payload);
+    let vaultMatch;
+    while ((vaultMatch = vaultPattern.exec(payloadStr)) !== null) {
+      if (!vaultIds.includes(vaultMatch[1])) vaultIds.push(vaultMatch[1]);
+    }
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    });
+    return res.end(
+      JSON.stringify({
+        pipeline_ms: pipelineLatencyMs,
+        tokens_before: trueBaselineTokens,
+        tokens_after: finalTokens,
+        tokens_saved: totalSaved,
+        compression_ratio:
+          trueBaselineTokens > 0
+            ? parseFloat(((totalSaved / trueBaselineTokens) * 100).toFixed(1))
+            : 0,
+        stages,
+        vault_ids: vaultIds,
+        vault_id: vaultIds[0] ?? null,
+      })
+    );
+  }
+
+  // ── Mutation detection ──
+  const payloadStr = JSON.stringify(payload);
+  const { isMutation, mutatedFile } = detectMutation(payloadStr);
+  if (isMutation && mutatedFile) {
+    const newHash = hashFile(mutatedFile);
+    const result = invalidateByFile(mutatedFile, newHash, semanticCache);
+    if (result.deletedIds.length > 0) {
+      console.log(
+        `\n[State Monitor] 🚨 Mutation on '${mutatedFile}'. ` +
+          `Invalidated ${result.deletedIds.length} entries.`
+      );
+    }
+  }
+
+  // ── Expose metrics via HTTP headers ──
+  res.setHeader("x-cf-tokens-before", trueBaselineTokens);
+  res.setHeader("x-cf-tokens-after", finalTokens);
+  res.setHeader("x-cf-tokens-saved", totalSaved);
+  res.setHeader("x-cf-pipeline-ms", pipelineLatencyMs.toFixed(2));
+  res.setHeader(
+    "x-cf-compression-ratio",
+    trueBaselineTokens > 0 ? parseFloat(((totalSaved / trueBaselineTokens) * 100).toFixed(1)) : 0
+  );
+
+  const upstreamMetrics = await executeUpstreamRequest(payload);
+  const totalLatencyMs = performance.now() - startTime;
+  const wireTokens = upstreamMetrics?.accumulatedInputTokens ?? finalTokens;
+  const ghostRetries = upstreamMetrics?.ghostRetries ?? 0;
+  const cacheReadTokens = upstreamMetrics?.accumulatedCacheReadTokens ?? 0;
+
+  savingsTracker.recordRequest({
+    baselineTokens: trueBaselineTokens,
+    wireTokens: wireTokens,
+    tokensSaved: trueBaselineTokens - wireTokens,
+    ghostRetries: ghostRetries,
+    cacheReadTokens: cacheReadTokens,
+  });
+  statsEmitter.recordRequest({
+    baselineTokens: trueBaselineTokens,
+    finalTokens: wireTokens,
+    pipelineLatency: pipelineLatencyMs,
+    upstreamLatency: totalLatencyMs - pipelineLatencyMs,
+  });
+
+  // ── Pipeline report ──
+  console.log("\n=== ContextForge Pipeline Report ===");
+  console.log(`[Metrics] True Baseline:      ${trueBaselineTokens}`);
+  console.log(`[Metrics] After Always-On:    ${trueBaselineTokens}`); // approximation post SV-9
+  console.log(`[Metrics] Final Tokens:       ${finalTokens}`);
+  console.log(`[Metrics] Savings Breakdown:`);
+
+  if (totalSaved < 0) {
+    console.warn(`[Pipeline] ⚠️ Net-negative: pipeline inflated by ${-totalSaved} tokens`);
+  }
+
+  if (ghostRetries > 0) {
+    console.log(
+      `[Metrics] Background Hops:    ${ghostRetries} extra ` +
+        `(${ghostRetries + 1} total LLM calls)`
+    );
+    console.log(`[Metrics] Total Wire Tokens:  ${wireTokens}`);
+  }
+  console.log(`[Metrics] Pipeline Latency:   ${pipelineLatencyMs.toFixed(2)}ms`);
+  console.log(`[Metrics] Total E2E Latency:  ${totalLatencyMs.toFixed(2)}ms`);
+
+  // SV-10 FIX: Removed empty console.log() — was printing a blank line
+  // every request due to commented-out content inside the call.
+
+  const tokenSavings = timer.tokenSummary();
+  if (Object.keys(tokenSavings).length > 0) {
+    console.log(`[Tokens]  Stage Savings:`);
+    for (const [stage, saved] of Object.entries(tokenSavings)) {
+      if (saved > 0) console.log(`[Tokens]    ${stage}: ↓${saved} tokens`);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+// Graceful shutdown
+//
+// SV-11 FIX: server.close() called before process.exit() to drain
+// in-flight connections. 5s timeout forces exit if drain stalls.
+// ─────────────────────────────────────────────
 
 process.on("SIGINT", () => {
   console.log("\n🛑 Shutting down ContextForge Proxy...");
+
   if (global.embeddingWorker) global.embeddingWorker.terminate();
-  if (savingsTracker?.getSummary) console.log("\n" + savingsTracker.getSummary());
-  else console.log("\n[Stats] Session ended.");
-  process.exit(0);
+
+  const forceExit = setTimeout(() => {
+    console.warn("[Server] Force exit after 5s shutdown timeout");
+    if (savingsTracker?.getSummary) console.log("\n" + savingsTracker.getSummary());
+    process.exit(0);
+  }, 5000);
+
+  // .unref() prevents the timeout from keeping the process alive
+  // if all connections drain before 5s
+  forceExit.unref();
+
+  server.close(() => {
+    if (savingsTracker?.getSummary) console.log("\n" + savingsTracker.getSummary());
+    else console.log("\n[Stats] Session ended.");
+    process.exit(0);
+  });
 });

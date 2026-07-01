@@ -1,66 +1,77 @@
 import { classifyContentAsync } from "./contentDetector.js";
+
 // ============================================================
 // PHASE 1, FEATURE 1: NATIVE TERMINAL SCRUBBER (RTK Replacement)
 // ============================================================
 
-/**
- * Standard ANSI escape sequence regex.
- * Matches CSI sequences: ESC [ ... <letter>
- * Matches OSC sequences: ESC ] ... BEL or ST
- * Matches single-character ESC sequences
- */
 const ANSI_PATTERN = /\x1b\[[0-9;]*[a-zA-Z]/g;
 const OSC_PATTERN = /\x1b\][^\x07]*\x07/g;
 const SINGLE_ESC = /\x1b[()][0-9a-zA-Z]/g;
 
-/**
- * Lines that are ONLY spinner/loading noise.
- * These lines contain nothing but spinner characters, punctuation,
- * percentages, and box-drawing characters — no actual words.
- */
 const SPINNER_LINE_PATTERN = /^[\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠏⣾⣽⣻⢿⡿⣟⣯⣷#=\-|/\\%.\d(){}\]\[∧>]*$/;
-
-/**
- * npm/yarn install progress lines look like:
- *   [#########........] 45% - some-package@1.2.3
- * We want to keep the final package list but strip intermediate progress lines.
- */
 const NPM_PROGRESS_PATTERN = /^\[[#=\-.\s]{8,}\]\s+\d+%.*/;
 
-/**
- * Carriage-return-based progress (single-line overwrite spinners).
- * Detects groups of lines where each line ends with \r and replaces the pattern.
- */
-function collapseCarriageReturnProgress(text) {
-  // Split on carriage returns to see overwrite groups
-  // Lines separated by \r (not \n) overwrite each other in-terminal
-  const lines = text.split("\n");
+// ─────────────────────────────────────────────
+// Shell tool detection
+//
+// Bash, PowerShell, and other shell tools must never be deduped
+// or vaulted. Their results contain directory listings, command
+// output, and file trees that must always reach the LLM fresh.
+//
+// Stale shell output causes the LLM to believe files don't exist
+// when they do — leading to not_found cascades and wasted hops.
+//
+// Uses exact Set lookup instead of .includes() to avoid
+// false-positives on MCP tools like "executeGraphQuery" or
+// "executePatchToolCall" which contain "execute".
+// ─────────────────────────────────────────────
 
+export const SHELL_TOOL_NAMES = new Set([
+  "bash",
+  "powershell",
+  "zsh",
+  "sh",
+  "terminal",
+  "shell",
+  "cmd",
+  "command",
+]);
+
+export function isShellToolResult(msg) {
+  // Primary: _toolName set by tagToolResults metadata backfill
+  if (msg._toolName && SHELL_TOOL_NAMES.has(msg._toolName.toLowerCase())) {
+    return true;
+  }
+  // Secondary: tool name on the message itself (set by ghost interceptor)
+  if (msg.name && SHELL_TOOL_NAMES.has(msg.name.toLowerCase())) {
+    return true;
+  }
+  // Tertiary: explicit flag set during tagging (most reliable on re-runs)
+  if (msg._isShellTool === true) {
+    return true;
+  }
+  return false;
+}
+
+function collapseCarriageReturnProgress(text) {
+  const lines = text.split("\n");
   const result = [];
   let i = 0;
 
   while (i < lines.length) {
     const line = lines[i];
 
-    // Check if this line contains \r (carriage return overwrite within the line)
     if (line.includes("\r")) {
       const segments = line.split("\r").filter((s) => s.length > 0);
       if (segments.length > 1) {
-        // Multiple \r segments = progress bar overwrite
-        // Keep only the LAST segment (final state)
         const lastSegment = segments[segments.length - 1].trim();
-        if (lastSegment) {
-          result.push(lastSegment);
-        }
+        if (lastSegment) result.push(lastSegment);
         i++;
         continue;
       }
     }
 
-    // Check if this looks like a standalone progress bar line
-    // and the next few lines ALSO look like progress bars (repeating pattern)
     if (NPM_PROGRESS_PATTERN.test(line) || SPINNER_LINE_PATTERN.test(line)) {
-      // Look ahead: how many consecutive progress/spinner lines?
       let j = i + 1;
       while (
         j < lines.length &&
@@ -71,14 +82,12 @@ function collapseCarriageReturnProgress(text) {
 
       const consecutiveProgressLines = j - i;
       if (consecutiveProgressLines > 2) {
-        // Collapse: keep only the LAST one (final state)
         const lastProgress = lines[j - 1].trim();
         if (lastProgress && !SPINNER_LINE_PATTERN.test(lastProgress)) {
           result.push(
             lastProgress + `  [${consecutiveProgressLines - 1} progress lines collapsed]`
           );
         }
-        // Otherwise drop entirely (pure spinner noise)
         i = j;
         continue;
       }
@@ -96,63 +105,45 @@ export function scrubTerminalOutput(text) {
 
   let cleaned = text;
 
-  // 1. Strip ANSI escape codes (colors, cursor movements, etc)
   cleaned = cleaned.replace(ANSI_PATTERN, "");
   cleaned = cleaned.replace(OSC_PATTERN, "");
   cleaned = cleaned.replace(SINGLE_ESC, "");
 
-  // 2. Collapse carriage-return progress bars (npm install, curl, etc)
   cleaned = collapseCarriageReturnProgress(cleaned);
 
-  // 3. Remove npm verbose/silly/timing lines (massive token wasters)
   cleaned = cleaned
     .split("\n")
     .filter((line) => !/^\s*npm\s+(verb|sill|timing|notice\s+http)/i.test(line))
     .join("\n");
 
-  // 4. Collapse vertical whitespace (3+ blank lines → 2)
   cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
 
-  // 5. (Removed) Do not collapse horizontal whitespace to preserve code indentation
-
-  // 6. Trim trailing whitespace per line
   cleaned = cleaned
     .split("\n")
     .map((line) => line.trimEnd())
     .join("\n");
 
-  // 7. Final trim
   return cleaned.trim();
 }
 
-/**
- * Applies the terminal scrubber to all tool results in the payload.
- * This runs on the LIVE payload — the LLM gets clean text but
- * real timestamps and IDs are preserved for reasoning.
- */
 export function scrubToolResults(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
   payload.messages = payload.messages.map((msg) => {
-    // OpenAI format: role:"tool" with string content
     if (msg.role === "tool" && typeof msg.content === "string") {
       const scrubbed = scrubTerminalOutput(msg.content);
 
-      // CH-7: Use spread to create new object — direct mutation would leave
-      // _cachedTokens stale on the same object reference, causing countTokens
-      // to return the pre-scrub length on all subsequent pipeline stages.
       if (scrubbed !== msg.content) {
         const savedChars = msg.content.length - scrubbed.length;
         return {
-          ...msg, // new object — _cachedTokens dropped ✅
+          ...msg,
           content: scrubbed,
           _scrubbedChars: savedChars,
         };
       }
-      return msg; // unchanged — cache valid ✅
+      return msg;
     }
 
-    // Anthropic format: role:"user" with tool_result blocks (dead path post-translation)
     if (msg.role === "user" && Array.isArray(msg.content)) {
       let modified = false;
       const newContent = msg.content.map((block) => {
@@ -160,15 +151,14 @@ export function scrubToolResults(payload) {
           const scrubbed = scrubTerminalOutput(block.content);
           if (scrubbed !== block.content) {
             modified = true;
-            return { ...block, content: scrubbed }; // new block object ✅
+            return { ...block, content: scrubbed };
           }
         }
         return block;
       });
 
-      // Only create new message object if content actually changed
       if (modified) {
-        return { ...msg, content: newContent }; // new object — _cachedTokens dropped ✅
+        return { ...msg, content: newContent };
       }
       return msg;
     }
@@ -183,10 +173,6 @@ export function scrubToolResults(payload) {
 // PHASE 1, FEATURE 3: CONTENT ROUTER MIDDLEWARE
 // ============================================================
 
-/**
- * Walks the payload and attaches a `_cf_type` tag to each tool result
- * after it has been scrubbed.
- */
 export async function tagToolResults(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
@@ -194,29 +180,52 @@ export async function tagToolResults(payload) {
   let skippedAlreadyTagged = 0;
 
   // ── Build tool call metadata lookup ──
-  // Must run before the classification loop so backfill
-  // can apply _filename to already-tagged messages too.
   const toolCallMeta = new Map();
   for (const msg of payload.messages) {
-    if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
-      for (const tc of msg.tool_calls) {
-        try {
-          const args = JSON.parse(tc.function?.arguments || "{}");
-          toolCallMeta.set(tc.id, {
-            toolName: tc.function?.name || "",
-            filePath:
-              args.path ||
-              args.file_path ||
-              args.filename ||
-              args.filepath ||
-              args.input?.path ||
-              args.file ||
-              null,
-            command: args.command || null,
-            // Store full args so semanticDedup can probe them directly
-            args,
-          });
-        } catch (_) {}
+    if (msg.role === "assistant") {
+      // OpenAI format
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          try {
+            const args = JSON.parse(tc.function?.arguments || "{}");
+            toolCallMeta.set(tc.id, {
+              toolName: tc.function?.name || "",
+              filePath:
+                args.path ||
+                args.file_path ||
+                args.filename ||
+                args.filepath ||
+                args.input?.path ||
+                args.file ||
+                null,
+              command: args.command || null,
+              args,
+            });
+          } catch (_) {}
+        }
+      }
+      // Anthropic format
+      if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "tool_use") {
+            try {
+              const args = block.input || {};
+              toolCallMeta.set(block.id, {
+                toolName: block.name || "",
+                filePath:
+                  args.path ||
+                  args.file_path ||
+                  args.filename ||
+                  args.filepath ||
+                  args.input?.path ||
+                  args.file ||
+                  null,
+                command: args.command || null,
+                args,
+              });
+            } catch (_) {}
+          }
+        }
       }
     }
   }
@@ -226,35 +235,46 @@ export async function tagToolResults(payload) {
   for (const msg of payload.messages) {
     if (msg.role === "tool" && typeof msg.content === "string") {
       // ── ALWAYS backfill metadata regardless of tag status ──
-      // Prior fix: already-tagged messages hit `continue` before
-      // toolCallMeta.get() — so _filename was only set on turn 1.
-      // On turn 2+ the dedup saw _filename=undefined → no-key → skip.
       const meta = toolCallMeta.get(msg.tool_call_id);
       if (meta) {
         if (meta.filePath && !msg._filename) msg._filename = meta.filePath;
-        if (meta.toolName && !msg._toolName) msg._toolName = meta.toolName;
-        if (meta.command && !msg._command) msg._command = meta.command;
-        // Expose full args for downstream consumers (semanticDedup._args)
+        if (meta.toolName && !msg._toolName)  msg._toolName = meta.toolName;
+        if (meta.command && !msg._command)    msg._command = meta.command;
         if (!msg._args) msg._args = meta.args;
 
+        const lowerName = meta.toolName.toLowerCase();
+
+        // ── Shell tool detection ────────────────────────────────────────
+        // FIX: Use exact Set lookup — NOT .includes("execute") which would
+        // false-positive on MCP tools like "executeGraphQuery".
+        //
+        // FIX: Remove the !msg._cf_type guard from Gemini's implementation.
+        // Without the guard, protection applies on every turn — not just
+        // the first time the message is tagged. If a previous run set
+        // _cf_type = "text" on a Bash result (before this fix), the
+        // guard would prevent correction on subsequent turns.
+        //
+        // FIX: Set both _cf_type = "log" AND _isShellTool = true.
+        //   _cf_type = "log"      → blocks semanticDedup (not in allowed list)
+        //   _isShellTool = true   → explicit flag checked by fatCatch to
+        //                           block vaulting of large shell outputs
+        if (SHELL_TOOL_NAMES.has(lowerName)) {
+          msg._cf_type = "log";
+          msg._isShellTool = true;
+        }
+
+        // ── Read tool editable flag ─────────────────────────────────────
         if (msg._cf_editable === undefined) {
-          const lowerName = meta.toolName.toLowerCase();
           const isReadTool = lowerName.includes("read") || lowerName.includes("view");
 
           if (isReadTool) {
-            let linesRequested = -1;
             const args = meta.args || {};
-
             const startLine = args.start_line ?? args.startLine ?? args.start ?? args.StartLine;
-            const endLine = args.end_line ?? args.endLine ?? args.end ?? args.EndLine;
+            const endLine   = args.end_line   ?? args.endLine   ?? args.end   ?? args.EndLine;
 
             if (startLine !== undefined && endLine !== undefined) {
-              linesRequested = Number(endLine) - Number(startLine);
-            }
-
-            // Only bypass AST compression if it's a targeted chunk (<= 800 lines)
-            if (linesRequested >= 0 && linesRequested <= 800) {
-              msg._cf_editable = true;
+              const linesRequested = Number(endLine) - Number(startLine);
+              msg._cf_editable = linesRequested >= 0 && linesRequested <= 800;
             } else {
               msg._cf_editable = false;
             }
@@ -283,6 +303,43 @@ export async function tagToolResults(payload) {
     if (msg.role === "user" && Array.isArray(msg.content)) {
       for (const block of msg.content) {
         if (block.type === "tool_result" && typeof block.content === "string") {
+          const meta = toolCallMeta.get(block.tool_use_id);
+          if (meta) {
+            if (meta.filePath && !block._filename) block._filename = meta.filePath;
+            if (meta.toolName && !block._toolName)  block._toolName = meta.toolName;
+            if (meta.command && !block._command)    block._command = meta.command;
+            if (!block._args) block._args = meta.args;
+
+            const lowerName = meta.toolName.toLowerCase();
+
+            // ── Shell tool detection (Anthropic format) ─────────────────
+            // Same fix as OpenAI path above — exact Set, no !_cf_type guard,
+            // dual flag (_cf_type + _isShellTool).
+            if (SHELL_TOOL_NAMES.has(lowerName)) {
+              block._cf_type = "log";
+              block._isShellTool = true;
+            }
+
+            if (block._cf_editable === undefined) {
+              const isReadTool = lowerName.includes("read") || lowerName.includes("view");
+
+              if (isReadTool) {
+                const args = meta.args || {};
+                const startLine = args.start_line ?? args.startLine ?? args.start ?? args.StartLine;
+                const endLine   = args.end_line   ?? args.endLine   ?? args.end   ?? args.EndLine;
+
+                if (startLine !== undefined && endLine !== undefined) {
+                  const linesRequested = Number(endLine) - Number(startLine);
+                  block._cf_editable = linesRequested >= 0 && linesRequested <= 800;
+                } else {
+                  block._cf_editable = false;
+                }
+              } else {
+                block._cf_editable = false;
+              }
+            }
+          }
+
           if (block._cf_type) {
             skippedAlreadyTagged++;
             typesReport[block._cf_type] = (typesReport[block._cf_type] || 0) + 1;
@@ -301,18 +358,6 @@ export async function tagToolResults(payload) {
   }
 
   await Promise.all(classifyJobs);
-
-  const newlyClassified = classifyJobs.length;
-  // console.log(
-  //   `[ContentRouter] 🏷️  Tagged tool results: ` +
-  //     Object.entries(typesReport)
-  //       .filter(([_, count]) => count > 0)
-  //       .map(([type, count]) => `${count}x ${type}`)
-  //       .join(", ") +
-  //     (skippedAlreadyTagged > 0
-  //       ? ` (${skippedAlreadyTagged} cached, ${newlyClassified} new)`
-  //       : ""),
-  // );
 
   return payload;
 }

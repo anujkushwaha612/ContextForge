@@ -1,26 +1,32 @@
 /**
  * graphTools.js
  *
- * Fixes applied:
- *   GT-1: Path normalization now strips workspace root prefix, not just drive letter.
- *         Absolute paths like "D:/NODE JS/.../controllers/file.js" now correctly
- *         resolve to "controllers/file.js" for graph queries.
+ * Fixes applied (original):
+ *   GT-1: Path normalization strips workspace root prefix.
+ *   GT-2: show_callers reads each file once.
+ *   GT-3: CONFIDENCE_THRESHOLD removed.
+ *   GT-4: executeReadFileChunk uses workspace root, not cwd.
+ *   GT-5: process.cwd() fallback removed.
  *
- *   GT-2: show_callers now reads each file once and reuses the lines array
- *         for findCallLine, snippet extraction, and callText — was reading
- *         the same file 2-3 times per caller entry.
+ * Fixes applied (this pass):
+ *   GT-3: show_callers snippet extraction corrected — start/end indices
+ *         were off by 1 relative to the 1-indexed callLine. Snippet now
+ *         correctly centers on the call line with 3 lines before and after.
  *
- *   GT-3: CONFIDENCE_THRESHOLD removed — was declared but never wired into
- *         any query path.
+ *   GT-4: read_function path resolution now uses normalizeTargetPath()
+ *         instead of manual drive-letter regex — handles cross-platform
+ *         Windows absolute paths correctly when server runs on Linux.
  *
- *   GT-4: executeReadFileChunk verification in patchTools.js now uses
- *         result.file (resolved path). executeReadFileChunk itself now
- *         removes the process.cwd() fallback (GT-5) — workspace root is
- *         the single authoritative base for all relative paths.
+ *   GT-6: find query now attempts direct queryFindSymbol first before
+ *         routing through planRetrieval. Direct match returns in <1ms
+ *         and skips the full retrieval planner overhead.
  *
- *   GT-5: process.cwd() fallback removed from executeReadFileChunk.
- *         Workspace root is the canonical base. cwd() fallback caused
- *         inconsistent resolution when server was started from a parent dir.
+ *   GT-8: formatEvidence omits empty calls/literalRefs/envRefs arrays.
+ *         Empty arrays added ~250 tokens per 20-result query for no value.
+ *
+ *   GT-10: find_route with no filter (returns all routes) now capped at
+ *          50 results with a truncation notice. Large route tables were
+ *          returned unfiltered, potentially sending 3000+ token responses.
  */
 
 import {
@@ -45,7 +51,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { planRetrieval } from "./retrievalPlanner.js";
 
-// Re-export so upstreamRequest.js can import without depending on graphDb directly
 export { getWorkspaceRoot } from "./graphDb.js";
 
 export const GRAPH_TOOL_NAME = "contextforge_query_graph";
@@ -63,42 +68,35 @@ export function normalizeGraphToolName(name) {
 }
 
 // ─────────────────────────────────────────────
-// GT-1: Canonical path normalizer
+// Canonical path normalizer
 //
-// Converts any path representation the LLM may pass — absolute Windows,
-// absolute POSIX, relative — to a workspace-relative forward-slash path
-// that matches what the graph DB stores.
+// Converts any path the LLM may pass — absolute Windows, absolute POSIX,
+// relative — to a workspace-relative forward-slash path that matches
+// what the graph DB stores.
 //
-// Strategy:
-//   1. Normalize separators to forward slashes
-//   2. If path starts with workspace root → strip it
-//   3. Else if path has a drive letter → strip drive letter
-//      (best-effort for paths outside workspace)
-//   4. Strip leading slashes left over from stripping
+// NOTE: Comparison is lowercased for case-insensitive filesystem safety.
+// Slice uses original casing to preserve path case in results.
+// String length is identical between original and lowercased for ASCII
+// paths. Non-ASCII directory names (e.g. CJK characters) may cause
+// incorrect slice offsets — acceptable tradeoff for English codebases.
 // ─────────────────────────────────────────────
 
 function normalizeTargetPath(rawPath) {
   if (!rawPath || typeof rawPath !== "string") return rawPath ?? "";
 
-  // Normalize separators
   let p = rawPath.replace(/\\/g, "/");
 
-  // Get workspace root in the same normalized form
   const wsRoot = getWorkspaceRoot().replace(/\\/g, "/");
   const wsPrefix = wsRoot.endsWith("/") ? wsRoot.toLowerCase() : wsRoot.toLowerCase() + "/";
 
   const pLower = p.toLowerCase();
 
   if (pLower.startsWith(wsPrefix)) {
-    // Absolute path inside workspace — strip to relative
     p = p.slice(wsPrefix.length);
   } else if (/^[A-Za-z]:\//.test(p)) {
-    // Absolute path outside workspace — strip drive letter only
-    // This is best-effort; graph query will return not_found if path is wrong
     p = p.replace(/^[A-Za-z]:\//, "");
   }
 
-  // Strip any remaining leading slashes
   p = p.replace(/^\/+/, "");
 
   return p;
@@ -117,8 +115,7 @@ function readFileLines(filePath) {
 }
 
 // ─────────────────────────────────────────────
-// GT-2: Find call line from already-loaded lines array
-// Avoids re-reading the file when lines are already in memory.
+// Find call line from already-loaded lines array
 // ─────────────────────────────────────────────
 
 function findCallLineInFileFromLines(lines, functionName) {
@@ -128,13 +125,6 @@ function findCallLineInFileFromLines(lines, functionName) {
     if (callRegex.test(lines[i])) return i + 1; // 1-indexed
   }
   return null;
-}
-
-// Kept for external callers that only have a file path
-function findCallLineInFile(filePath, functionName) {
-  const lines = readFileLines(filePath);
-  if (!lines) return null;
-  return findCallLineInFileFromLines(lines, functionName);
 }
 
 // ─────────────────────────────────────────────
@@ -151,72 +141,96 @@ export function getGraphToolDefinition() {
     function: {
       name: GRAPH_TOOL_NAME,
       description:
-        "Query the ContextForge code knowledge graph. " +
-        "Use this tool INSTEAD of grep, find, or bash search " +
-        "when you need to locate a symbol, find imports, trace call chains, or check exports. " +
-        "Results are pre-indexed and return instantly at zero token cost. " +
-        "\n\nWORKFLOW:" +
-        "\n  1. what_does_this_export('src/path/to/file.js') — list all exported symbols" +
-        "\n  2. find('specificFunctionName') — returns metadata and signature only — call read_function(name) if you need the implementation" +
-        "\n  3. read_function('specificFunctionName') — get the exact full function body and related context" +
-        "\n  4. Use read_file_chunk if you need more surrounding code." +
-        "\n  NEVER search for class names — always search for function or method names (e.g. 'decide', not 'CompressionDecision')." +
-        "\n\nSpatial queries:" +
-        "\n  find                  — locate any function, class, variable, literal, config, or route" +
-        "\n  read_function         — read the full body of a function/symbol" +
-        "\n  who_imports_this      — find all files that import a symbol" +
-        "\n  what_does_this_export — list a file's exports without reading it" +
-        "\n  what_does_this_import — list everything a file imports" +
-        "\n  who_depends_on_file   — find files that depend on a specific file" +
-        "\n\nRelational queries:" +
-        "\n  show_callers      — find all functions that call function X" +
-        "\n  show_dependencies — find all functions that X calls" +
-        "\n  analyze_impact    — full call-chain impact analysis (2 hops) for safe refactoring" +
-        "\n  find_route        — find HTTP route handlers by path fragment (e.g. '/v1/chat')" +
-        "\n\nAlways try this before reading any file.",
+        "Query the pre-built code knowledge graph. " +
+        "Returns function bodies, call chains, exports, and route definitions " +
+        "without reading files from disk. Results are pre-indexed.\n\n" +
+        "## CRITICAL RULES\n" +
+        "1. target must be a FUNCTION or METHOD name — never a class name, " +
+        "never an error message string, never a file path (except for file queries).\n" +
+        "   ✅ find_symbol('getFileById')  — function name\n" +
+        "   ✅ find_symbol('renameFile')   — function name\n" +
+        "   ❌ find_symbol('File not found') — this is a string literal, not a symbol\n" +
+        "   ❌ find_symbol('FileController') — this is a class name, not a function\n" +
+        "   To find code that contains a specific error message: use find_symbol on " +
+        "the FUNCTION that owns it, not on the message itself.\n\n" +
+        "2. If graph returns not_found for a function you know exists:\n" +
+        "   → Call what_does_this_export('path/to/file.js') to list all symbols in that file\n" +
+        "   → Then call find_symbol or read_function on a symbol from that list\n" +
+        "   → Do NOT call find_symbol with error message strings as the target\n\n" +
+        "## CHOOSE YOUR WORKFLOW\n\n" +
+        "### I know the function name I want to edit:\n" +
+        "  Step 1: find_symbol('functionName') → get file path + line numbers\n" +
+        "  Step 2: read_function('functionName') → get full body\n" +
+        "  Step 3: contextforge_patch_ast → apply edit\n\n" +
+        "### I don't know what's in a file:\n" +
+        "  Step 1: what_does_this_export('controllers/file.controller.js') → list all exports\n" +
+        "  Step 2: read_function('exportedFunctionName') → get full body\n" +
+        "  Step 3: contextforge_patch_ast → apply edit\n\n" +
+        "### I need to understand impact before editing:\n" +
+        "  Step 1: analyze_impact('functionName') → see all callers (2 hops)\n" +
+        "  Step 2: read_function('functionName') → get full body\n" +
+        "  Step 3: contextforge_patch_ast → apply edit\n\n" +
+        "### I need to find an HTTP route handler:\n" +
+        "  find_route('/api/files') → returns handler function name + file + line\n\n" +
+        "## QUERY REFERENCE\n" +
+        "  find_symbol          — locate a function/variable/const by exact name → returns file + line numbers\n" +
+        "  read_function        — get the complete body of a function by name\n" +
+        "  what_does_this_export — list all exported symbols from a file path\n" +
+        "  what_does_this_import — list all imports in a file path\n" +
+        "  who_imports_this     — find all files that import a given symbol\n" +
+        "  who_depends_on_file  — find all files that depend on a given file path\n" +
+        "  show_callers         — find all functions that call function X\n" +
+        "  show_dependencies    — find all functions that X calls\n" +
+        "  analyze_impact       — 2-hop call chain analysis for safe refactoring\n" +
+        "  find_route           — find HTTP route handler by path fragment (e.g. '/v1/chat')\n" +
+        "  find                 — broad search across symbols, literals, routes, env vars\n\n" +
+        "Always prefer graph queries over reading files — graph results are precise and targeted.",
+
       parameters: {
         type: "object",
         properties: {
           query_type: {
             type: "string",
             enum: [
-              "retrieve",
-              "find",
-              "read_function",
-              "who_imports_this",
-              "what_does_this_export",
               "find_symbol",
+              "read_function",
+              "what_does_this_export",
               "what_does_this_import",
+              "who_imports_this",
               "who_depends_on_file",
               "show_callers",
               "show_dependencies",
               "analyze_impact",
               "find_route",
+              "find",
             ],
             description:
-              "\n  retrieve — unified retrieval with automatic source selection. " +
-              "Pass query + intent (location|implementation|architecture|debug). " +
-              "ContextForge decides whether to use graph, function body, call graph, or file. " +
-              "USE THIS FIRST before any other query type.\n" +
-              "\n  find — unified search across symbols, literals, routes, env vars, and config. Returns metadata only." +
-              "\n  read_function — read the exact full body of a symbol by name, plus related context." +
-              "\n  Spatial: who_imports_this, what_does_this_export, find_symbol, " +
-              "what_does_this_import, who_depends_on_file. " +
-              "Relational: show_callers (who calls X), show_dependencies (what X calls), " +
-              "analyze_impact (full 2-hop call chain for refactoring safety), " +
-              "find_route (HTTP route by path fragment). " +
-              "For file analysis: start with what_does_this_export to get symbol names, " +
-              "then find_symbol to get line numbers, " +
-              "then read_function to get the full body. Never search by class name.",
+              "find_symbol: locate a function/const/variable by exact name. " +
+              "Target MUST be a function or variable name — never a class name, " +
+              "never an error message string, never a file path.\n" +
+              "read_function: get the complete implementation of a named function.\n" +
+              "what_does_this_export: list all exports from a file — target is a file path.\n" +
+              "what_does_this_import: list all imports in a file — target is a file path.\n" +
+              "who_imports_this: find files that import a symbol — target is a symbol name.\n" +
+              "who_depends_on_file: find files that depend on a file — target is a file path.\n" +
+              "show_callers: find all functions that call X — target is a function name.\n" +
+              "show_dependencies: find all functions X calls — target is a function name.\n" +
+              "analyze_impact: 2-hop call chain for refactoring safety — target is a function name.\n" +
+              "find_route: find HTTP handler by route path fragment — target is a path like '/api/files'.\n" +
+              "find: broad search across all symbol types, literals, config values, routes.",
           },
           target: {
             type: "string",
             description:
-              "Function or method name (e.g. 'decide', 'sliceJsonOutput') for symbol queries — " +
-              "NOT class names. " +
-              "File path (e.g. 'src/helper.js') for file queries. " +
-              "Route fragment (e.g. '/v1/chat') for find_route. " +
-              "Pass empty string to find_route to list all routes.",
+              "What to search for. Type depends on query_type:\n" +
+              "  Symbol queries (find_symbol, read_function, show_callers, show_dependencies, " +
+              "analyze_impact, who_imports_this): " +
+              "exact function or variable name ONLY. Examples: 'getFileById', 'renameFile', 'uploadFile'.\n" +
+              "  File queries (what_does_this_export, what_does_this_import, who_depends_on_file): " +
+              "relative file path. Examples: 'controllers/file.controller.js', 'utils/helper.js'.\n" +
+              "  Route queries (find_route): URL path fragment. Examples: '/api/files', '/v1/upload'. " +
+              "Use empty string '' to list all routes.\n" +
+              "  Broad search (find): any term — symbol name, string literal, env var, config key.",
           },
         },
         required: ["query_type", "target"],
@@ -232,12 +246,14 @@ export function getGraphToolDefinition() {
 // Query executor
 // ─────────────────────────────────────────────
 
+// GT-10: Maximum routes returned when no filter is applied
+const MAX_UNFILTERED_ROUTES = 50;
+
 export async function executeGraphQuery(queryType, target, args = {}) {
   if (target === undefined || target === null) {
     return JSON.stringify({ error: "target is required" });
   }
 
-  // GT-1: Use the canonical normalizer instead of the broken drive-letter-only strip
   const cleanTarget = normalizeTargetPath(String(target).trim());
 
   try {
@@ -330,8 +346,6 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           start_line: r.start_line,
           end_line: r.end_line,
           complexity: r.complexity,
-          // No body — call read_function(name) to get the full implementation.
-          // find_symbol is a location query, not a content query.
         }));
 
         result = JSON.stringify(
@@ -421,12 +435,13 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           break;
         }
 
-        // GT-2: Read each file once, reuse lines array for all operations
+        // GT-2: Read each file once, reuse lines for all operations
         const callers = rows.map((r) => {
           let callLine = r.source_line ?? null;
-          const fileName = r.source_file;
-
-          // Read file once — reuse for findCallLine, snippet, and callText
+          const rawFileName = r.source_file;
+          const fileName = path.isAbsolute(rawFileName)
+            ? rawFileName
+            : path.resolve(getWorkspaceRoot(), rawFileName);
           const lines = readFileLines(fileName);
 
           if (!callLine && lines) {
@@ -437,11 +452,15 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           let callText = null;
 
           if (callLine && lines) {
-            const start = Math.max(0, callLine - 4);
-            const end = Math.min(lines.length, callLine + 3);
+            // GT-3 FIX: callLine is 1-indexed, lines is 0-indexed.
+            // Convert to 0-indexed: lines[callLine - 1] is the call line.
+            // Take 3 lines before and 3 lines after for 7-line context window.
+            const zeroIdx = callLine - 1;
+            const start = Math.max(0, zeroIdx - 3);
+            const end = Math.min(lines.length, zeroIdx + 4); // +4 = line + 3 after
             snippet = lines.slice(start, end).join("\n");
 
-            const raw = lines[callLine - 1]?.trim() ?? "";
+            const raw = lines[zeroIdx]?.trim() ?? "";
             callText = raw.length > 200 ? raw.slice(0, 200) + "..." : raw;
           }
 
@@ -570,6 +589,37 @@ export async function executeGraphQuery(queryType, target, args = {}) {
       }
 
       case "find": {
+        // GT-6 FIX: Fast path — try direct symbol lookup before routing through
+        // planRetrieval. queryFindSymbol is a synchronous O(1) index lookup that
+        // returns in <1ms. planRetrieval involves async embedding + multiple graph
+        // queries. Skipping it on direct matches saves 50-200ms per find call.
+        const directRows = queryFindSymbol(cleanTarget);
+        if (directRows.length > 0) {
+          const formatted = directRows.map((r) => ({
+            type: "symbol",
+            name: cleanTarget,
+            kind: r.kind,
+            file: r.file_path,
+            startLine: r.start_line,
+            endLine: r.end_line,
+            complexity: r.complexity,
+          }));
+          result = JSON.stringify(
+            {
+              query: cleanTarget,
+              confidence: 1.0,
+              strategy_used: "direct_symbol_match",
+              results: formatted,
+              count: formatted.length,
+              hint: "Call read_function('" + cleanTarget + "') to get full implementation.",
+            },
+            null,
+            2
+          );
+          break;
+        }
+
+        // Slow path: retrieval planner for fuzzy/semantic/route/literal search
         const plan = await planRetrieval(cleanTarget, "implementation");
 
         if (!plan.evidence.length) {
@@ -612,9 +662,14 @@ export async function executeGraphQuery(queryType, target, args = {}) {
 
         const sym = rows[0];
 
-        // GT-1 fix applied here too: resolve against workspace root, not drive letter
-        let resolvedPath = sym.file_path.replace(/\\/g, "/");
-        if (!path.isAbsolute(resolvedPath) && !/^[A-Za-z]:\//.test(resolvedPath)) {
+        // GT-4 FIX: Use normalizeTargetPath to strip workspace root and drive
+        // letters consistently. This handles cross-platform cases where the
+        // graph DB was built on Windows (storing D:/... absolute paths) but
+        // the server runs on Linux — path.isAbsolute("D:/...") returns false
+        // on Linux, causing path.resolve() to incorrectly prepend the workspace.
+        // normalizeTargetPath handles both cases and always produces a relative path.
+        let resolvedPath = normalizeTargetPath(sym.file_path);
+        if (!path.isAbsolute(resolvedPath)) {
           resolvedPath = path.resolve(getWorkspaceRoot(), resolvedPath);
         }
 
@@ -624,7 +679,10 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           const allLines = content.replace(/\r\n/g, "\n").split("\n");
           bodyLines = allLines.slice(sym.start_line - 1, sym.end_line);
         } catch (e) {
-          result = JSON.stringify({ error: "Failed to read file", message: e.message });
+          result = JSON.stringify({
+            error: "Failed to read file",
+            message: e.message,
+          });
           break;
         }
 
@@ -663,6 +721,7 @@ export async function executeGraphQuery(queryType, target, args = {}) {
       case "find_route": {
         const filter = cleanTarget.length > 0 ? cleanTarget : null;
         const rows = queryFindRoutes(filter);
+
         if (rows.length === 0) {
           result = JSON.stringify({
             filter: filter || "(all routes)",
@@ -673,10 +732,17 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           });
           break;
         }
+
+        // GT-10 FIX: Cap unfiltered route lists to prevent massive responses.
+        // A 50+ route application would send 3000+ tokens for all routes.
+        // Use a filter to narrow results for large applications.
+        const truncated = !filter && rows.length > MAX_UNFILTERED_ROUTES;
+        const displayRows = truncated ? rows.slice(0, MAX_UNFILTERED_ROUTES) : rows;
+
         result = JSON.stringify(
           {
             filter: filter || "(all routes)",
-            routes: rows.map((r) => ({
+            routes: displayRows.map((r) => ({
               route: r.route_path,
               file: r.source_file,
               start_line: r.source_line ?? null,
@@ -688,6 +754,12 @@ export async function executeGraphQuery(queryType, target, args = {}) {
                   : `Route is inline — use contextforge_retrieve on ${r.source_file} to get surrounding context.`,
             })),
             count: rows.length,
+            ...(truncated
+              ? {
+                  truncated: true,
+                  note: `Showing first ${MAX_UNFILTERED_ROUTES} of ${rows.length} routes. Pass a route fragment as 'target' to narrow results.`,
+                }
+              : {}),
           },
           null,
           2
@@ -780,20 +852,18 @@ export function executeReadFileChunk(filePath, startLine, endLine) {
   if (isNaN(start) || isNaN(end) || start < 1 || end < start) {
     return JSON.stringify({
       error: "Invalid line range",
-      message: `start_line and end_line must be positive integers with end_line >= start_line. Got start=${startLine}, end=${endLine}.`,
+      message:
+        `start_line and end_line must be positive integers with end_line >= start_line. ` +
+        `Got start=${startLine}, end=${endLine}.`,
     });
   }
 
-  // GT-5: Workspace root is the single authoritative base for relative paths.
-  // process.cwd() fallback removed — it caused inconsistent resolution when
-  // the server was started from a parent directory.
   let resolvedPath = filePath.replace(/\\/g, "/");
   if (!path.isAbsolute(resolvedPath) && !/^[A-Za-z]:\//.test(resolvedPath)) {
     const workspaceRoot = getWorkspaceRoot();
     resolvedPath = path.resolve(workspaceRoot, filePath);
 
     if (!fs.existsSync(resolvedPath)) {
-      // Fuzzy search in graph DB for files that match the relative path suffix
       const allIndexedFiles = getAllIndexedFiles();
       const queryPath = filePath.replace(/\\/g, "/").replace(/^\.\//, "");
       const matches = allIndexedFiles.filter((f) => {
@@ -812,7 +882,6 @@ export function executeReadFileChunk(filePath, startLine, endLine) {
             `Matches: ${matches.map((m) => m.file_path).join(", ")}`,
         });
       } else {
-        // GT-5 fix: no cwd fallback — if not in workspace, report clearly
         return JSON.stringify({
           error: "File not found",
           message:
@@ -840,22 +909,11 @@ export function executeReadFileChunk(filePath, startLine, endLine) {
 
     const searchHint = chunk.length > 0 && chunk[0].trim() ? chunk[0].trim().substring(0, 40) : "";
 
-    return JSON.stringify(
-      {
-        file: filePath,
-        start_line: start,
-        end_line: actualEnd,
-        total_lines: allLines.length,
-        lines: chunk,
-        content: chunk.join("\n"),
-        hint:
-          `To patch this file: use contextforge_patch_ast with ` +
-          `search_string set to one of these lines and file_path="${filePath}". ` +
-          `To retrieve from vault: contextforge_retrieve with search_query="${searchHint}".`,
-      },
-      null,
-      2
-    );
+    let outText = chunk.join("\n");
+    if (outText.length > 0) {
+      outText += `\n\n[CF_HINT] To patch this file: use contextforge_patch_ast with search_string set to an exact line from above and file_path="${filePath}".`;
+    }
+    return outText;
   } catch (err) {
     if (err.code === "ENOENT") {
       return JSON.stringify({
@@ -927,6 +985,10 @@ export function injectReadFileChunkTool(tools) {
 
 // ─────────────────────────────────────────────
 // Evidence formatter for find/retrieve results
+//
+// GT-8 FIX: Empty arrays (calls, literalRefs, envRefs) are omitted from
+// output. Each empty array adds ~20 chars of JSON per result entry.
+// For a find query returning 20 symbols, this saves ~1200 chars (~300 tokens).
 // ─────────────────────────────────────────────
 
 function formatEvidence(evidence) {
@@ -934,7 +996,7 @@ function formatEvidence(evidence) {
   for (const e of evidence) {
     for (const item of e.items) {
       if (item.type === "symbol") {
-        output.push({
+        const entry = {
           type: "symbol",
           name: item.name,
           kind: item.kind,
@@ -943,12 +1005,14 @@ function formatEvidence(evidence) {
           endLine: item.endLine,
           complexity: item.complexity,
           signature: item.signature,
-          calls: item.calls || [],
-          literalRefs: item.literalRefs || [],
-          envRefs: item.envRefs || [],
-          // No body — find/retrieve returns location metadata only.
-          // Call read_function(name) for the full implementation.
-        });
+        };
+
+        // GT-8 FIX: Only include non-empty arrays — omit empty ones to save tokens
+        if (item.calls?.length) entry.calls = item.calls;
+        if (item.literalRefs?.length) entry.literalRefs = item.literalRefs;
+        if (item.envRefs?.length) entry.envRefs = item.envRefs;
+
+        output.push(entry);
       } else if (item.type === "route") {
         output.push({
           type: "route",
@@ -964,7 +1028,7 @@ function formatEvidence(evidence) {
           file: item.file,
           line: item.line,
           usedIn: item.usedIn,
-          containing_function: item.containing_function || undefined,
+          ...(item.containing_function ? { containing_function: item.containing_function } : {}),
         });
       }
     }

@@ -559,9 +559,39 @@ void ASTCompressor::walkNode(
         anode.body_end_line   = anode.end_line;
       }
 
-      if (ntype.find("export") != std::string::npos) {
-        anode.is_exported = true;
-      }
+      // ── Export detection ─────────────────────────────────────────────────
+// Three strategies in priority order:
+
+// Strategy 1: node type contains "export"
+if (ntype.find("export") != std::string::npos) {
+  anode.is_exported = true;
+}
+
+// Strategy 2: node source text starts with "export " keyword
+// Handles `export const fn = () => {}` where tree-sitter assigns
+// type lexical_declaration (no "export" in type name) but the
+// declaration text begins with the export keyword.
+if (!anode.is_exported && !anode.name.empty()) {
+  std::string node_text = getNodeText(node, source);
+  size_t first = node_text.find_first_not_of(" \t\r\n");
+  if (first != std::string::npos && node_text.size() > first + 6) {
+    std::string start = node_text.substr(first, 7);
+    if (start == "export " || start == "export\t") {
+      anode.is_exported = true;
+    }
+  }
+}
+
+// Strategy 3: immediate parent is export_statement
+// Handles case where tree-sitter keeps export as parent node and
+// child is a bare lexical_declaration without export in its text.
+if (!anode.is_exported) {
+  TSNode parent = ts_node_parent(node);
+  if (!ts_node_is_null(parent) &&
+      std::string(ts_node_type(parent)) == "export_statement") {
+    anode.is_exported = true;
+  }
+}
 
       std::string node_text = getNodeText(node, source);
       if (node_text.find("async ") != std::string::npos) {
@@ -978,6 +1008,34 @@ Napi::Value ASTCompressorNAPI::ExtractNodes(const Napi::CallbackInfo& info) {
     );
     for (const auto& n : result.preserved_nodes)  all_nodes.push_back(n);
     for (const auto& n : result.compressed_nodes) all_nodes.push_back(n);
+
+    // Deduplicate by name — keep exported version over non-exported
+std::unordered_map<std::string, size_t> name_to_idx;
+std::vector<ASTNode> deduped;
+
+for (const auto& n : all_nodes) {
+  if (n.name.empty()) {
+    deduped.push_back(n);
+    continue;
+  }
+  auto it = name_to_idx.find(n.name);
+  if (it == name_to_idx.end()) {
+    name_to_idx[n.name] = deduped.size();
+    deduped.push_back(n);
+  } else {
+    // Keep whichever is exported — if new node is exported and existing is not, replace
+    if (n.is_exported && !deduped[it->second].is_exported) {
+      deduped[it->second] = n;
+    }
+    // If both exported or both not, keep the one with higher complexity (more informative)
+    else if (n.is_exported == deduped[it->second].is_exported &&
+             n.complexity > deduped[it->second].complexity) {
+      deduped[it->second] = n;
+    }
+  }
+}
+
+all_nodes = deduped;
 
     // Sort by start_line so JS receives nodes in source order
     std::sort(all_nodes.begin(), all_nodes.end(),

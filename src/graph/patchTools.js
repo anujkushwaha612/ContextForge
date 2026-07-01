@@ -1,23 +1,36 @@
 /**
  * patchTools.js
  *
- * Fixes applied:
- *   PT-1: Verification reads now use result.file (the resolved absolute path
- *         returned by executePatch) instead of raw args.file_path. Previously
- *         the LLM-provided relative/absolute path was passed to executeReadFileChunk
- *         which could resolve to a different location than where the patch was written.
+ * Fixes applied (original):
+ *   PT-1: result.file used for verification reads.
+ *   PT-2: successDetail guard added.
+ *   GT-4: Verification snippet parsed and error-checked.
  *
- *   PT-2: successDetail guard added — was undefined on failure path causing
- *         "[PatchTool] ❌ operation failed: undefined" in logs.
+ * Fixes applied (this pass):
+ *   PT-1: executeReadFileChunk converted from dynamic import() to static
+ *         import at module top. Dynamic import() in the hot path created
+ *         a Promise + microtask overhead on every successful patch even
+ *         though the module was already in the cache.
  *
- *   GT-4: Verification snippet is now parsed and checked for error before
- *         embedding in verified_state.content. Previously an error JSON string
- *         like {"error":"File not found"} was sent to the LLM as the "verified
- *         current file state", causing wrong decisions on next turn.
+ *   PT-3: Verification snippet capped at 30 lines. Previously unbounded —
+ *         a replace_body on a 100-line function embedded the full 100+ line
+ *         verified_state in the response, injecting those tokens into every
+ *         subsequent turn's conversation history.
+ *
+ *   PT-4: statsEmitter.recordPatchOperation replaced with
+ *         statsEmitter.recordAgentAction("astPatches") — the actual method
+ *         that exists on statsEmitter. recordPatchOperation was silently
+ *         no-op'd by the ?. operator since the method doesn't exist.
  */
 
 import { executePatch, PATCH_OPERATIONS } from "./patchEngine.js";
 import { statsEmitter } from "../proxy/statsEmitter.js";
+
+// PT-1 FIX: Static import instead of dynamic import() inside hot path.
+// Module is already loaded by the time any patch succeeds.
+// Dynamic import() still hits the cache but creates a Promise and goes
+// through the microtask queue on every call — unnecessary overhead.
+import { executeReadFileChunk } from "./graphTools.js";
 
 export const PATCH_TOOL_NAME = "contextforge_patch_ast";
 
@@ -26,6 +39,10 @@ const PATCH_TOOL_ALIASES = new Set([
   `mcp__contextforge__${PATCH_TOOL_NAME}`,
   `contextforge__${PATCH_TOOL_NAME}`,
 ]);
+
+// PT-3: Maximum lines in the verification snippet embedded in the response.
+// Keeps verified_state small so it doesn't inflate subsequent turns.
+const MAX_VERIFY_LINES = 30;
 
 let _toolDef = null;
 
@@ -80,6 +97,7 @@ export function getPatchToolDefinition() {
               "delete_node",
               "replace_string",
               "insert_at_line",
+              "create_file",
             ],
             description:
               "replace_body: replaces entire symbol — requires reading complete body first via read_function. " +
@@ -89,7 +107,10 @@ export function getPatchToolDefinition() {
               "replace_string: surgical find-and-replace INSIDE a symbol (or globally if target_symbol omitted). " +
               "insert_at_line: inserts new_body at a specific 1-based line number — " +
               "use this when find_route gives you a line number for an anonymous handler. " +
-              "No target_symbol needed.",
+              "No target_symbol needed. " +
+              "create_file: creates a new file with content from new_body. " +
+              "Fails if file already exists. Creates parent directories automatically. " +
+              "Use this instead of the native Write tool for new files.",
           },
           search_string: {
             type: "string",
@@ -125,10 +146,7 @@ export function getPatchToolDefinition() {
 
 export function isPatchToolCall(toolName) {
   if (!toolName) return false;
-  return (
-    PATCH_TOOL_ALIASES.has(toolName) ||
-    normalizePatchToolName(toolName) === PATCH_TOOL_NAME
-  );
+  return PATCH_TOOL_ALIASES.has(toolName) || normalizePatchToolName(toolName) === PATCH_TOOL_NAME;
 }
 
 export function normalizePatchToolName(name) {
@@ -156,24 +174,24 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
   }
 
   const result = await executePatch({
-    file_path:          args.file_path,
-    target_symbol:      args.target_symbol || null,
-    new_body:           args.new_body || "",
-    operation:          args.operation,
-    search_string:      args.search_string      ?? null,
+    file_path: args.file_path,
+    target_symbol: args.target_symbol || null,
+    new_body: args.new_body || "",
+    operation: args.operation,
+    search_string: args.search_string ?? null,
     replacement_string: args.replacement_string ?? null,
-    insert_line:        args.insert_line        ?? null,
+    insert_line: args.insert_line ?? null,
     semanticCache,
   });
 
-  statsEmitter.recordPatchOperation?.({
-    file:      args.file_path,
-    symbol:    args.target_symbol || "GLOBAL",
-    operation: args.operation,
-    success:   result.success,
-  });
+  // PT-4 FIX: Use recordAgentAction("astPatches") — the actual method that
+  // exists on statsEmitter. recordPatchOperation doesn't exist and was
+  // silently skipped by the ?. operator, making patch telemetry a no-op.
+  if (result.success) {
+    statsEmitter.recordAgentAction?.("astPatches");
+  }
 
-  // PT-2: Guard successDetail so failures don't log "undefined"
+  // PT-2: Guard successDetail — was undefined on failure path
   let successDetail = "";
   if (result.success) {
     if (args.operation === "replace_string") {
@@ -187,82 +205,71 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
 
   console.log(
     result.success
-      ? `[PatchTool] ✅ ${args.operation}('${args.target_symbol || "GLOBAL"}') in ${args.file_path} — ${successDetail}`
-      : `[PatchTool] ❌ ${args.operation}('${args.target_symbol || "GLOBAL"}') failed: ${result.error?.slice(0, 120)}`,
+      ? `[PatchTool] ✅ ${args.operation}('${args.target_symbol || "GLOBAL"}') ` +
+          `in ${args.file_path} — ${successDetail}`
+      : `[PatchTool] ❌ ${args.operation}('${args.target_symbol || "GLOBAL"}') ` +
+          `failed: ${result.error?.slice(0, 120)}`
   );
 
   // ── Automatic verification snapshot ──────────────────────────────────────
-  // On success, read back the patched region and embed it in the response.
-  // This prevents the LLM from issuing a second patch on already-modified
-  // content because it can SEE the current file state without another read.
   if (result.success) {
-    const verifyLine =
-      result.patch_start_line ??
-      result.insert_line      ??
-      result.lines_before     ??
-      null;
+    const verifyLine = result.patch_start_line ?? result.insert_line ?? result.lines_before ?? null;
 
     if (verifyLine != null) {
       try {
-        // PT-1: Use result.file (resolved absolute path from executePatch)
-        // NOT args.file_path (raw LLM-provided path, may be relative or
-        // point to a different location than where the write actually happened).
-        const { executeReadFileChunk } = await import("./graphTools.js");
-
         const verifyStart = Math.max(1, verifyLine - 2);
-        const verifyEnd   =
-          (result.patch_end_line ?? result.lines_after ?? verifyLine) + 4;
+        const rawVerifyEnd = (result.patch_end_line ?? result.lines_after ?? verifyLine) + 4;
 
+        // PT-3 FIX: Cap verification snippet at MAX_VERIFY_LINES (30).
+        // Previously unbounded — replace_body on a 100-line function embedded
+        // the full function + 4 lines in verified_state, injecting 100+ tokens
+        // into every subsequent turn's conversation history.
+        const verifyEnd = Math.min(rawVerifyEnd, verifyStart + MAX_VERIFY_LINES - 1);
+
+        // PT-1 FIX: Static import at module top — no dynamic import() here
         const snippetRaw = executeReadFileChunk(result.file, verifyStart, verifyEnd);
 
-        // GT-4: Parse the snippet and check for error before embedding.
-        // executeReadFileChunk returns a JSON string — if it contains an error
-        // (file not found, bad range) that error JSON would be sent to the LLM
-        // as the "verified current state", causing wrong decisions.
+        // GT-4: Parse and error-check before embedding
         let snippetContent = null;
         try {
           const snippetParsed = JSON.parse(snippetRaw);
           if (snippetParsed.error) {
-            // Read failed — don't embed error as file content
             snippetContent = null;
           } else {
-            // Use the content field (joined lines) not the raw JSON
             snippetContent = snippetParsed.content ?? null;
           }
         } catch {
-          // JSON parse failed — use raw string as fallback
           snippetContent = snippetRaw;
         }
 
         if (snippetContent !== null) {
           result.verified_state = {
             message: "Patch applied and verified. File now contains:",
-            lines:   `${verifyStart}-${verifyEnd}`,
+            lines: `${verifyStart}-${verifyEnd}`,
             content: snippetContent,
             WARNING:
-              "The original search_string no longer exists in this form. " +
-              "Do NOT retry this patch. If further edits are needed, " +
-              "use the content above as your new reference.",
+              "PATCH ALREADY APPLIED. The original search_string no longer exists — " +
+              "this is proof the edit succeeded. Do NOT call this tool again with the " +
+              "same arguments. If you need to make further changes, call " +
+              "read_file_chunk first to get the current file state, then issue " +
+              "a new patch based on what you see.",
           };
         } else {
           result.verified_state = {
             message: "Patch applied successfully.",
-            WARNING:
-              "Do NOT retry this patch. Use read_file_chunk to verify current state.",
+            WARNING: "Do NOT retry this patch. Use read_file_chunk to verify current state.",
           };
         }
       } catch {
         result.verified_state = {
           message: "Patch applied successfully.",
-          WARNING:
-            "Do NOT retry this patch. Use read_file_chunk to verify current state.",
+          WARNING: "Do NOT retry this patch. Use read_file_chunk to verify current state.",
         };
       }
     } else {
       result.verified_state = {
         message: "Patch applied successfully.",
-        WARNING:
-          "Do NOT retry this patch. Use read_file_chunk to verify current state.",
+        WARNING: "Do NOT retry this patch. Use read_file_chunk to verify current state.",
       };
     }
   }

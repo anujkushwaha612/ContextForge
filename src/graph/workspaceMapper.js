@@ -23,6 +23,27 @@
  *
  *   WM-7: Event loop yield changed from every 5 files to every file —
  *         prevents up to 500ms blocking during indexing of large files.
+ *
+ *   WM-8: normalizePath() introduced — single function for all path
+ *         normalization. Eliminates backslash/forward-slash and case
+ *         mismatches that caused silent lookup failures on Windows.
+ *
+ *   WM-9: buildIndexedFileMap key format fixed — was storing relPath keys
+ *         but lookup used absolute filePath. alreadyIndexed.has() always
+ *         returned false, making force:false behave like force:true and
+ *         re-indexing all files on every startup.
+ *
+ *   WM-10: routePrefixMap keys unified — was populated with absolute paths
+ *          but queried with relPath after the relPath refactor. Mount prefix
+ *          lookups always missed, so all routes were registered without their
+ *          mount prefix (e.g. "/files" instead of "/api/files").
+ *
+ *   WM-11: walkDirectory now logs failures instead of silently returning.
+ *          Silent catch made it impossible to diagnose indexing gaps.
+ *
+ *   WM-12: force defaults to true — stale SQLite entries from previous
+ *          sessions caused graph to return outdated symbol locations after
+ *          patches. Re-indexing 30 files takes ~200ms, worth the accuracy.
  */
 
 import fs from "node:fs";
@@ -45,28 +66,44 @@ import {
 import { setGraphEmbedder } from "./semanticResolver.js";
 
 const IGNORE_DIRS = new Set([
-  "node_modules", ".git", ".claude", "dist", "build",
-  ".next", ".nuxt", "__pycache__", ".pytest_cache",
-  "target", "vendor", "native/build",
+  "node_modules",
+  ".git",
+  ".claude",
+  "dist",
+  "build",
+  ".next",
+  ".nuxt",
+  "__pycache__",
+  ".pytest_cache",
+  "target",
+  "vendor",
+  "native/build",
 ]);
 
-const IGNORE_PATTERNS = [
-  /\.min\.(js|css)$/,
-  /\.bundle\.js$/,
-  /\.d\.ts$/,
-  /\.map$/,
-  /\.lock$/,
-];
+const IGNORE_PATTERNS = [/\.min\.(js|css)$/, /\.bundle\.js$/, /\.d\.ts$/, /\.map$/, /\.lock$/];
+
+// ─────────────────────────────────────────────
+// WM-8: Path normalization
+//
+// All paths stored in Maps, passed to SQLite, or compared against
+// each other must go through normalizePath first.
+//
+// Rules:
+//   - Backslashes → forward slashes (Windows fs.watch emits backslashes)
+//   - Lowercase (Windows is case-insensitive, Node.js is not)
+//
+// This single function replaces ad-hoc .replace(/\\/g, "/") calls
+// scattered throughout the file, which missed cases and caused
+// silent lookup failures (Map.get returns undefined instead of value).
+// ─────────────────────────────────────────────
+
+function normalizePath(p) {
+  if (!p) return p;
+  return p.replace(/\\/g, "/").toLowerCase();
+}
 
 // ─────────────────────────────────────────────
 // WM-2: File change callback
-//
-// workspaceMapper (graph layer) must not import from upstreamRequest.js
-// (proxy layer) — this violates the dependency direction.
-//
-// Instead: server.js registers a callback at startup via setFileChangeCallback().
-// When a file changes, the callback is invoked with the file path.
-// upstreamRequest.js exports invalidateCacheForFile which server.js passes here.
 // ─────────────────────────────────────────────
 
 let _onFileChanged = null;
@@ -79,11 +116,11 @@ export function setFileChangeCallback(cb) {
 // Symbol embedder
 // ─────────────────────────────────────────────
 
-let _symbolEmbedder  = null;
+let _symbolEmbedder = null;
 let _symbolRetriever = null;
 
 export function setSymbolEmbedder(embedder, retriever) {
-  _symbolEmbedder  = embedder;
+  _symbolEmbedder = embedder;
   _symbolRetriever = retriever;
   setGraphEmbedder(embedder, retriever);
   console.log("[GraphMapper] 🧠 Symbol embedding pipeline ready");
@@ -98,7 +135,7 @@ async function embedRetrievalDocuments(docs) {
   for (let i = 0; i < docs.length; i += EMBED_BATCH_SIZE) {
     const batch = docs.slice(i, i + EMBED_BATCH_SIZE);
     try {
-      const texts   = batch.map((d) => d.document);
+      const texts = batch.map((d) => d.document);
       const vectors = await _symbolEmbedder.embedBatch(texts);
 
       for (let j = 0; j < batch.length; j++) {
@@ -126,19 +163,15 @@ async function embedRetrievalDocuments(docs) {
 }
 
 // ─────────────────────────────────────────────
-// File hash tracking — for change detection
+// File hash tracking
 // ─────────────────────────────────────────────
 
-const fileHashes = new Map();
+const fileHashes = new Map(); // normalized absolute path → sha256 hex
 
 function getFileHash(content) {
   return crypto.createHash("sha256").update(content).digest("hex");
 }
 
-/**
- * WM-5: Returns { changed, content } so the caller can reuse
- * the content that was read for hashing — avoids reading twice.
- */
 function checkAndUpdateHash(filePath) {
   let content;
   try {
@@ -148,11 +181,13 @@ function checkAndUpdateHash(filePath) {
   }
 
   const newHash = getFileHash(content);
-  const oldHash = fileHashes.get(filePath);
+  // WM-8: normalize key for consistent lookup
+  const key = normalizePath(filePath);
+  const oldHash = fileHashes.get(key);
 
   if (newHash === oldHash) return { changed: false, content: null };
 
-  fileHashes.set(filePath, newHash);
+  fileHashes.set(key, newHash);
   return { changed: true, content };
 }
 
@@ -162,14 +197,14 @@ function checkAndUpdateHash(filePath) {
 
 const ROUTE_PATTERN =
   /\b([a-zA-Z_$][a-zA-Z0-9_$]*)\.(get|post|put|patch|delete|all|head|options)\s*\(\s*['"`]([^'"`]+)['"`]/g;
-const BARE_URL_PATTERN =
-  /req\.url\s*(?:===|!==|startsWith\s*\()\s*['"`]([^'"`]+)['"`]/g;
+const BARE_URL_PATTERN = /req\.url\s*(?:===|!==|startsWith\s*\()\s*['"`]([^'"`]+)['"`]/g;
 const ROUTER_MOUNT_PATTERN =
   /(?:app|server)\s*\.\s*use\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*([a-zA-Z_$][a-zA-Z0-9_$]*)/g;
-const IMPORT_ROUTER_PATTERN =
-  /import\s+(\w+)\s+from\s+['"`]([^'"`]*)['"` ]/g;
+const IMPORT_ROUTER_PATTERN = /import\s+(\w+)\s+from\s+['"`]([^'"`]*)['"` ]/g;
 
-const routePrefixMap = new Map();
+// WM-10: routePrefixMap keyed by normalized relPath (not absolute path).
+// Previously keyed by absolute path but queried with relPath — always missed.
+const routePrefixMap = new Map(); // normalized relPath → mount prefix string
 
 // ─────────────────────────────────────────────
 // Call edge patterns
@@ -177,19 +212,62 @@ const routePrefixMap = new Map();
 
 const CALL_EXPRESSION_PATTERN = /\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
 const CALL_EXCLUSIONS = new Set([
-  "if", "for", "while", "switch", "catch", "function", "class",
-  "return", "typeof", "instanceof", "new", "await", "yield",
-  "import", "export", "const", "let", "var", "async", "static",
-  "get", "set", "console", "Math", "JSON", "Object", "Array",
-  "String", "Number", "Boolean", "Promise", "Error", "Date",
-  "Map", "Set", "Symbol", "parseInt", "parseFloat", "isNaN",
-  "isFinite", "encodeURIComponent", "decodeURIComponent",
-  "setTimeout", "setInterval", "clearTimeout", "clearInterval",
-  "setImmediate", "process", "Buffer", "require", "performance", "crypto",
+  "if",
+  "for",
+  "while",
+  "switch",
+  "catch",
+  "function",
+  "class",
+  "return",
+  "typeof",
+  "instanceof",
+  "new",
+  "await",
+  "yield",
+  "import",
+  "export",
+  "const",
+  "let",
+  "var",
+  "async",
+  "static",
+  "get",
+  "set",
+  "console",
+  "Math",
+  "JSON",
+  "Object",
+  "Array",
+  "String",
+  "Number",
+  "Boolean",
+  "Promise",
+  "Error",
+  "Date",
+  "Map",
+  "Set",
+  "Symbol",
+  "parseInt",
+  "parseFloat",
+  "isNaN",
+  "isFinite",
+  "encodeURIComponent",
+  "decodeURIComponent",
+  "setTimeout",
+  "setInterval",
+  "clearTimeout",
+  "clearInterval",
+  "setImmediate",
+  "process",
+  "Buffer",
+  "require",
+  "performance",
+  "crypto",
 ]);
 
 function extractCallEdges(source, filePath, nodes, allKnownSymbols) {
-  const callEdges    = [];
+  const callEdges = [];
   const localSymbols = new Set(nodes.map((n) => n.name));
   const knownSymbols = allKnownSymbols ?? localSymbols;
 
@@ -209,22 +287,23 @@ function extractCallEdges(source, filePath, nodes, allKnownSymbols) {
         CALL_EXCLUSIONS.has(callee) ||
         !knownSymbols.has(callee) ||
         seenCallees.has(callee)
-      ) continue;
+      )
+        continue;
 
       seenCallees.add(callee);
       callEdges.push({
         sourceSymbol: node.name,
         targetSymbol: callee,
-        targetFile:   null,
-        relation:     "calls",
-        sourceLine:   null,
+        targetFile: null,
+        relation: "calls",
+        sourceLine: null,
       });
     }
   }
   return callEdges;
 }
 
-function extractRouteEdges(source, filePath, mountPrefix = "") {
+function extractRouteEdges(source, relPath, mountPrefix = "") {
   const routeEdges = [];
 
   function offsetToLine(offset) {
@@ -238,37 +317,39 @@ function extractRouteEdges(source, filePath, mountPrefix = "") {
   ROUTE_PATTERN.lastIndex = 0;
   let match;
   while ((match = ROUTE_PATTERN.exec(source)) !== null) {
-    const routerVar  = match[1];
-    const method     = match[2].toUpperCase();
-    const routePath  = match[3];
+    const routerVar = match[1];
+    const method = match[2].toUpperCase();
+    const routePath = match[3];
     const sourceLine = offsetToLine(match.index);
     if (["res", "req", "err", "ctx", "next", "response", "request"].includes(routerVar)) continue;
-    const prefix   = mountPrefix || routePrefixMap.get(filePath) || "";
+
+    // WM-10: query routePrefixMap with normalized relPath
+    const prefix = mountPrefix || routePrefixMap.get(normalizePath(relPath)) || "";
     const fullPath = prefix + routePath;
     routeEdges.push({
       sourceSymbol: null,
       targetSymbol: `${method} ${fullPath}`,
-      targetFile:   filePath,
-      relation:     "defines_route",
+      targetFile: relPath,
+      relation: "defines_route",
       sourceLine,
     });
   }
 
   BARE_URL_PATTERN.lastIndex = 0;
   while ((match = BARE_URL_PATTERN.exec(source)) !== null) {
-    const routePath  = match[1];
+    const routePath = match[1];
     const sourceLine = offsetToLine(match.index);
     const contextWindow = source.slice(
       Math.max(0, match.index - 10),
       match.index + match[0].length + 100
     );
     const methodMatch = contextWindow.match(/req\.method\s*===\s*['"`]([A-Z]+)['"`]/);
-    const method      = methodMatch ? methodMatch[1] : "ANY";
+    const method = methodMatch ? methodMatch[1] : "ANY";
     routeEdges.push({
       sourceSymbol: null,
       targetSymbol: `${method} ${routePath}`,
-      targetFile:   null,
-      relation:     "defines_route",
+      targetFile: null,
+      relation: "defines_route",
       sourceLine,
     });
   }
@@ -278,12 +359,14 @@ function extractRouteEdges(source, filePath, mountPrefix = "") {
 
 // ─────────────────────────────────────────────
 // Route prefix map builder
-// Extracted to a shared function so both indexWorkspace
-// and watchWorkspace can call it when files change.
-// WM-6: watcher now calls this when router files change.
+//
+// WM-10: Keys are now normalized relPath strings, not absolute paths.
+// Previously absolute paths were stored here but relPath was used for
+// lookup — Map.get always returned undefined, so all routes were
+// registered without their mount prefix.
 // ─────────────────────────────────────────────
 
-function buildRoutePrefixMap(allFiles) {
+function buildRoutePrefixMap(allFiles, workspacePath) {
   routePrefixMap.clear();
 
   for (const filePath of allFiles) {
@@ -291,48 +374,62 @@ function buildRoutePrefixMap(allFiles) {
       const src = fs.readFileSync(filePath, "utf-8");
       if (!src.includes(".use(")) continue;
 
-      const importMap = new Map();
+      const importMap = new Map(); // varName → normalized relPath
+
       IMPORT_ROUTER_PATTERN.lastIndex = 0;
       let imp;
 
       while ((imp = IMPORT_ROUTER_PATTERN.exec(src)) !== null) {
-        const varName    = imp[1];
+        const varName = imp[1];
         const importPath = imp[2];
         if (!importPath.startsWith(".")) continue;
         try {
-          const resolved = path.resolve(path.dirname(filePath), importPath).replace(/\\/g, "/");
-          const withExt  = /\.\w{1,4}$/.test(resolved) ? resolved : resolved + ".js";
-          importMap.set(varName, withExt);
-        } catch { /* skip */ }
+          const absResolved = path.resolve(path.dirname(filePath), importPath);
+          // Add .js extension if missing
+          const withExt = /\.\w{1,4}$/.test(absResolved) ? absResolved : absResolved + ".js";
+          // WM-10: store as normalized relPath so lookup matches
+          const relResolved = normalizePath(path.relative(workspacePath, withExt));
+          importMap.set(varName, relResolved);
+        } catch {
+          /* skip unresolvable imports */
+        }
       }
 
       ROUTER_MOUNT_PATTERN.lastIndex = 0;
       let mount;
 
       while ((mount = ROUTER_MOUNT_PATTERN.exec(src)) !== null) {
-        const prefix   = mount[1];
-        const varName  = mount[2];
-        const resolved = importMap.get(varName);
-        if (resolved) {
-          routePrefixMap.set(resolved, prefix);
+        const prefix = mount[1];
+        const varName = mount[2];
+        const relResolved = importMap.get(varName);
+        if (relResolved) {
+          routePrefixMap.set(relResolved, prefix);
           if (process.env.CF_DEBUG_GRAPH === "1") {
-            console.log(`[GraphMapper] 📍 Mount: ${path.basename(resolved)} → "${prefix}"`);
+            console.log(`[GraphMapper] 📍 Mount: ${relResolved} → "${prefix}"`);
           }
         }
       }
-    } catch { /* skip */ }
+    } catch {
+      /* skip unreadable files */
+    }
   }
 }
 
 // ─────────────────────────────────────────────
 // Directory walker
+//
+// WM-11: Now logs failures instead of silently returning.
+// Silent catch made it impossible to diagnose indexing gaps
+// (e.g. permission errors, paths with special characters on Windows).
 // ─────────────────────────────────────────────
 
 function* walkDirectory(rootDir) {
   let entries;
   try {
     entries = fs.readdirSync(rootDir, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    // WM-11: was `catch { return; }` — silent failure hid indexing gaps
+    console.warn(`[GraphMapper] ⚠️ Cannot read directory: ${rootDir} — ${err.message}`);
     return;
   }
 
@@ -344,15 +441,33 @@ function* walkDirectory(rootDir) {
     } else if (entry.isFile()) {
       if (!getLanguageForFile(fullPath)) continue;
       if (IGNORE_PATTERNS.some((p) => p.test(entry.name))) continue;
-      yield fullPath.replace(/\\/g, "/");
+      // WM-8: normalize immediately — all downstream consumers get
+      // consistent forward-slash paths regardless of OS
+      yield normalizePath(fullPath);
     }
   }
 }
 
+// ─────────────────────────────────────────────
+// WM-9: buildIndexedFileMap
+//
+// SQLite stores relPath as file_path (e.g. "controllers/file.controller.js").
+// The skip check in indexWorkspace uses absolute filePath as the key.
+// These never matched — alreadyIndexed.has(filePath) always returned false,
+// so force:false behaved identically to force:true, re-indexing everything
+// on every startup.
+//
+// Fix: key the map by normalized relPath so the lookup matches.
+// The caller must convert filePath → relPath before calling .has()/.get().
+// ─────────────────────────────────────────────
+
 function buildIndexedFileMap() {
   const indexed = getAllIndexedFiles();
-  const map     = new Map();
-  for (const row of indexed) map.set(row.file_path, row.last_modified);
+  const map = new Map();
+  for (const row of indexed) {
+    // Normalize the stored relPath so case/slash differences don't cause misses
+    map.set(normalizePath(row.file_path), row.last_modified);
+  }
   return map;
 }
 
@@ -361,39 +476,51 @@ function buildIndexedFileMap() {
 // ─────────────────────────────────────────────
 
 export async function indexWorkspace(workspacePath, options = {}) {
-  setWorkspaceRoot(workspacePath);
-  const { force = false, onProgress = null } = options;
+  // WM-8: normalize workspacePath at entry — used as base for all
+  // path.relative() calls throughout this function
+  const normalizedWorkspacePath = normalizePath(path.resolve(workspacePath));
+  setWorkspaceRoot(normalizedWorkspacePath);
 
-  console.log(`[GraphMapper] 🗺️  Starting workspace index: ${workspacePath}`);
-  const startTime      = Date.now();
+  // WM-12: default force:true — stale SQLite entries from previous sessions
+  // cause graph to return outdated symbol locations after patches.
+  // Re-indexing 30 files costs ~200ms at startup, worth the accuracy guarantee.
+  const { force = true, onProgress = null } = options;
+
+  console.log(`[GraphMapper] 🗺️  Starting workspace index: ${normalizedWorkspacePath}`);
+  const startTime = Date.now();
   const alreadyIndexed = force ? new Map() : buildIndexedFileMap();
-  const stats          = { indexed: 0, skipped: 0, errors: 0, total: 0 };
+  const stats = { indexed: 0, skipped: 0, errors: 0, total: 0 };
 
   const allFiles = [];
-  for (const filePath of walkDirectory(workspacePath)) allFiles.push(filePath);
+  for (const filePath of walkDirectory(normalizedWorkspacePath)) {
+    allFiles.push(filePath);
+  }
   stats.total = allFiles.length;
   console.log(`[GraphMapper] Found ${stats.total} indexable files`);
 
-  // WM-1: Store edges from Pass 1 to reuse in Pass 2 — avoids re-running tree-sitter
   const fileData = new Map();
 
-  // Pre-pass: build route prefix map
-  buildRoutePrefixMap(allFiles);
+  // WM-10: pass workspacePath so buildRoutePrefixMap can compute relPaths
+  buildRoutePrefixMap(allFiles, normalizedWorkspacePath);
 
   // ── Pass 1: Extract nodes ──────────────────────────────────────────────
   console.log(`[GraphMapper] Pass 1/2 — extracting nodes…`);
 
   for (let i = 0; i < allFiles.length; i++) {
-    const filePath = allFiles[i];
+    const filePath = allFiles[i]; // already normalized absolute path
 
     try {
-      const stat  = fs.statSync(filePath);
+      const stat = fs.statSync(filePath);
       const mtime = stat.mtimeMs;
 
-      if (!force && alreadyIndexed.has(filePath)) {
-        if (Math.abs(alreadyIndexed.get(filePath) - mtime) < 1000) {
+      // WM-9: compute relPath for SQLite key lookup
+      // path.relative needs the original casing for Windows fs operations,
+      // then we normalize the result for map lookup
+      const relPath = normalizePath(path.relative(normalizedWorkspacePath, filePath));
+
+      if (!force && alreadyIndexed.has(relPath)) {
+        if (Math.abs(alreadyIndexed.get(relPath) - mtime) < 1000) {
           stats.skipped++;
-          // WM-7: yield on every file — even skipped files reset the timer
           await new Promise((r) => setImmediate(r));
           continue;
         }
@@ -406,7 +533,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
         continue;
       }
 
-      const { nodes, edges } = extractSymbols(source, filePath);
+      const { nodes, edges } = extractSymbols(source, relPath);
 
       if (process.env.CF_DEBUG_GRAPH === "1") {
         const isSynthetic = nodes.length === 1 && nodes[0].name.startsWith("__module_");
@@ -415,41 +542,43 @@ export async function indexWorkspace(workspacePath, options = {}) {
           if (lang === "javascript" || lang === "typescript" || lang === "tsx") {
             console.warn(
               `[GraphMapper] ⚠️  ${path.basename(filePath)} has no named declarations ` +
-              `(${source.length} chars) — synthetic __module node created.`
+                `(${source.length} chars) — synthetic __module node created.`
             );
           }
         }
       }
 
-      const { literals, configRefs } = extractLiterals(source, filePath, nodes);
-      const summaries                = buildNodeSummaries(nodes, literals, configRefs, filePath);
-      const retrievalDocs            = buildRetrievalDocuments(nodes, literals, configRefs, filePath);
-      const mountPrefix              = routePrefixMap.get(filePath) || "";
-      const routeEdges               = extractRouteEdges(source, filePath, mountPrefix);
-      const pass1Edges               = [...edges, ...routeEdges];
+      const { literals, configRefs } = extractLiterals(source, relPath, nodes);
+      const summaries = buildNodeSummaries(nodes, literals, configRefs, relPath);
+      const retrievalDocs = buildRetrievalDocuments(nodes, literals, configRefs, relPath);
+
+      // WM-10: routePrefixMap is now keyed by normalized relPath
+      const mountPrefix = routePrefixMap.get(normalizePath(relPath)) || "";
+      const routeEdges = extractRouteEdges(source, relPath, mountPrefix);
+      const pass1Edges = [...edges, ...routeEdges];
 
       writeFileGraph({
-        filePath,
-        language:     getLanguageForFile(filePath)?.language || "unknown",
+        filePath: relPath,
+        language: getLanguageForFile(filePath)?.language || "unknown",
         lastModified: mtime,
         nodes,
-        edges:        pass1Edges,
+        edges: pass1Edges,
         literals,
         configRefs,
         summaries,
       });
 
-      // WM-1: Store symbol edges (not route edges) for Pass 2 reuse
       fileData.set(filePath, {
         source,
         nodes,
-        edges,          // ← symbol edges from extractSymbols — reused in Pass 2
-        routeEdges,     // ← route edges — reused in Pass 2
+        edges,
+        routeEdges,
         mtime,
         literals,
         configRefs,
         summaries,
         retrievalDocs,
+        relPath,
       });
 
       stats.indexed++;
@@ -457,21 +586,17 @@ export async function indexWorkspace(workspacePath, options = {}) {
       if (onProgress && i % 10 === 0) {
         onProgress({
           current: i + 1,
-          total:   stats.total,
-          file:    path.relative(workspacePath, filePath),
+          total: stats.total,
+          file: relPath,
           ...stats,
         });
       }
 
-      // WM-7: Yield after every file — prevents event loop blocking
-      // Old: yield every 5 files → up to 500ms blocking on large files
       await new Promise((r) => setImmediate(r));
-
     } catch (err) {
       stats.errors++;
-      if (process.env.CF_DEBUG_GRAPH === "1") {
-        console.warn(`[GraphMapper] ⚠️ Failed to index ${filePath}: ${err.message}`);
-      }
+      // WM-11: always log errors, not just in debug mode
+      console.warn(`[GraphMapper] ⚠️ Failed to index ${filePath}: ${err.message}`);
       await new Promise((r) => setImmediate(r));
     }
   }
@@ -481,27 +606,29 @@ export async function indexWorkspace(workspacePath, options = {}) {
   const allKnownSymbols = new Set(getAllNodeNames());
   console.log(`[GraphMapper] Global symbol set: ${allKnownSymbols.size} symbols`);
 
-  for (const [filePath, { source, nodes, edges, routeEdges, mtime, literals, configRefs, summaries }] of fileData) {
+  for (const [
+    filePath,
+    { source, nodes, edges, routeEdges, mtime, literals, configRefs, summaries, relPath },
+  ] of fileData) {
     try {
-      const callEdges = extractCallEdges(source, filePath, nodes, allKnownSymbols);
+      const callEdges = extractCallEdges(source, relPath, nodes, allKnownSymbols);
       if (callEdges.length === 0) continue;
 
-      // WM-1: Reuse edges from Pass 1 — no re-running tree-sitter
       const allEdges = [...edges, ...callEdges, ...routeEdges];
 
       writeFileGraph({
-        filePath,
-        language:     getLanguageForFile(filePath)?.language || "unknown",
+        filePath: relPath,
+        language: getLanguageForFile(filePath)?.language || "unknown",
         lastModified: mtime,
         nodes,
-        edges:        allEdges,
+        edges: allEdges,
         literals,
         configRefs,
         summaries,
       });
     } catch (err) {
       if (process.env.CF_DEBUG_GRAPH === "1") {
-        console.warn(`[GraphMapper] ⚠️ Pass 2 failed for ${filePath}: ${err.message}`);
+        console.warn(`[GraphMapper] ⚠️ Pass 2 failed for ${relPath}: ${err.message}`);
       }
     }
     await new Promise((r) => setImmediate(r));
@@ -520,13 +647,14 @@ export async function indexWorkspace(workspacePath, options = {}) {
     }
   }
 
-  const elapsed    = Date.now() - startTime;
+  const elapsed = Date.now() - startTime;
   const graphStats = getGraphStats();
   console.log(
     `[GraphMapper] ✅ Index complete in ${elapsed}ms | ` +
-    `Files: ${stats.indexed} indexed, ${stats.skipped} skipped, ${stats.errors} errors | ` +
-    `Graph: ${graphStats.node_count} nodes, ${graphStats.edge_count} edges ` +
-    `(${graphStats.calls_count} calls, ${graphStats.imports_count} imports, ${graphStats.routes_count} routes)`
+      `Files: ${stats.indexed} indexed, ${stats.skipped} skipped, ${stats.errors} errors | ` +
+      `Graph: ${graphStats.node_count} nodes, ${graphStats.edge_count} edges ` +
+      `(${graphStats.calls_count} calls, ${graphStats.imports_count} imports, ` +
+      `${graphStats.routes_count} routes)`
   );
 
   statsEmitter.updateGraphStats({
@@ -535,9 +663,9 @@ export async function indexWorkspace(workspacePath, options = {}) {
     files: stats.indexed + stats.skipped,
   });
 
-  // Store hashes for watcher change detection
+  // WM-8: store hashes with normalized absolute path as key
   for (const [fp, { source }] of fileData) {
-    fileHashes.set(fp, getFileHash(source));
+    fileHashes.set(normalizePath(fp), getFileHash(source));
   }
 
   return stats;
@@ -548,39 +676,43 @@ export async function indexWorkspace(workspacePath, options = {}) {
 // ─────────────────────────────────────────────
 
 export function watchWorkspace(workspacePath) {
-  const pendingFiles  = new Set();
-  let debounceTimer   = null;
+  // WM-8: normalize at entry so all internal operations use consistent paths
+  const normalizedWorkspacePath = normalizePath(path.resolve(workspacePath));
+
+  const pendingFiles = new Set();
+  let debounceTimer = null;
 
   const processChanges = async () => {
     const files = [...pendingFiles];
     pendingFiles.clear();
 
-    const allKnownSymbols  = new Set(getAllNodeNames());
-    let allRetrievalDocs   = [];
+    const allKnownSymbols = new Set(getAllNodeNames());
+    let allRetrievalDocs = [];
 
-    // WM-6: Collect all current workspace files for route prefix map rebuild
     const allWorkspaceFiles = [];
-    for (const f of walkDirectory(workspacePath)) allWorkspaceFiles.push(f);
+    for (const f of walkDirectory(normalizedWorkspacePath)) {
+      allWorkspaceFiles.push(f);
+    }
 
-    // Check if any changed file is a router mount file — if so, rebuild prefix map
     const hasRouterChange = files.some((f) => {
       try {
         const src = fs.readFileSync(f, "utf-8");
         return src.includes(".use(");
-      } catch { return false; }
+      } catch {
+        return false;
+      }
     });
 
     if (hasRouterChange) {
-      buildRoutePrefixMap(allWorkspaceFiles);
+      // WM-10: pass workspacePath for relPath computation
+      buildRoutePrefixMap(allWorkspaceFiles, normalizedWorkspacePath);
     }
 
     for (const filePath of files) {
       if (!getLanguageForFile(filePath)) continue;
 
-      // Small delay to let the editor finish writing
       await new Promise((r) => setTimeout(r, 200));
 
-      // WM-5: checkAndUpdateHash returns content so we don't read twice
       const { changed, content: source } = checkAndUpdateHash(filePath);
       if (!changed || source === null) {
         if (process.env.CF_DEBUG_GRAPH === "1") {
@@ -590,14 +722,15 @@ export function watchWorkspace(workspacePath) {
       }
 
       if (source.length === 0) {
-        fileHashes.delete(filePath);
+        fileHashes.delete(normalizePath(filePath));
         continue;
       }
 
       try {
         const stat = fs.statSync(filePath);
+        const relPath = normalizePath(path.relative(normalizedWorkspacePath, filePath));
 
-        const { nodes, edges } = extractSymbols(source, filePath);
+        const { nodes, edges } = extractSymbols(source, relPath);
 
         if (process.env.CF_DEBUG_GRAPH === "1") {
           const isSynthetic = nodes.length === 1 && nodes[0].name.startsWith("__module_");
@@ -611,38 +744,38 @@ export function watchWorkspace(workspacePath) {
           }
         }
 
-        const { literals, configRefs } = extractLiterals(source, filePath, nodes);
-        const summaries                = buildNodeSummaries(nodes, literals, configRefs, filePath);
-        const callEdges                = extractCallEdges(source, filePath, nodes, allKnownSymbols);
-        const watchMountPrefix         = routePrefixMap.get(filePath) || "";
-        const routeEdges               = extractRouteEdges(source, filePath, watchMountPrefix);
-        const allEdges                 = [...edges, ...callEdges, ...routeEdges];
+        const { literals, configRefs } = extractLiterals(source, relPath, nodes);
+        const summaries = buildNodeSummaries(nodes, literals, configRefs, relPath);
+        const callEdges = extractCallEdges(source, relPath, nodes, allKnownSymbols);
+
+        // WM-10: query with normalized relPath
+        const watchMountPrefix = routePrefixMap.get(normalizePath(relPath)) || "";
+        const routeEdges = extractRouteEdges(source, relPath, watchMountPrefix);
+        const allEdges = [...edges, ...callEdges, ...routeEdges];
 
         writeFileGraph({
-          filePath:     filePath.replace(/\\/g, "/"),
-          language:     getLanguageForFile(filePath)?.language || "unknown",
+          filePath: relPath,
+          language: getLanguageForFile(filePath)?.language || "unknown",
           lastModified: stat.mtimeMs,
           nodes,
-          edges:        allEdges,
+          edges: allEdges,
           literals,
           configRefs,
           summaries,
         });
 
-        const retrievalDocs = buildRetrievalDocuments(
-          nodes, literals, configRefs,
-          filePath.replace(/\\/g, "/")
-        );
+        const retrievalDocs = buildRetrievalDocuments(nodes, literals, configRefs, relPath);
         if (_symbolEmbedder && _symbolRetriever && retrievalDocs.length > 0) {
           allRetrievalDocs.push(...retrievalDocs);
         }
 
         console.log(
-          `[GraphMapper] 🔄 Re-indexed: ${path.relative(workspacePath, filePath)} ` +
-          `(${nodes.length} nodes, ${allEdges.length} edges, ${callEdges.length} call edges)`
+          `[GraphMapper] 🔄 Re-indexed: ${relPath} ` +
+            `(${nodes.length} nodes, ${allEdges.length} edges, ` +
+            `${callEdges.length} call edges)`
         );
 
-        // WM-2: Use registered callback instead of importing from proxy layer
+        // WM-2: callback with normalized absolute path
         _onFileChanged?.(filePath);
 
         try {
@@ -652,16 +785,17 @@ export function watchWorkspace(workspacePath) {
             edges: updated.edge_count,
             files: updated.file_count,
           });
-        } catch { /* stats update failure is non-fatal */ }
-
+        } catch {
+          /* stats update failure is non-fatal */
+        }
       } catch (err) {
         if (err.code !== "ENOENT") {
           console.warn(
             `[GraphMapper] ⚠️  Re-index failed for ${path.basename(filePath)}: ` +
-            `${err.code || err.message}`
+              `${err.code || err.message}`
           );
         }
-        fileHashes.delete(filePath);
+        fileHashes.delete(normalizePath(filePath));
       }
     }
 
@@ -670,11 +804,14 @@ export function watchWorkspace(workspacePath) {
         .then((count) => {
           if (process.env.CF_DEBUG_GRAPH === "1") {
             console.log(
-              `[GraphMapper] 🧠 Re-embedded ${count} symbols from ${files.length} changed file(s)`
+              `[GraphMapper] 🧠 Re-embedded ${count} symbols from ` +
+                `${files.length} changed file(s)`
             );
           }
         })
-        .catch(() => { /* embedding failure is non-fatal */ });
+        .catch(() => {
+          /* embedding failure is non-fatal */
+        });
     }
   };
 
@@ -682,16 +819,17 @@ export function watchWorkspace(workspacePath) {
   if (process.platform === "linux") {
     console.warn(
       `[GraphMapper] ⚠️  fs.watch with recursive:true is not supported on Linux. ` +
-      `Only files in the workspace root directory will be watched for changes. ` +
-      `Files in subdirectories (src/, controllers/, etc.) will NOT trigger re-indexing. ` +
-      `Consider adding 'chokidar' as a dependency for cross-platform recursive watching.`
+        `Only files in the workspace root directory will be watched for changes. ` +
+        `Files in subdirectories (src/, controllers/, etc.) will NOT trigger re-indexing. ` +
+        `Consider adding 'chokidar' as a dependency for cross-platform recursive watching.`
     );
   }
 
-  const watcher = fs.watch(workspacePath, { recursive: true }, (event, filename) => {
+  const watcher = fs.watch(normalizedWorkspacePath, { recursive: true }, (event, filename) => {
     if (!filename) return;
 
-    const fullPath    = path.join(workspacePath, filename).replace(/\\/g, "/");
+    // WM-8: normalize immediately — fs.watch emits backslashes on Windows
+    const fullPath = normalizePath(path.join(normalizedWorkspacePath, filename));
     const pathSegments = fullPath.split("/");
 
     if ([...IGNORE_DIRS].some((d) => pathSegments.includes(d))) return;
@@ -707,7 +845,7 @@ export function watchWorkspace(workspacePath) {
     debounceTimer = setTimeout(processChanges, 800);
   });
 
-  console.log(`[GraphMapper] 👁️  Watching: ${workspacePath}`);
+  console.log(`[GraphMapper] 👁️  Watching: ${normalizedWorkspacePath}`);
 
   return {
     stop: () => {

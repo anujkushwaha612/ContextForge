@@ -25,6 +25,19 @@
  *
  *   SE-4: import_statement removed from mapNodeTypeToKind — dead code,
  *         import nodes have no name and are always filtered out immediately.
+ *
+ *   SE-5: buildExportedNames regex pass added — corrects is_exported for
+ *         `export const fn = () => {}` pattern missed by native C++ extractor.
+ *         Native ExtractNodes only sets is_exported=true when the node type
+ *         string contains "export" — lexical_declaration nodes wrapping
+ *         exported arrow functions never match this check.
+ *
+ *   SE-6: Duplicate node deduplication added after native extraction.
+ *         C++ produces both export_statement and lexical_declaration nodes
+ *         for the same symbol. Without dedup, graphDb INSERT OR IGNORE keeps
+ *         whichever arrives first — which may be the non-exported duplicate,
+ *         causing is_exported=0 in the DB even after SE-5 correction.
+ *         Dedup keeps the exported version, falling back to higher complexity.
  */
 
 import { createRequire } from "module";
@@ -32,8 +45,8 @@ import path from "node:path";
 
 const require = createRequire(import.meta.url);
 
-let _native      = null;
-let _compressor  = null;
+let _native = null;
+let _compressor = null;
 let _nativeReady = false;
 
 function getNative() {
@@ -41,14 +54,14 @@ function getNative() {
   try {
     _native = require("../../native/build/Release/contextforge_native.node");
     _compressor = new _native.ASTCompressor({
-      preserveImports:          true,
-      preserveSignatures:       true,
-      preserveTypeAnnotations:  true,
-      preserveDecorators:       true,
-      vaultOnCompress:          false,
-      docstringMode:            2,    // REMOVE
-      maxBodyLines:             0,
-      minTokensToCompress:      0,
+      preserveImports: true,
+      preserveSignatures: true,
+      preserveTypeAnnotations: true,
+      preserveDecorators: true,
+      vaultOnCompress: false,
+      docstringMode: 2,
+      maxBodyLines: 0,
+      minTokensToCompress: 0,
     });
     _nativeReady = true;
   } catch (err) {
@@ -95,11 +108,6 @@ export function getLanguageForFile(filePath) {
 
 // ─────────────────────────────────────────────
 // Node type → kind mapping
-//
-// SE-3: Removed duplicate method_declaration key.
-// SE-4: Removed import_statement — import nodes have no name and are
-//       immediately filtered by the !raw.name check. Imports are handled
-//       by extractImportEdges, not as graph nodes.
 // ─────────────────────────────────────────────
 
 function mapNodeTypeToKind(nodeType) {
@@ -113,7 +121,6 @@ function mapNodeTypeToKind(nodeType) {
     generator_function_declaration: "function",
     class_declaration:              "class",
     class_expression:               "class",
-    // lexical/variable declarations — may be upgraded to arrow_function below
     lexical_declaration:            "const",
     variable_declaration:           "const",
     assignment_expression:          "const",
@@ -130,7 +137,6 @@ function mapNodeTypeToKind(nodeType) {
 
     // Go
     function_declaration_go:        "function",
-    // SE-3: single method_declaration entry (covers both Go and Java)
     method_declaration:             "method",
     type_declaration:               "class",
     assignment_statement:           "const",
@@ -156,6 +162,63 @@ function mapNodeTypeToKind(nodeType) {
 }
 
 // ─────────────────────────────────────────────
+// Export detection — JavaScript/TypeScript supplement
+//
+// SE-5: Native C++ ExtractNodes misses `export const fn = () => {}`
+// because it checks if the node type string contains "export" —
+// lexical_declaration nodes never match this. We run a regex pass
+// over the source to build a Set of exported names and correct
+// is_exported after the native pass.
+// ─────────────────────────────────────────────
+
+const EXPORT_CONST_PATTERN =
+  /^export\s+(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)/gm;
+
+const EXPORT_DEFAULT_PATTERN =
+  /^export\s+default\s+(?:function\s+)?([A-Za-z_$][A-Za-z0-9_$]*)/gm;
+
+const EXPORT_NAMED_PATTERN =
+  /^export\s+(?:async\s+)?(?:function|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)/gm;
+
+const EXPORT_LIST_PATTERN =
+  /^export\s*\{([^}]+)\}/gm;
+
+function buildExportedNames(source, language) {
+  if (!["javascript", "typescript", "tsx"].includes(language)) {
+    return null;
+  }
+
+  const exported = new Set();
+
+  EXPORT_CONST_PATTERN.lastIndex = 0;
+  let m;
+  while ((m = EXPORT_CONST_PATTERN.exec(source)) !== null) {
+    exported.add(m[1]);
+  }
+
+  EXPORT_NAMED_PATTERN.lastIndex = 0;
+  while ((m = EXPORT_NAMED_PATTERN.exec(source)) !== null) {
+    exported.add(m[1]);
+  }
+
+  EXPORT_DEFAULT_PATTERN.lastIndex = 0;
+  while ((m = EXPORT_DEFAULT_PATTERN.exec(source)) !== null) {
+    exported.add(m[1]);
+  }
+
+  EXPORT_LIST_PATTERN.lastIndex = 0;
+  while ((m = EXPORT_LIST_PATTERN.exec(source)) !== null) {
+    const names = m[1]
+      .split(",")
+      .map((s) => s.trim().split(/\s+as\s+/)[0].trim())
+      .filter((s) => /^[A-Za-z_$]/.test(s));
+    for (const name of names) exported.add(name);
+  }
+
+  return exported;
+}
+
+// ─────────────────────────────────────────────
 // Tree-sitter extraction
 // ─────────────────────────────────────────────
 
@@ -173,6 +236,9 @@ function treesitterExtract(source, language, filePath) {
     return { nodes: [], edges: [] };
   }
 
+  // SE-5: Build export name set for is_exported correction
+  const exportedNames = buildExportedNames(source, language);
+
   const nodes = [];
   const edges = [];
   const MAX_BODY_LINES = 100;
@@ -182,35 +248,38 @@ function treesitterExtract(source, language, filePath) {
     if (!kind) continue;
     if (!raw.name || raw.name.trim() === "") continue;
 
-    // Upgrade "const" → function kind for function-valued declarations
     if (kind === "const") {
-      const initType    = raw.initializer_type || "";
+      const initType = raw.initializer_type || "";
       const isFunctionInit = [
-        "arrow_function", "function_expression", "generator_function",
-        "lambda", "func_literal", "closure_expression",
+        "arrow_function",
+        "function_expression",
+        "generator_function",
+        "lambda",
+        "func_literal",
+        "closure_expression",
       ].includes(initType);
       const isAsyncDecl = raw.is_async === true;
 
       if (isFunctionInit || isAsyncDecl) {
-        kind = (
+        kind =
           initType === "arrow_function" ||
           initType === "closure_expression" ||
           initType === "lambda"
-        ) ? "arrow_function" : "function";
+            ? "arrow_function"
+            : "function";
       } else {
-        // Keep non-function constants only at module root level (depth ≤ 2)
         if ((raw.depth || Infinity) <= 2) {
           kind = "const";
         } else {
-          continue; // local variable — not useful in call graph
+          continue;
         }
       }
     }
 
-    const startLine      = raw.start_line      ?? 0;
-    const endLine        = raw.end_line        ?? startLine;
-    const bodyStartLine  = raw.body_start_line ?? startLine;
-    const bodyEndLine    = raw.body_end_line   ?? endLine;
+    const startLine     = raw.start_line      ?? 0;
+    const endLine       = raw.end_line        ?? startLine;
+    const bodyStartLine = raw.body_start_line ?? startLine;
+    const bodyEndLine   = raw.body_end_line   ?? endLine;
 
     const signatureLines = sourceLines.slice(startLine, bodyStartLine);
     const bodyLines      = sourceLines.slice(
@@ -221,31 +290,34 @@ function treesitterExtract(source, language, filePath) {
     const actualBodyLines = bodyEndLine - bodyStartLine + 1;
     const wasTruncated    = actualBodyLines > MAX_BODY_LINES;
 
-    // SE-1: Reference read_function/read_file_chunk, not contextforge_retrieve.
-    // Graph node bodies are not vaulted — contextforge_retrieve needs a vault ID.
     const truncationNote = wasTruncated
-      ? [`// ... ${actualBodyLines - MAX_BODY_LINES} more lines. ` +
-         `Use read_function('${raw.name}') or read_file_chunk to get the full body.`]
+      ? [
+          `// ... ${actualBodyLines - MAX_BODY_LINES} more lines. ` +
+            `Use read_function('${raw.name}') or read_file_chunk to get the full body.`,
+        ]
       : [];
 
-    const bodyText = [
-      ...signatureLines,
-      ...bodyLines,
-      ...truncationNote,
-    ].join("\n").trimEnd();
+    const bodyText = [...signatureLines, ...bodyLines, ...truncationNote]
+      .join("\n")
+      .trimEnd();
+
+    // SE-5: Correct is_exported — native misses export const arrow functions
+    const isExported = raw.is_exported
+      ? true
+      : (exportedNames?.has(raw.name) ?? false);
 
     nodes.push({
       name:       raw.name,
       kind,
       startLine,
       endLine,
-      isExported: raw.is_exported || false,
+      isExported,
       isAsync:    raw.is_async    || false,
       complexity: raw.complexity  || 0,
       bodyText,
     });
 
-    if (raw.is_exported) {
+    if (isExported) {
       edges.push({
         targetSymbol: raw.name,
         targetFile:   filePath,
@@ -255,11 +327,40 @@ function treesitterExtract(source, language, filePath) {
     }
   }
 
-  // Synthesize virtual module-scope node for procedural top-level scripts.
-  // bodyText: null — extractCallEdges detects this and scans entire source instead.
-  if (nodes.length === 0 && source.length > 200 && source.includes("(")) {
+  // ── SE-6: Deduplicate nodes by name ───────────────────────────────────
+  // C++ produces both export_statement and lexical_declaration nodes for
+  // `export const fn = () => {}` — same name, different types.
+  // graphDb uses INSERT OR IGNORE so whichever arrives first wins.
+  // Without dedup, the non-exported duplicate can arrive first and persist
+  // as is_exported=0 even after the SE-5 correction above sets isExported=true
+  // on both — because INSERT OR IGNORE silently discards the second insert.
+  //
+  // Resolution priority:
+  //   1. Exported beats non-exported
+  //   2. Higher complexity beats lower (more informative body)
+  //   3. First seen wins on tie
+  const nameMap = new Map();
+  for (const node of nodes) {
+    const existing = nameMap.get(node.name);
+    if (!existing) {
+      nameMap.set(node.name, node);
+    } else {
+      const newWins =
+        (node.isExported && !existing.isExported) ||
+        (node.isExported === existing.isExported &&
+          node.complexity > existing.complexity);
+      if (newWins) nameMap.set(node.name, node);
+    }
+  }
+
+  const dedupedNodes = [...nameMap.values()].sort(
+    (a, b) => a.startLine - b.startLine
+  );
+
+  // Synthesize virtual module-scope node for procedural scripts
+  if (dedupedNodes.length === 0 && source.length > 200 && source.includes("(")) {
     const baseName = path.basename(filePath, path.extname(filePath));
-    nodes.push({
+    dedupedNodes.push({
       name:       `__module_${baseName}`,
       kind:       "function",
       startLine:  0,
@@ -274,7 +375,7 @@ function treesitterExtract(source, language, filePath) {
   const importEdges = extractImportEdges(source, language, filePath);
   edges.push(...importEdges);
 
-  return { nodes, edges };
+  return { nodes: dedupedNodes, edges };
 }
 
 // ─────────────────────────────────────────────
@@ -288,19 +389,12 @@ const IMPORT_PATTERNS = {
     /(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
     /(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
   ],
-  python: [
-    /from\s+([\w.]+)\s+import\s+([^#\n]+)/g,
-    /^import\s+([\w.]+)/gm,
-  ],
-  go:   [/import\s+"([^"]+)"/g, /"([\w./]+)"/g],
-  rust: [/use\s+([\w:]+)::(\w+)/g, /use\s+([\w:]+)::\{([^}]+)\}/g],
-  cpp:  [/#include\s+"([^"]+)"/g, /#include\s+<([^>]+)>/g],
+  python: [/from\s+([\w.]+)\s+import\s+([^#\n]+)/g, /^import\s+([\w.]+)/gm],
+  go:     [/import\s+"([^"]+)"/g, /"([\w./]+)"/g],
+  rust:   [/use\s+([\w:]+)::(\w+)/g, /use\s+([\w:]+)::\{([^}]+)\}/g],
+  cpp:    [/#include\s+"([^"]+)"/g, /#include\s+<([^>]+)>/g],
 };
 
-/**
- * SE-2: resolveImportPath now accepts the importing file's extension
- * so TypeScript imports resolve to .ts not .js.
- */
 function resolveImportPath(fromDir, importPath, importingFileExt = ".js") {
   try {
     const clean  = importPath.split("?")[0].split("#")[0];
@@ -310,9 +404,6 @@ function resolveImportPath(fromDir, importPath, importingFileExt = ".js") {
       return path.resolve(fromDir, clean).replace(/\\/g, "/");
     }
 
-    // SE-2: Try the same extension as the importing file first,
-    // then fall back to .js. This ensures TypeScript imports resolve
-    // to .ts files rather than non-existent .js files.
     const preferredExt = [".ts", ".tsx", ".jsx"].includes(importingFileExt)
       ? importingFileExt
       : ".js";
@@ -328,9 +419,7 @@ function extractImportEdges(source, language, filePath) {
   const lang     = language === "typescript" || language === "tsx" ? "javascript" : language;
   const patterns = IMPORT_PATTERNS[lang] || IMPORT_PATTERNS.javascript;
   const fileDir  = path.dirname(filePath);
-
-  // SE-2: Detect the extension of the importing file for resolveImportPath
-  const fileExt = path.extname(filePath).toLowerCase();
+  const fileExt  = path.extname(filePath).toLowerCase();
 
   for (const pattern of patterns) {
     pattern.lastIndex = 0;
@@ -447,7 +536,10 @@ function regexExtract(source, filePath) {
     const name      = match[1];
     const startLine = charToLine(match.index);
     const endLine   = Math.min(startLine + 50, lines.length - 1);
-    const bodyLines = lines.slice(startLine, Math.min(endLine + 1, startLine + MAX_BODY_LINES));
+    const bodyLines = lines.slice(
+      startLine,
+      Math.min(endLine + 1, startLine + MAX_BODY_LINES)
+    );
 
     nodes.push({
       name,
@@ -466,7 +558,10 @@ function regexExtract(source, filePath) {
     const name      = match[1];
     const startLine = charToLine(match.index);
     const endLine   = Math.min(startLine + 100, lines.length - 1);
-    const bodyLines = lines.slice(startLine, Math.min(endLine + 1, startLine + MAX_BODY_LINES));
+    const bodyLines = lines.slice(
+      startLine,
+      Math.min(endLine + 1, startLine + MAX_BODY_LINES)
+    );
 
     nodes.push({
       name,
@@ -490,13 +585,6 @@ function regexExtract(source, filePath) {
 // Main export
 // ─────────────────────────────────────────────
 
-/**
- * Extract all symbols from a source file.
- *
- * @param {string} source     - File contents
- * @param {string} filePath   - Absolute or workspace-relative path
- * @returns {{ nodes: Node[], edges: Edge[] }}
- */
 export function extractSymbols(source, filePath) {
   if (!source || source.length === 0) return { nodes: [], edges: [] };
 

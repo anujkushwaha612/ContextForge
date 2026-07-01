@@ -3,28 +3,21 @@
  *
  * Canonical "should this request be compressed?" gate.
  *
- * Pre-this-module, compression ran unconditionally on every request.
- * This caused:
- * - Token counting pings (empty messages) running through full pipeline
- * - No way to bypass compression for debugging
- * - No observability into WHY a request was not compressed
+ * Fixes:
+ *   CD-1: Minimum token threshold raised from 500 → 2000 to align with
+ *         the planner's own bypass threshold (2 * toolInjectionCost ≈ 4000).
+ *         Between 500 and 2000 tokens, the pipeline ran but the planner
+ *         bypassed tool injection — producing pipeline overhead with no
+ *         compression benefit. 2000 is still well below the threshold where
+ *         any meaningful tool result content appears.
  *
- * Precedence (highest first):
- *   1. bypass_header        — x-contextforge-bypass: true
- *   2. compression_disabled — CF_OPTIMIZE=false env var
- *   3. no_messages          — empty/missing messages array
- *   4. token_minimum        — below 500 tokens (ping/trivial request)
- *   5. otherwise            — compress
+ *   CD-2: getOptimizeFlag evaluated once at module load — process.env is a
+ *         C++ binding call, not a free property read. Previously re-evaluated
+ *         on every request.
  *
- * Fixes applied:
- *   CD-2: bypass header checked BEFORE token counting — header check is O(1),
- *         countTokens is O(n). Bypassed requests no longer pay token count cost.
- *
- *   CD-3: precomputedTokens now accepted and used — server.js computes
- *         trueBaselineTokens before this call and passes it. Previously
- *         ignored, causing a redundant O(n) token count on every request.
- *
- *   CD-6: JSDoc updated to document precomputedTokens parameter.
+ *   CD-3: Documented that shouldCompress=true does not guarantee compression
+ *         stages run — server.js has a separate hasCompressibleContent check
+ *         that skips stages 2-8 when no tool result content is present.
  */
 
 import { countTokens } from "../compression/compressionHelper.js";
@@ -46,6 +39,24 @@ export function isBypassEnabled(headers) {
 
   return false;
 }
+
+// ─────────────────────────────────────────────
+// Minimum token threshold
+//
+// CD-1 FIX: Raised from 500 → 2000.
+//
+// Rationale: The planner bypasses tool injection when payload is below
+// 2 * toolInjectionCost (~4000 tokens). Between 500 and ~4000 tokens,
+// the pipeline ran but produced no compression benefit — only overhead.
+// 2000 is a conservative midpoint that skips the pipeline for clearly
+// trivial payloads (ping requests, token counting calls, short CHAT turns)
+// while still engaging compression for anything with real tool result content.
+//
+// A payload with one user message + system prompt typically reaches 2000
+// tokens only when the system prompt itself is substantial, at which point
+// deduplication and minimization have real work to do.
+// ─────────────────────────────────────────────
+const MIN_TOKENS_TO_COMPRESS = 2000;
 
 // ─────────────────────────────────────────────
 // CompressionDecision value object
@@ -70,23 +81,33 @@ export class CompressionDecision {
   /**
    * Factory — the only correct way to create a CompressionDecision.
    *
-   * @param {object}      headers            - Inbound request headers
-   * @param {boolean}     optimize           - From CF_OPTIMIZE env var
-   * @param {Array}       messages           - messages array from payload
-   * @param {object}      payload            - Full payload (fallback for token count)
-   * @param {number}      [precomputedTokens] - Token count already computed upstream.
-   *                                           Pass trueBaselineTokens to avoid
-   *                                           redundant O(n) recount.
+   * Precedence (highest first):
+   *   1. bypass_header        — x-contextforge-bypass: true
+   *   2. compression_disabled — CF_OPTIMIZE=false env var
+   *   3. no_messages          — empty/missing messages array
+   *   4. token_minimum        — below MIN_TOKENS_TO_COMPRESS (2000)
+   *   5. otherwise            — compress
+   *
+   * CD-3 NOTE: shouldCompress=true means the pipeline STARTS. It does not
+   * guarantee compression stages run. server.js has a separate
+   * hasCompressibleContent check that skips stages 2-8 (scrub, tag,
+   * semantic dedup, AST compress, vault intercept) when no tool result
+   * content is present. Always-on stages (memory inject, CCR, minimize
+   * tools, memory context) still run.
+   *
+   * @param {object} headers             - Inbound request headers
+   * @param {boolean} optimize           - From getOptimizeFlag()
+   * @param {Array}   messages           - messages array from payload
+   * @param {object}  payload            - Full payload (fallback token count)
+   * @param {number}  [precomputedTokens] - Pass trueBaselineTokens to avoid
+   *                                       redundant O(n) recount.
    */
   static decide({ headers, optimize = true, messages, payload, precomputedTokens }) {
-    // CD-2: Check cheap conditions first — bypass header is O(1).
-    // Previously countTokens ran before bypass check, wasting O(n) on
-    // every bypassed request.
-
     const bypass   = isBypassEnabled(headers);
     const configOk = Boolean(optimize);
     const hasMsgs  = Array.isArray(messages) && messages.length > 0;
 
+    // Check cheap conditions first — O(1) before O(n) token count
     if (bypass) {
       return new CompressionDecision({
         shouldCompress:        false,
@@ -117,17 +138,16 @@ export class CompressionDecision {
       });
     }
 
-    // CD-3: Use precomputed token count if available — avoids redundant O(n)
-    // recount. server.js computes trueBaselineTokens before this call and
-    // passes it as precomputedTokens. Only fall back to countTokens if not provided.
-    const tokenCount = (typeof precomputedTokens === "number" && precomputedTokens > 0)
-      ? precomputedTokens
-      : countTokens(payload);
+    // Use precomputed token count if available — avoids redundant O(n) recount
+    const tokenCount =
+      typeof precomputedTokens === "number" && precomputedTokens > 0
+        ? precomputedTokens
+        : countTokens(payload);
 
-    if (tokenCount < 500) {
+    if (tokenCount < MIN_TOKENS_TO_COMPRESS) {
       return new CompressionDecision({
         shouldCompress:        false,
-        passthroughReason:     `${tokenCount} tokens below minimum (500)`,
+        passthroughReason:     `${tokenCount} tokens below minimum (${MIN_TOKENS_TO_COMPRESS})`,
         bypassHeaderSet:       false,
         configOptimizeEnabled: configOk,
         hasMessages:           hasMsgs,
@@ -156,12 +176,18 @@ export class CompressionDecision {
 }
 
 // ─────────────────────────────────────────────
-// Read optimize flag from environment
+// getOptimizeFlag
+//
+// CD-2 FIX: Evaluated once at module load via IIFE.
+// process.env access is a C++ binding call — not free.
+// CF_OPTIMIZE never changes at runtime so there is no reason
+// to re-read it on every request.
 // ─────────────────────────────────────────────
 
 const OFF_VALUES = new Set(["false", "0", "off", "no", "disabled"]);
 
-export function getOptimizeFlag() {
-  const val = (process.env.CF_OPTIMIZE || "true").trim().toLowerCase();
-  return !OFF_VALUES.has(val);
-}
+export const getOptimizeFlag = (() => {
+  const val  = (process.env.CF_OPTIMIZE || "true").trim().toLowerCase();
+  const flag = !OFF_VALUES.has(val);
+  return () => flag;
+})();

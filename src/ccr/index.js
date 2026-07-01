@@ -105,24 +105,38 @@ export function applyCCRPipeline(payload, tokenCount = null) {
   // ── Step 1: Find vault stubs in NEW messages only ─────────────────────
   const newVaultIds = scanNewMessagesOnly(sessionId, payload.messages);
 
-  // Register newly discovered vault IDs in the session
   for (const vaultId of newVaultIds) {
     session.addDiscoveredVaultId(vaultId);
+    // Track which turn each vault was first discovered
+    session.vaultDiscoveredAtTurn(vaultId);
   }
 
   // ── Step 2: Compute UNRETRIEVED vaults in current payload ─────────────
-  // Scan the FULL current payload (not just new messages) for vault stubs.
-  // This catches stubs that were injected by THIS pipeline run (fat catch,
-  // AST compressor) which haven't been seen in prior turns yet.
   const allCurrentVaultIds = scanForMarkers(payload.messages);
+  const currentTurn = session.turnNumber;
 
-  // Subtract vaults the LLM has already successfully retrieved.
-  // These are already in the LLM context window — no need to offer retrieval.
-  const unretrievedVaultIds = allCurrentVaultIds.filter(
-    (id) => !session.retrievedVaultIds.has(id)
-  );
+  // ── Step 3: Filter to vaults that are both unretrieved AND recent ─────
+  // If a vault has been unretrieved for more than MAX_UNRETRIEVED_TURNS,
+  // the LLM is clearly not going to retrieve it — it is using native tools
+  // or has moved on. Stop injecting the retrieve schema for stale vaults.
+  const MAX_UNRETRIEVED_TURNS = 3;
 
-  // ── Step 3: Inject tool only if there are unretrieved stubs ──────────
+  const unretrievedVaultIds = allCurrentVaultIds.filter((id) => {
+    if (session.retrievedVaultIds.has(id)) return false; // already retrieved
+
+    // Check staleness — how many turns since this vault was first seen?
+    const discoveredAt = session.vaultDiscoveredTurn?.get(id) ?? currentTurn;
+    const turnsUnretrieved = currentTurn - discoveredAt;
+
+    if (turnsUnretrieved > MAX_UNRETRIEVED_TURNS) {
+      // Vault has been sitting unretrieved for too long.
+      // LLM is not going to retrieve it — mark as stale, stop injecting.
+      return false;
+    }
+
+    return true;
+  });
+
   const shouldInject = unretrievedVaultIds.length > 0;
 
   if (!shouldInject) {
@@ -135,14 +149,14 @@ export function applyCCRPipeline(payload, tokenCount = null) {
   const { messages, tools, toolWasInjected } = injector.processRequest(
     payload.messages,
     payload.tools,
-    { sessionHasDoneCCR: false }, // never use sticky flag — let vault scan decide
+    { sessionHasDoneCCR: false }
   );
 
   if (toolWasInjected) {
     console.log(
       `[CCR] 💉 contextforge_retrieve injected — ` +
-      `${unretrievedVaultIds.length} unretrieved vault(s) in context ` +
-      `(session=${sessionId.slice(0, 8)})`
+        `${unretrievedVaultIds.length} unretrieved vault(s) in context ` +
+        `(session=${sessionId.slice(0, 8)})`
     );
   }
 
@@ -165,16 +179,13 @@ export function applyCCRPipeline(payload, tokenCount = null) {
 export function recordCCRSuccess(payload, vaultId) {
   if (!payload._sessionId || !vaultId) return;
 
-  const session = sessionRegistry.getOrCreate(
-    payload._sessionId,
-    payload._workspaceKey || "",
-  );
+  const session = sessionRegistry.getOrCreate(payload._sessionId, payload._workspaceKey || "");
 
   session.markVaultRetrieved(vaultId);
 
   console.log(
     `[CCR] ✅ Vault ${vaultId} marked as retrieved — ` +
-    `will not re-inject for this vault ` +
-    `(session=${payload._sessionId.slice(0, 8)})`
+      `will not re-inject for this vault ` +
+      `(session=${payload._sessionId.slice(0, 8)})`
   );
 }

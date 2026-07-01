@@ -8,8 +8,9 @@ const __dirname = path.dirname(__filename);
 
 const db = new Database(path.join(__dirname,  "../data/contextforge.db"));
 
-// CRITICAL: Enable foreign keys for CASCADE DELETE
-db.exec(`PRAGMA foreign_keys = ON`);
+// CRITICAL: Enable foreign keys for CASCADE DELETE and WAL mode for concurrency
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS semantic_cache (

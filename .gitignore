@@ -19,6 +19,8 @@ data/
 
 # Machine Learning Models (large binaries)
 contextforge_models/
+debug_translation/
+.contextforge
 
 # Claude CLI data
 .claude/

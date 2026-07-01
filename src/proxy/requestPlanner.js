@@ -18,7 +18,7 @@
  *   4. Capability Set output — planner returns a Set of capability
  *      strings. Extensible without touching the decision matrix.
  *
- *   5. CONTINUATION carries forward the last known capability set
+ *   5. CONTINUATION carries forward the classified capability set
  *      instead of always returning FULL. This prevents tool
  *      re-injection on every follow-up turn.
  *
@@ -27,12 +27,34 @@
  *   PATCH  — contextforge_patch_ast
  *   READ   — contextforge_read_file_chunk
  *
- * Intent → Capability mapping (corrected):
+ * Intent → Capability mapping:
  *   PATCH    → { PATCH }                    targeted edit, scope known
  *   DEBUG    → { GRAPH, PATCH, READ }       exploratory fix, scope unknown
  *   SEARCH   → { GRAPH, READ }              read-only exploration
  *   CREATE   → { PATCH }                    write new file, no exploration needed
  *   CHAT     → { }                          bypass entirely
+ *
+ * Fixes applied:
+ *   BUG-8:  \bimport\b removed from SEARCH patterns — fired on "importing it"
+ *           inside CREATE instructions, suppressing confidence below threshold
+ *           and forcing unnecessary semantic lookup on unambiguous tasks.
+ *           Replaced with structurally-anchored import/export query patterns.
+ *
+ *   BUG-9:  Confidence formula changed from (winner-runner)/total to
+ *           (winner-runner)/winner. Previous formula penalized high-signal
+ *           messages: CREATE=7, SEARCH=3 → confidence=0.4 (wrong, triggers
+ *           semantic). New formula: (7-3)/7 = 0.57 (correct, stays regex).
+ *
+ *   BUG-10: Semantic anchor phrases audited. Ambiguous phrases that describe
+ *           unknown problems ("there is something off", "make it better",
+ *           "this seems inefficient") moved from PATCH to DEBUG anchors.
+ *           PATCH anchors now only contain genuinely targeted edits with
+ *           known scope.
+ *
+ *   BUG-11: CONTINUATION + hasPriorTools expansion now handles the case
+ *           where CHAT was a likely misclassification of a transition message
+ *           in an active tool session. If any non-CHAT signals scored > 0,
+ *           the highest non-CHAT intent is promoted rather than staying bypassed.
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -50,12 +72,15 @@ export const CAPABILITIES = Object.freeze({
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scored regex patterns
-// All patterns are evaluated — scores accumulate per intent.
-// Each pattern carries a weight: strong signals score 2+, weak score 1.
 //
-// PATCH vs DEBUG distinction:
-//   PATCH = targeted edit with known scope ("fix typo", "rename variable")
-//   DEBUG = exploratory fix with unknown scope ("fix auth", "debug crash")
+// BUG-8 FIX: \bimport\b and \bexport\b removed from SEARCH patterns.
+// These words appear in CREATE instructions ("importing it", "wire this in
+// by importing") and caused SEARCH to accumulate score on unambiguously
+// CREATE tasks, dragging confidence below the 0.5 threshold and triggering
+// unnecessary semantic lookup.
+//
+// Replacement: structurally-anchored patterns that require query context
+// ("where is it imported", "what imports this") rather than bare word match.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const INTENT_PATTERNS = [
@@ -82,11 +107,7 @@ const INTENT_PATTERNS = [
   },
   { intent: "PATCH", weight: 2, regex: /\bmodify\b|\badjust\b|\btweak\b/i },
   { intent: "PATCH", weight: 2, regex: /\bwrap\b|\bsurround\b|\benclose\b/i },
-  {
-    intent: "PATCH",
-    weight: 1,
-    regex: /\bremove\b|\bdelete\b/i,
-  },
+  { intent: "PATCH", weight: 1, regex: /\bremove\b|\bdelete\b/i },
   { intent: "PATCH", weight: 1, regex: /\bclean up\b|\bimprove\b/i },
 
   // ── DEBUG signals (exploratory fixes — scope unknown) ────────────────────
@@ -134,16 +155,26 @@ const INTENT_PATTERNS = [
   { intent: "SEARCH", weight: 2, regex: /which file|show me|list all/i },
   { intent: "SEARCH", weight: 2, regex: /\bcall\b|\bdepend\b|\binternally\b/i },
   { intent: "SEARCH", weight: 1, regex: /\bsymbol\b|\broute\b|\bendpoint\b/i },
+  // BUG-8 FIX: Replaced bare \bimport\b|\bexport\b with structurally-anchored
+  // patterns. The old pattern fired on "importing it" inside CREATE instructions.
+  // New patterns require query framing ("where is X imported", "what exports Y").
+  {
+    intent: "SEARCH",
+    weight: 2,
+    regex: /\bwhere\s+is\s+(it\s+)?imported\b|\bwhat\s+imports\b|\bwho\s+imports\b/i,
+  },
+  {
+    intent: "SEARCH",
+    weight: 2,
+    regex: /\bwhat\s+(does\s+this\s+)?exports?\b|\bwho\s+exports\b/i,
+  },
   {
     intent: "SEARCH",
     weight: 1,
-    regex: /\bdefined\b|\bdeclared\b|\bimported\b|\bimport\b|\bexport\b/i,
+    regex: /\bdefined\b|\bdeclared\b/i,
   },
 
   // ── CREATE signals ────────────────────────────────────────────────────────
-  // NOTE: \badd\b and \binsert\b intentionally removed from CREATE —
-  // they are stronger PATCH signals and caused CREATE+PATCH multi-task
-  // collisions that previously forced every add/insert into DEBUG.
   {
     intent: "CREATE",
     weight: 2,
@@ -196,15 +227,25 @@ const INTENT_PATTERNS = [
 /**
  * Score all intents against the message.
  *
- * FIX: Removed the multi-task CREATE+PATCH → DEBUG forced override.
- * That heuristic caused any message with "add" (PATCH) + "create" (CREATE)
- * to force DEBUG with confidence 1, bypassing semantic lookup entirely
- * and always returning FULL_CAPABILITY_SET.
+ * BUG-9 FIX: Confidence formula changed from:
+ *   (winnerScore - runnerScore) / totalScore
+ * to:
+ *   (winnerScore - runnerScore) / winnerScore
  *
- * The correct behavior: let the winner win. If the scores are ambiguous,
- * the confidence will naturally be low and semantic lookup will run.
+ * Problem with old formula: totalScore grows with the winner's own score,
+ * so messages with MORE evidence for the winning intent paradoxically produce
+ * LOWER confidence. Example:
+ *   CREATE=7, SEARCH=3 → old: (7-3)/10 = 0.40 (triggers semantic — wrong)
+ *                       → new: (7-3)/7  = 0.57 (stays regex — correct)
  *
- * Returns { intent, score, confidence, allScores, matchedPatterns }
+ * The new formula measures the winner's margin as a fraction of its own
+ * score (how dominant is it over the runner-up), which is the correct
+ * definition of classification confidence.
+ *
+ * Edge cases:
+ *   - winnerScore === 0 (nothing matched) → confidence = 0 (semantic runs)
+ *   - winnerScore === runnerScore (perfect tie) → confidence = 0 (semantic runs)
+ *   - Only winner scored (runner = 0) → confidence = 1.0 (no semantic needed)
  */
 function scoreIntents(message) {
   const scores = {
@@ -234,8 +275,11 @@ function scoreIntents(message) {
   const [winnerIntent, winnerScore] = sorted[0];
   const runnerScore = sorted[1]?.[1] ?? 0;
 
+  // BUG-9 FIX: Use winnerScore as denominator, not totalScore
+  const confidence =
+    winnerScore === 0 ? 0 : (winnerScore - runnerScore) / winnerScore;
+
   const totalScore = Object.values(scores).reduce((a, b) => a + b, 0);
-  const confidence = totalScore === 0 ? 0 : (winnerScore - runnerScore) / totalScore;
 
   return {
     intent: totalScore === 0 ? "CHAT" : winnerIntent,
@@ -248,23 +292,6 @@ function scoreIntents(message) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Capability matrix
-//
-// FIX: CREATE now maps to { PATCH } only.
-//   Old: CREATE → { GRAPH, READ }  (speculative exploration before scaffolding)
-//   New: CREATE → { PATCH }        (write the file, ask for context if needed)
-//
-// Rationale: The LLM already knows how to create a file. Pre-injecting GRAPH
-// and READ speculatively on every CREATE task adds ~24,000 tokens of tool
-// schema for no benefit. If the LLM needs to read an existing file for
-// context (e.g. to match a pattern), it will call READ explicitly.
-//
-// FIX: PATCH now maps to { PATCH } only.
-//   Old: PATCH → { GRAPH, PATCH, READ }  (targeted edit but with full exploration)
-//   New: PATCH → { PATCH }               (targeted edit, scope is already known)
-//
-// Rationale: A targeted PATCH task ("rename variable X to Y") does not need
-// graph traversal. The comment "targeted edit (known scope)" contradicted
-// the actual GRAPH+READ injection. Scope is known → no exploration needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CAPABILITY_MATRIX = {
@@ -275,25 +302,58 @@ const CAPABILITY_MATRIX = {
   CHAT: new Set(),
 };
 
-const FULL_CAPABILITY_SET = new Set([CAPABILITIES.GRAPH, CAPABILITIES.PATCH, CAPABILITIES.READ]);
+const FULL_CAPABILITY_SET = new Set([
+  CAPABILITIES.GRAPH,
+  CAPABILITIES.PATCH,
+  CAPABILITIES.READ,
+]);
 
 const EMPTY_CAPABILITY_SET = new Set();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Semantic anchor store
+//
+// BUG-10 FIX: Anchor phrases audited and reassigned.
+//
+// PATCH anchors previously contained phrases that describe unknown problems:
+//   "there is something off with this"  → moved to DEBUG
+//   "this does not look right"          → moved to DEBUG
+//   "make it better"                    → moved to DEBUG (unknown problem)
+//   "this seems inefficient"            → moved to DEBUG (requires investigation)
+//   "can you improve this function"     → moved to DEBUG (scope unknown)
+//
+// Rationale: PATCH = targeted edit with KNOWN scope. If the scope is unknown
+// ("something is off", "make it better"), the agent needs to investigate
+// first — that's DEBUG territory which requires GRAPH + READ tools.
+// Misclassifying these as PATCH meant the agent tried to edit without first
+// understanding where the problem was.
+//
+// PATCH anchors now only contain phrases where the edit target is explicit
+// and contained in the instruction itself.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SEMANTIC_ANCHORS = {
   PATCH: [
-    "make it better",
+    // Genuinely targeted edits — scope is stated in the instruction
+    "rename this variable to something clearer",
+    "change the return type to string",
+    "extract this block into a helper function",
+    "update the error message text",
     "clean this up a bit",
-    "this needs to be updated",
-    "can you improve this function",
-    "this seems inefficient",
-    "there is something off with this",
-    "this does not look right",
+    "this needs to be updated with the new field",
+    "replace the hardcoded value with a constant",
+    "add a null check before this line",
+    "remove the console log from this function",
+    "swap the order of these two parameters",
   ],
   DEBUG: [
+    // BUG-10 FIX: Moved ambiguous phrases from PATCH to DEBUG
+    "there is something off with this",
+    "this does not look right",
+    "make it better",
+    "this seems inefficient",
+    "can you improve this function",
+    // Existing debug anchors (unchanged)
     "why is this failing",
     "something weird is happening",
     "this throws an error sometimes",
@@ -351,10 +411,6 @@ let _embedder = null;
 let _plannerReady = false;
 const _idToIntent = new Map();
 
-/**
- * Initialize the planner at startup.
- * Seeds the shared SemanticCache with anchor phrases.
- */
 export async function initPlanner(onnxEmbedder, semanticCache) {
   _embedder = onnxEmbedder;
   _plannerCache = semanticCache;
@@ -398,17 +454,15 @@ function extractLastUserMessage(payload) {
   return "";
 }
 
-/**
- * Semantic intent lookup via native SemanticCache HNSW.
- * Returns null if planner not ready, timeout, or score below threshold.
- */
 async function semanticLookup(message) {
   if (!_plannerReady || !_embedder || !_plannerCache) return null;
 
   try {
     const queryVec = await Promise.race([
       _embedder.embed(message),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("embed timeout")), 2000)),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("embed timeout")), 2000)
+      ),
     ]);
 
     const hits = _plannerCache.searchK(queryVec, 5);
@@ -448,30 +502,6 @@ async function semanticLookup(message) {
 const REGEX_CONFIDENCE_THRESHOLD = 0.5;
 const SEMANTIC_SCORE_THRESHOLD = 0.2;
 
-/**
- * Plan which capabilities this request needs.
- *
- * Decision order:
- *   1. originHint=CONTINUATION  → carry forward last known capabilities
- *                                  (not FULL — only what the task needs)
- *   2. hasPriorTools            → full arsenal (mid-session safety net,
- *                                  but only if origin detection also agrees)
- *   3. Empty message            → bypass
- *   4. Scored regex             → classify, check confidence
- *   5. Low confidence           → semantic HNSW lookup
- *   6. Low semantic score       → context signal check
- *   7. Final fallback           → CHAT bypass (safe default)
- *
- * FIX: CONTINUATION no longer returns FULL_CAPABILITY_SET unconditionally.
- * Instead it returns whatever the CAPABILITY_MATRIX says for the classified
- * intent from the actual message content. This prevents the situation where
- * a short acknowledgment in a CONTINUATION turn still injects all three tools.
- *
- * FIX: hasPriorTools no longer short-circuits to FULL_CAPABILITY_SET.
- * It now sets a flag that is used AFTER intent classification to ensure
- * we include PATCH capability (so the agent can keep patching mid-session)
- * without forcing GRAPH injection when it isn't needed.
- */
 export async function planPipeline(payload, sessionState, onnxEmbedder) {
   const { hasPriorTools, originHint } = sessionState;
 
@@ -489,8 +519,6 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
   }
 
   // ── 1. Scored regex classification (always runs first) ───────────────────
-  // Run this before any origin/session checks so we always have an
-  // intent-based capability set to work with.
   const regexResult = scoreIntents(lastMsg);
 
   const evidence = [
@@ -533,10 +561,11 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
       if (semResult) {
         evidence.push(`semantic_score=${semResult.score.toFixed(3)} (below threshold)`);
       } else {
-        evidence.push(`semantic_lookup=null (planner not ready or embed failed)`);
+        evidence.push(
+          `semantic_lookup=null (planner not ready or embed failed)`
+        );
       }
 
-      // Context signal: only upgrades CHAT → SEARCH, never overrides others
       const hasFileRef =
         /\.(js|ts|py|go|rs|jsx|tsx|java|rb|cpp)\b|function |class |const |route|endpoint|middleware/i.test(
           lastMsg
@@ -548,11 +577,10 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
         evidence.push(`context_signal=file_or_symbol_reference`);
         evidence.push(`chat_upgraded_to_search=true`);
       } else {
-        // Low confidence, semantic failed — safe default is CHAT (bypass)
-        // EXCEPT: if the message clearly has CREATE or PATCH signals,
-        // keep those — "create a file" with 0.14 confidence is still CREATE.
-        // Only fall to CHAT if total score is very low (< 3).
-        const totalScore = Object.values(regexResult.allScores).reduce((a, b) => a + b, 0);
+        const totalScore = Object.values(regexResult.allScores).reduce(
+          (a, b) => a + b,
+          0
+        );
         if (totalScore < 3 && regexResult.intent === "CHAT") {
           finalIntent = "CHAT";
           method = "safe_fallback";
@@ -560,7 +588,9 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
         } else {
           finalIntent = regexResult.intent;
           method = "regex_fallback";
-          evidence.push(`low_confidence_kept_regex_winner=${regexResult.intent}`);
+          evidence.push(
+            `low_confidence_kept_regex_winner=${regexResult.intent}`
+          );
         }
       }
     }
@@ -570,22 +600,55 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
   let capabilities = CAPABILITY_MATRIX[finalIntent] ?? EMPTY_CAPABILITY_SET;
 
   // ── 4. Origin and session adjustments ────────────────────────────────────
-  // These adjust the capability set AFTER intent classification.
-  // They do NOT override the classification — they can only expand it,
-  // and only when there is structural evidence to do so.
-
+  //
+  // BUG-11 FIX: The previous implementation only expanded capabilities when
+  // capabilities.size > 0. This meant a CHAT-classified CONTINUATION turn
+  // stayed bypassed even in an active tool session where CHAT was likely a
+  // misclassification of a transition message ("ok thanks, now also fix X").
+  //
+  // New behavior:
+  //   Case A: capabilities.size > 0 (non-CHAT intent) → ensure PATCH is present
+  //   Case B: capabilities.size === 0 (CHAT intent) in a session with prior tools
+  //           → check if any non-CHAT signals scored. If yes, promote to the
+  //             highest non-CHAT intent. If no (pure CHAT like "ok thanks"), stay
+  //             bypassed — the agent genuinely has nothing to do.
   if (originHint === "CONTINUATION" || hasPriorTools) {
-    // We are mid-session. The agent may need to keep patching.
-    // Ensure PATCH capability is always present in continuations
-    // so the agent is not left without its primary action tool.
-    // But do NOT force GRAPH — if the intent doesn't need it, don't add it.
     if (capabilities.size > 0) {
-      // Only expand if we are already injecting something.
-      // A CHAT-classified continuation stays bypassed.
+      // Case A: Non-CHAT intent — ensure PATCH is present for continuations
+      // so the agent can keep patching without losing its primary action tool.
+      // Do NOT add GRAPH unless the intent already requires it — that would
+      // re-inject the full tool schema unnecessarily.
       const expanded = new Set(capabilities);
       expanded.add(CAPABILITIES.PATCH);
       capabilities = expanded;
       evidence.push(`continuation_patch_ensured=true`);
+    } else if (hasPriorTools && finalIntent === "CHAT") {
+      // Case B: BUG-11 FIX — CHAT in an active tool session
+      // Check if any non-CHAT regex signals scored. If they did, CHAT was
+      // likely a misclassification caused by transition phrasing
+      // ("ok thanks, now also fix the auth bug").
+      const nonChatEntries = Object.entries(regexResult.allScores).filter(
+        ([k]) => k !== "CHAT"
+      );
+      const totalNonChat = nonChatEntries.reduce((sum, [, v]) => sum + v, 0);
+
+      if (totalNonChat > 0) {
+        // Promote to the highest-scoring non-CHAT intent
+        const nonChatWinner = nonChatEntries.sort((a, b) => b[1] - a[1])[0];
+        finalIntent = nonChatWinner[0];
+        capabilities = CAPABILITY_MATRIX[finalIntent] ?? EMPTY_CAPABILITY_SET;
+
+        // Ensure PATCH is present for the promoted intent too
+        const expanded = new Set(capabilities);
+        expanded.add(CAPABILITIES.PATCH);
+        capabilities = expanded;
+
+        evidence.push(
+          `continuation_chat_promoted_to=${finalIntent} (non_chat_score=${totalNonChat})`
+        );
+      }
+      // If totalNonChat === 0 (pure CHAT — "ok thanks", "looks good"),
+      // stay bypassed. The agent genuinely has nothing to do this turn.
     }
 
     if (originHint === "CONTINUATION") {
@@ -600,7 +663,9 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
 
   evidence.push(`final_intent=${finalIntent}`);
   evidence.push(`method=${method}`);
-  evidence.push(`capabilities=${Array.from(capabilities).join("+") || "none"}`);
+  evidence.push(
+    `capabilities=${Array.from(capabilities).join("+") || "none"}`
+  );
   evidence.push(`bypass=${bypass}`);
 
   return {

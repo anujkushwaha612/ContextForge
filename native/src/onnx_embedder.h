@@ -129,6 +129,7 @@ private:
     // OE-7: Renamed from stat_requests_ — counts cache misses (inference runs).
     // Total requests_processed = stat_cache_hits_ + stat_cache_misses_.
     uint64_t stat_cache_misses_       = 0;
+    uint64_t stat_batches_            = 0;
     double   stat_total_inference_ms_ = 0.0;
 };
 

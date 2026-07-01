@@ -7,7 +7,20 @@ import { createServer } from "node:net";
 import http from "node:http";
 import readline from "node:readline";
 
-const PROXY_URL = process.env.CONTEXTFORGE_PROXY_URL || "http://127.0.0.1:3000";
+import { getGraphToolDefinition, getReadFileChunkToolDefinition } from "../graph/graphTools.js";
+import { getPatchToolDefinition } from "../graph/patchTools.js";
+import { createCCRToolDefinition } from "../ccr/toolInjection.js";
+
+function adaptToMcp(toolDef) {
+  const f = toolDef?.function;
+  if (!f) return null;
+  return {
+    name: f.name,
+    description: f.description || "",
+    inputSchema: f.parameters || { type: "object", properties: {}, required: [] }
+  };
+}
+
 const PROXY_HOST = "127.0.0.1";
 const PROXY_PORT = 3000;
 
@@ -127,7 +140,11 @@ rl.on("line", async (line) => {
               required:   [],
             },
           },
-        ],
+          adaptToMcp(getGraphToolDefinition()),
+          adaptToMcp(getPatchToolDefinition()),
+          adaptToMcp(getReadFileChunkToolDefinition()),
+          adaptToMcp(createCCRToolDefinition("openai"))
+        ].filter(Boolean),
       },
     });
     return;
@@ -146,7 +163,7 @@ rl.on("line", async (line) => {
             {
               hostname: PROXY_HOST,
               port:     PROXY_PORT,
-              path:     "/v1/cache/reset",
+              path:     "/healthz",
               method:   "POST",
               headers:  { "Content-Length": "0" },
             },
@@ -207,6 +224,24 @@ rl.on("line", async (line) => {
                 text: `✅ Cache reset: ${JSON.stringify(result)}`,
               },
             ],
+          },
+        });
+        return;
+      }
+
+      if (["contextforge_query_graph", "contextforge_patch_ast", "read_file_chunk", "contextforge_retrieve"].includes(toolName)) {
+        const result = await forwardToProxy(toolName, toolArgs);
+        send({
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [
+              {
+                type: "text",
+                text: result.content || JSON.stringify(result),
+              },
+            ],
+            isError: !!result.error,
           },
         });
         return;

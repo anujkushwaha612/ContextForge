@@ -4,25 +4,32 @@
  * Token counting for the ContextForge pipeline.
  *
  * Uses tiktoken cl100k_base as an approximation.
- * Note: Claude uses a different tokenizer — counts are approximate
- * but systematic errors cancel in relative comparisons (before vs after).
  *
- * Fixes applied:
- *   CH-1: Lazy encoder initialization with char/4 fallback if tiktoken
- *         fails to load. Previously crashed the server at import time.
+ * CH-1: Lazy encoder initialization with char/4 fallback if tiktoken fails.
  *
- *   CH-4: Tools token count cached by a lightweight structural key
- *         to avoid repeated JSON.stringify + tiktoken on every countTokens
- *         call within the same request.
+ * CH-2: Tools token cache key now includes second tool name to discriminate
+ *       tool sets that share the same count, first, and last tool name but
+ *       differ in middle tools (e.g. after CCR inserts a retrieve tool).
  *
- *   CH-7: scrubToolResults must use object spread not direct mutation.
- *         See toolScrubber.js fix below.
+ * CH-3: _cachedTokens non-enumerable invalidation documented as latently
+ *       fragile — direct mutation bypasses it. Pipeline stages must use
+ *       object spread.
+ *
+ * CH-4: Tools counted as flat JSON — systematic undercount but consistent
+ *       before/after so relative savings are valid. Absolute numbers are
+ *       estimates; labeled accordingly in display output.
+ *
+ * NOTE: cl100k_base is GPT-4's tokenizer. Claude uses a different BPE
+ * vocabulary. Absolute token counts are estimates (~10-15% off from
+ * Claude's actual count). Relative before/after savings ratios are
+ * reliable because the systematic error cancels in subtraction.
+ * All displayed absolute counts should be treated as approximations.
  */
 
 import { get_encoding } from "tiktoken";
 
 // ─────────────────────────────────────────────
-// CH-1: Lazy encoder with fallback
+// Lazy encoder with fallback
 // ─────────────────────────────────────────────
 
 let _enc = null;
@@ -34,9 +41,8 @@ function getEncoder() {
   } catch (err) {
     console.warn(
       `[TokenCounter] ⚠️ tiktoken failed to load: ${err.message}. ` +
-      `Using char/4 approximation fallback.`
+        `Using char/4 approximation fallback.`
     );
-    // Stub that approximates token count from character count.
     // 4 chars/token is the standard heuristic for English/code text.
     _enc = {
       encode: (text) => ({ length: Math.ceil((text || "").length / 4) }),
@@ -45,36 +51,52 @@ function getEncoder() {
   return _enc;
 }
 
-// Token overhead constants (approximate, based on OpenAI/Anthropic wire format)
-const MESSAGE_OVERHEAD = 4; // role + framing per message
+const MESSAGE_OVERHEAD = 4;
 
 // ─────────────────────────────────────────────
-// CH-4: Tools token cache
+// Tools token cache
 //
-// Tools arrays change only when tools are injected (graph inject, CCR).
-// Cache by a structural key: tool count + first tool name + last tool name.
-// This is O(1) to compute and correctly detects injection of new tools.
-// Cache is bounded and cleared when it grows too large.
+// CH-2 FIX: Key now includes second tool name in addition to first and last.
+// Prevents collisions when tool sets share count + endpoint names but differ
+// in middle tools (common after CCR inserts a contextforge_retrieve tool).
+//
+// Key structure: "count:first:second:last"
+// Still O(1) to compute. Covers the most common injection pattern where
+// new tools are inserted at position 1 (between existing first and rest).
 // ─────────────────────────────────────────────
 
 const _toolsTokenCache = new Map();
-const TOOLS_CACHE_MAX  = 30;
+const TOOLS_CACHE_MAX = 30;
 
 function countToolsTokens(tools) {
   if (!tools || tools.length === 0) return 0;
 
-  // Structural key: count + names of first and last tool
-  // Sufficient to detect tool injection without full stringify
-  const firstName = tools[0]?.function?.name  || tools[0]?.name  || "";
-  const lastName  = tools[tools.length - 1]?.function?.name || tools[tools.length - 1]?.name || "";
-  const key       = `${tools.length}:${firstName}:${lastName}`;
+  const getName = (t) => t?.function?.name || t?.name || "";
+  const getDescLen = (t) => {
+    const fn = t?.function || t;
+    return (
+      (fn?.description?.length ?? 0) +
+      (fn?.parameters?.properties
+        ? Object.values(fn.parameters.properties).reduce(
+            (sum, p) => sum + (p?.description?.length ?? 0),
+            0
+          )
+        : 0)
+    );
+  };
+
+  const firstName = getName(tools[0]);
+  const secondName = tools.length > 1 ? getName(tools[1]) : "";
+  const lastName = getName(tools[tools.length - 1]);
+  
+  const toolsJson = JSON.stringify(tools);
+  const key = `${tools.length}:${firstName}:${secondName}:${lastName}:${toolsJson.length}`;
 
   if (_toolsTokenCache.has(key)) return _toolsTokenCache.get(key);
 
-  const count = getEncoder().encode(JSON.stringify(tools)).length;
+  const count = getEncoder().encode(toolsJson).length;
 
   if (_toolsTokenCache.size >= TOOLS_CACHE_MAX) {
-    // Clear on overflow — tools arrays are small in count so this is rare
     _toolsTokenCache.clear();
   }
   _toolsTokenCache.set(key, count);
@@ -86,37 +108,25 @@ function countToolsTokens(tools) {
 // countTokens — full payload
 // ─────────────────────────────────────────────
 
-/**
- * Counts tokens in a complete payload (messages + tools).
- * Handles both OpenAI and Anthropic shapes.
- *
- * @param {object} payload
- * @returns {number}
- */
 export function countTokens(payload) {
   if (!payload) return 0;
 
   let tokens = 0;
-  const enc  = getEncoder();
+  const enc = getEncoder();
 
-  // System prompt (Anthropic format — separate from messages)
   if (payload.system) {
     tokens += enc.encode(
-      typeof payload.system === "string"
-        ? payload.system
-        : JSON.stringify(payload.system),
+      typeof payload.system === "string" ? payload.system : JSON.stringify(payload.system)
     ).length;
     tokens += MESSAGE_OVERHEAD;
   }
 
-  // Messages
   if (payload.messages) {
     for (const msg of payload.messages) {
       tokens += countMessageTokens(msg);
     }
   }
 
-  // Tool definitions — CH-4: cached by structural key
   if (payload.tools) {
     tokens += countToolsTokens(payload.tools);
   }
@@ -128,33 +138,26 @@ export function countTokens(payload) {
 // countMessageTokens — single message
 //
 // Caches result on the message object as a non-enumerable property.
-// Cache is automatically invalidated when a stage creates a new message
-// object via spread ({ ...msg, content: newContent }) — non-enumerable
-// properties are dropped by object spread.
+// Cache invalidated automatically when pipeline stages use object spread
+// ({ ...msg, content: newContent }) — spread drops non-enumerable properties.
 //
-// IMPORTANT: Pipeline stages MUST use object spread to mutate messages.
-// Direct property mutation (msg.content = x) bypasses cache invalidation.
-// See scrubToolResults fix (CH-7) for the corrected pattern.
+// INVARIANT: Pipeline stages MUST use object spread to create modified
+// messages. Direct mutation (msg.content = x) bypasses cache invalidation
+// and will return stale counts on subsequent calls.
 // ─────────────────────────────────────────────
 
-/**
- * @param {object} msg
- * @returns {number}
- */
 export function countMessageTokens(msg) {
   if (!msg) return 0;
 
-  // Return cached count if this exact message object was already counted
   if (msg._cachedTokens !== undefined) {
     return msg._cachedTokens;
   }
 
-  const enc  = getEncoder();
-  let tokens = MESSAGE_OVERHEAD; // role + framing overhead
+  const enc = getEncoder();
+  let tokens = MESSAGE_OVERHEAD;
 
   if (typeof msg.content === "string") {
     tokens += enc.encode(msg.content).length;
-
   } else if (Array.isArray(msg.content)) {
     for (const block of msg.content) {
       switch (block.type) {
@@ -164,7 +167,7 @@ export function countMessageTokens(msg) {
         case "tool_use":
           tokens += enc.encode(block.name || "").length;
           tokens += enc.encode(JSON.stringify(block.input || {})).length;
-          tokens += 6; // tool_use framing overhead
+          tokens += 6;
           break;
         case "tool_result":
           tokens += enc.encode(block.tool_use_id || "").length;
@@ -182,21 +185,19 @@ export function countMessageTokens(msg) {
     }
   }
 
-  // OpenAI format tool calls
   if (Array.isArray(msg.tool_calls)) {
     for (const tc of msg.tool_calls) {
-      tokens += enc.encode(tc.function?.name      || "").length;
+      tokens += enc.encode(tc.function?.name || "").length;
       tokens += enc.encode(tc.function?.arguments || "").length;
-      tokens += 8; // tool_call framing overhead
+      tokens += 8;
     }
   }
 
-  // Cache on the object as non-enumerable so spread drops it
   Object.defineProperty(msg, "_cachedTokens", {
-    value:        tokens,
-    enumerable:   false,
+    value: tokens,
+    enumerable: false,
     configurable: true,
-    writable:     true,
+    writable: true,
   });
 
   return tokens;

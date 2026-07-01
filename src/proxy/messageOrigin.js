@@ -157,13 +157,9 @@ export function detectMessageOrigin(messages) {
     return { origin: "HUMAN_TASK", reason: "no_history" };
   }
 
-  // ── The current turn is the last message ────────────────────────────────
   const currentMsg = messages[messages.length - 1];
 
   // ── Rule 1: Tool result message — mid tool-call loop ────────────────────
-  // Handles both:
-  //   OpenAI format:   role:"tool"
-  //   Anthropic format: role:"user" with all blocks type:"tool_result"
   if (isToolResultMessage(currentMsg)) {
     return {
       origin: "TOOL_FOLLOWUP",
@@ -172,13 +168,9 @@ export function detectMessageOrigin(messages) {
   }
 
   // ── Gather context from recent history ──────────────────────────────────
-  // Look back at the last 6 messages (excluding the current turn).
-  // Expanded from 4 to catch longer tool-call chains where tool activity
-  // may be further back than 4 messages.
   const history = messages.slice(0, -1);
   const recentHistory = history.slice(-6);
 
-  // Find the last assistant message and last human-authored user message.
   let lastAssistantMsg = null;
   let lastHumanUserMsg = null;
 
@@ -194,9 +186,6 @@ export function detectMessageOrigin(messages) {
   }
 
   // ── Rule 2: Recent tool activity — we are mid-session ───────────────────
-  // If any recent message was a tool result OR the assistant recently
-  // called tools, this is a continuation — keep capabilities active.
-  // Both Anthropic and OpenAI formats are handled by the updated helpers.
   const hasRecentTools = recentHistory.some(
     (m) => isToolResultMessage(m) || assistantCalledTools(m)
   );
@@ -208,8 +197,6 @@ export function detectMessageOrigin(messages) {
   }
 
   // ── Rule 3: Agent status exchange ───────────────────────────────────────
-  // If the previous assistant turn was a pure status report (no tool calls)
-  // AND the current user message is short → acknowledgment loop.
   if (lastAssistantMsg && !assistantCalledTools(lastAssistantMsg)) {
     const lastAssistantText = extractText(lastAssistantMsg.content);
     const currentUserText = extractText(currentMsg.content);
@@ -222,12 +209,27 @@ export function detectMessageOrigin(messages) {
     }
   }
 
-  // ── Rule 4: Fresh conversation ───────────────────────────────────────────
+  // ── Rule 4: Prior assistant turn exists — mid-conversation ──────────────
+  // The LLM has already responded at least once (even with text only, no
+  // tools). This is not a fresh conversation — do not inject full tool
+  // schemas as if starting from scratch.
+  //
+  // Catches the pattern: user→ text-only assistant → user (next message).
+  // Rule 2 does not fire here because no tools were called yet.
+  // But the conversation is already underway — treat as CONTINUATION.
+  if (lastAssistantMsg !== null) {
+    return {
+      origin: "CONTINUATION",
+      reason: "prior_assistant_turn_exists",
+    };
+  }
+
+  // ── Rule 5: Fresh conversation ───────────────────────────────────────────
   if (messages.length <= 2) {
     return { origin: "HUMAN_TASK", reason: "fresh_conversation" };
   }
 
-  // ── Rule 5: Default — treat as human task ────────────────────────────────
+  // ── Rule 6: Default — treat as human task ────────────────────────────────
   return { origin: "HUMAN_TASK", reason: "default" };
 }
 

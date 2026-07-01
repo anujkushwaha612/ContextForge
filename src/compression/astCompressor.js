@@ -1,5 +1,5 @@
 import { createRequire } from "module";
-import { saveToVault, lookupVaultByContent } from "../logging/cacheDb.js";
+import { saveToVault, lookupVaultByContent, fetchFromVault } from "../logging/cacheDb.js";
 
 const require = createRequire(import.meta.url);
 
@@ -17,9 +17,9 @@ const EXT_TO_LANG = {
 };
 
 // ─────────────────────────────────────────────
-// Load native ASTCompressor — fallback to
-// regex stub if native isn't built yet
+// Load native ASTCompressor
 // ─────────────────────────────────────────────
+
 let NativeASTCompressor = null;
 let nativeAvailable = false;
 
@@ -38,6 +38,7 @@ try {
 // ─────────────────────────────────────────────
 // Compressor instance cache
 // ─────────────────────────────────────────────
+
 const _compressorCache = new Map();
 
 function getPolicyFingerprint(policy) {
@@ -57,8 +58,7 @@ function getCompressor(policy = null) {
       preserveTypeAnnotations: true,
       preserveDecorators: true,
       vaultOnCompress: true,
-      docstringMode: 1, // FIRST_LINE
-
+      docstringMode: 1,
       preserveErrorHandlers: policy?.preserveErrorHandlers ?? true,
       maxBodyLines: policy?.maxBodyLines ?? 4,
       minTokensToCompress: policy?.minTokensToCompress ?? 80,
@@ -72,23 +72,44 @@ function getCompressor(policy = null) {
 }
 
 // ─────────────────────────────────────────────
+// Session compression cache
+//
+// BUG-7 FIX: Cache compression results by content hash within the session.
+// Without this, the same file gets passed through tree-sitter on every turn
+// it appears — even if the content hasn't changed. In a 15-turn agentic
+// session where the LLM reads the same controller file 8 times, tree-sitter
+// ran 8 times. Now it runs once.
+//
+// Cache is keyed by FNV-1a hash of the content (same implementation as
+// fixed fnv1a64 in semanticDedup.js — two independent lanes, all chars).
+// Cleared if content changes (different hash = different cache entry).
+// ─────────────────────────────────────────────
+
+const SESSION_COMPRESS_CACHE = new Map();
+const SESSION_COMPRESS_MAX = 50;
+
+function quickHash(str) {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x4b9ace2f;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    h1 ^= c;
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 ^= c;
+    h2 = Math.imul(h2, 0x01000193) >>> 0;
+  }
+  return `${h1.toString(16).padStart(8, "0")}_${h2.toString(16).padStart(8, "0")}`;
+}
+
+// ─────────────────────────────────────────────
 // compressCodeOutput
 // ─────────────────────────────────────────────
 
-/**
- * @param {string}      text          — source text to compress
- * @param {string}      languageHint  — file extension language hint
- * @param {object|null} policy        — compression policy from compressionPolicy.js
- * @param {string|null} filePath      — original file path, used in compression header
- *                                      to guide the LLM toward graph queries
- */
 export function compressCodeOutput(text, languageHint = "", policy = null, filePath = null) {
-  // NEW: If the current request intent is PATCH, never compress
   if (policy?.intent === "PATCH") {
     return { kept: text, vaulted: false };
   }
 
-  // FIX F3: Raise threshold to ~200 tokens to avoid inflating tiny files
   if (typeof text !== "string" || text.length < 800) {
     return { kept: text, vaulted: false };
   }
@@ -100,22 +121,21 @@ export function compressCodeOutput(text, languageHint = "", policy = null, fileP
       (policy ? ` [mode=${policy.mode}]` : "")
   );
 
-  // ── Path A: Native tree-sitter ──
   const compressor = getCompressor(policy);
   if (compressor) {
     try {
       const result = compressor.compress(text, languageHint);
 
-      // Sanity check: if auto-detect contradicts extension hint, log it
       if (languageHint && result.languageDetected !== languageHint) {
         console.warn(
           `[AST Compressor] ⚠️  Language mismatch: extension says ${languageHint}, ` +
             `auto-detected ${result.languageDetected} — trusting extension hint`
         );
-        // Re-compress with forced language if auto-detect produced 0 nodes
-        // but we know the language from the file extension
+        // BUG-9 FIX: Retry with languageHint, not "" (empty = re-run same
+        // failing auto-detect). The intent is to FORCE the extension-based
+        // language when auto-detect produced zero nodes.
         if (result.nodesCompressed === 0 && languageHint) {
-          const retryResult = compressor.compress(text, "");
+          const retryResult = compressor.compress(text, languageHint);
           if (retryResult.nodesCompressed > result.nodesCompressed) {
             Object.assign(result, retryResult);
           }
@@ -147,13 +167,11 @@ export function compressCodeOutput(text, languageHint = "", policy = null, fileP
 
       const vaultId = saveToVault(text);
 
-      // ── Inject vault ID into every compressed marker ──
       const keptWithVaultId = result.compressedSource.replace(
         /· vault_retrieve to expand/g,
         `Use tool call contextforge_retrieve with vault_id="${vaultId}" to read this content.`
       );
 
-      // ── File-level header ──
       const fileRef = filePath ? filePath.replace(/\\/g, "/") : "this file";
 
       const compressionHeader = [
@@ -191,31 +209,39 @@ export function compressCodeOutput(text, languageHint = "", policy = null, fileP
       };
     } catch (err) {
       console.error(`[AST Compressor] ❌ Native error: ${err.message}`);
-      // Fall through to regex fallback
     }
   }
 
-  // ── Path B: Regex fallback ──
   console.warn("[AST Compressor] Using regex fallback — build native for best results");
   return regexFallbackCompress(text);
 }
 
-/**
- * Async wrapper — yields to event loop via setImmediate so compression
- * does not block the server during large file processing.
- */
+// BUG-8 FIX: Two setImmediate yields for large files to give the event loop
+// a chance to process pending I/O between chunks of CPU work.
+// The native tree-sitter call inside compressCodeOutput is synchronous C++.
+// A single setImmediate yields once but the blocking call still runs
+// uninterrupted after that yield. Two yields provide two scheduling
+// opportunities — before and during processing of large files.
+//
+// PROPER FIX NOTE: Move native calls to the embeddingWorker thread.
+// The infrastructure already exists in server.js. This two-yield approach
+// is a band-aid for single-threaded operation.
 async function compressCodeOutputAsync(text, languageHint = "", policy = null, filePath = null) {
-  return new Promise((resolve) => {
-    setImmediate(() => {
-      resolve(compressCodeOutput(text, languageHint, policy, filePath));
-    });
-  });
+  // First yield — let pending I/O flush before starting
+  await new Promise((r) => setImmediate(r));
+
+  // Second yield for large files — additional scheduling opportunity
+  if (text.length > 50_000) {
+    await new Promise((r) => setImmediate(r));
+  }
+
+  return compressCodeOutput(text, languageHint, policy, filePath);
 }
 
 // ─────────────────────────────────────────────
-// Regex fallback (original AST-Lite logic)
-// Only used when native isn't built
+// Regex fallback
 // ─────────────────────────────────────────────
+
 const IMPORT_PATTERN =
   /^(import\s+[\s\S]*?from\s+['"][^'"]+['"]|const\s+\w+\s*=\s*require\s*\(.*\)|require\s*\(.*\))/gm;
 const EXPORT_PATTERN =
@@ -306,6 +332,7 @@ function regexFallbackCompress(text) {
 // ─────────────────────────────────────────────
 // compressCodeToolResults — policy-aware
 // ─────────────────────────────────────────────
+
 export async function compressCodeToolResults(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
 
@@ -334,6 +361,7 @@ export async function compressCodeToolResults(payload) {
 
   for (const msg of payload.messages) {
     if (msg.role === "tool" && typeof msg.content === "string" && msg._cf_type === "code") {
+      // ── Skip guards (ordered by cheapness) ───────────────────────────────
       if (msg._cf_editable === true) {
         newMessages.push(msg);
         continue;
@@ -350,31 +378,58 @@ export async function compressCodeToolResults(payload) {
         newMessages.push(msg);
         continue;
       }
-      if (msg.content.split("\n").length < 30) {
-        newMessages.push(msg);
+
+      // BUG-10 FIX: Vault pre-check BEFORE line count guard.
+      // Short files that were previously compressed (e.g. a 25-line utility
+      // read multiple times) benefit from the O(1) vault lookup.
+      // Previously the line count guard fired first and skipped the lookup.
+      // In compressCodeToolResults, replace the lookupVaultByContent block:
+      const existingVaultId = lookupVaultByContent(msg.content);
+      if (existingVaultId) {
+        // ✅ Issue 1 FIX: Verify vault still exists before embedding its ID
+        // in a stub. The prune_vault row persists across server restarts but
+        // the session registry resets — a stub could reference a vault whose
+        // row was wiped by fullReset() or a DB migration.
+        const vaultStillExists = fetchFromVault(existingVaultId) !== null;
+        if (vaultStillExists) {
+          const fileRef = (msg._filename ?? "this file").replace(/\\/g, "/");
+          const stub =
+            `[CF_COMPRESSED_FILE vault_id:"${existingVaultId}"]\n` +
+            `⚠️  Previously compressed — content unchanged from prior turn.\n` +
+            `To read the full source: use tool call contextforge_retrieve with vault_id="${existingVaultId}".\n` +
+            `To explore without reading the full file:\n` +
+            `  - what_does_this_export("${fileRef}") — list all exports\n` +
+            `  - find_symbol("functionName") — get a specific function body directly\n`;
+
+          newMessages.push({
+            ...msg,
+            content: stub,
+            _compressedVaultId: existingVaultId,
+          });
+          stats.compressed++;
+          stats.vaults++;
+          stats.charsSaved += msg.content.length - stub.length;
+          continue;
+        }
+        // Vault gone — fall through to re-compress fresh
+        console.log(`[AST Compressor] ⚠️ Vault ${existingVaultId} missing — re-compressing`);
+      }
+
+      // BUG-7 FIX: Session compression cache — skip tree-sitter if we've
+      // already compressed this exact content this session.
+      const contentHash = quickHash(msg.content);
+      const cachedCompression = SESSION_COMPRESS_CACHE.get(contentHash);
+      if (cachedCompression) {
+        newMessages.push({ ...msg, ...cachedCompression });
+        stats.compressed++;
+        stats.vaults++;
+        stats.charsSaved += msg.content.length - cachedCompression.content.length;
         continue;
       }
 
-      // ── Vault pre-check — skip tree-sitter if content already known ──
-      const existingVaultId = lookupVaultByContent(msg.content);
-      if (existingVaultId) {
-        const fileRef = (msg._filename ?? "this file").replace(/\\/g, "/");
-        const stub =
-          `[CF_COMPRESSED_FILE vault_id:"${existingVaultId}"]\n` +
-          `⚠️  Previously compressed — content unchanged from prior turn.\n` +
-          `To read the full source: use tool call contextforge_retrieve with vault_id="${existingVaultId}".\n` +
-          `To explore without reading the full file:\n` +
-          `  - what_does_this_export("${fileRef}") — list all exports\n` +
-          `  - find_symbol("functionName") — get a specific function body directly\n`;
-
-        newMessages.push({
-          ...msg,
-          content: stub,
-          _compressedVaultId: existingVaultId,
-        });
-        stats.compressed++;
-        stats.vaults++;
-        stats.charsSaved += msg.content.length - stub.length;
+      // Line count guard — after vault checks, before tree-sitter
+      if (msg.content.split("\n").length < 30) {
+        newMessages.push(msg);
         continue;
       }
 
@@ -398,13 +453,27 @@ export async function compressCodeToolResults(payload) {
         if (result.highComplexityNodes) {
           stats.highComplexityFunctions.push(...result.highComplexityNodes);
         }
-        newMessages.push({
+
+        const compressedMsg = {
           ...msg,
           content: result.kept,
           _compressedVaultId: result.vaultId,
           _astLanguage: result.language,
           _syntaxValid: result.syntaxValid,
+        };
+
+        // BUG-7 FIX: Store in session cache for subsequent turns
+        if (SESSION_COMPRESS_CACHE.size >= SESSION_COMPRESS_MAX) {
+          SESSION_COMPRESS_CACHE.delete(SESSION_COMPRESS_CACHE.keys().next().value);
+        }
+        SESSION_COMPRESS_CACHE.set(contentHash, {
+          content: result.kept,
+          _compressedVaultId: result.vaultId,
+          _astLanguage: result.language,
+          _syntaxValid: result.syntaxValid,
         });
+
+        newMessages.push(compressedMsg);
         continue;
       }
 
@@ -412,7 +481,6 @@ export async function compressCodeToolResults(payload) {
       continue;
     }
 
-    // All other message types pass through unchanged
     newMessages.push(msg);
   }
 

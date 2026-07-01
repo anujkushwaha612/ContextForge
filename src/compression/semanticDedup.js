@@ -9,19 +9,42 @@
  *     - Too different (distance > threshold) → update registry, pass through
  *   First time seeing this key → register in session, pass through
  *
- * What was removed:
- *   - Myers diff / fastLineDiff / formatDeltaForLLM — the delta representation
- *     was consistently larger than the original content (-173% savings in logs).
- *     Near-duplicates now always send a vault stub, which is smaller and gives
- *     the LLM a clear retrieve path. The delta format added complexity with
- *     negative compression benefit.
+ * Fixes applied:
+ *   BUG-1: SimHash false negative (distance=0, FNV differs) now correctly
+ *           treated as real content change — passes through and updates registry.
+ *           Previously logged as "collision" and sent stale vault stub to LLM.
  *
- * Fixes:
- *   FIX-A: getDynamicThreshold called with bare number → now called with object.
+ *   BUG-2: Registry no longer overwritten on near-duplicate. Original anchor
+ *           is preserved so future turns compare against the first version,
+ *           not a drifting chain of near-dups.
+ *
+ *   BUG-3: FNV-1a reimplemented as two independent 32-bit lanes (different
+ *           seeds, all characters processed in both lanes). Previously h2
+ *           skipped odd-indexed characters and shared h1's seed, making it
+ *           a subset of h1 rather than an independent hash.
+ *
+ *   BUG-4: normalizeForFingerprint now strips ISO timestamps, call IDs,
+ *           index UUIDs, and size fields that change every turn and caused
+ *           false SimHash mismatches on otherwise identical content.
+ *
+ *   BUG-5: MAX_REGISTRY_SIZE raised from 50 → 200. Eviction strategy
+ *           changed from insertion-order (oldest inserted) to LRU
+ *           (least recently accessed by turnIndex).
+ *
+ *   BUG-6: Content-prefix fallback key documented as intentionally unstable
+ *           for mutating content. "json" type explicitly excluded from fallback
+ *           because graph results are volatile and should not be deduped by prefix.
+ *
+ *   BUG-7: Dedup threshold split into MIN_EXACT_DEDUP_CHARS (100) for FNV
+ *           exact-match path and MIN_NEARDUP_DEDUP_CHARS (500) for SimHash
+ *           near-dup path. Short repeated messages (patch confirmations,
+ *           error strings) now caught by exact-match dedup.
+ *
+ *   FIX-A: getDynamicThreshold called with object (unchanged, was correct).
  *   FIX-B: normalizeFilePath src/ prefix stripping (unchanged, was correct).
  *   FIX-C: Near-dup vault stub path (simplified — always stub, never delta).
- *   FIX-D: buildMessageKey null for code messages without filename →
- *           now falls back to content-prefix hash for ALL tagged types.
+ *   FIX-D: buildMessageKey falls back to content-prefix hash for code/text/
+ *           markdown types. "json" excluded — graph results are volatile.
  */
 
 import { createRequire } from "module";
@@ -36,7 +59,10 @@ const native = require("../../native/build/Release/contextforge_native.node");
 // Session registry
 // ─────────────────────────────────────────────
 
-const MAX_REGISTRY_SIZE = 50;
+// BUG-5 FIX: Raised from 50 → 200. A 30-file workspace with multiple reads
+// per file easily exceeds 50 entries mid-session, causing files to be
+// evicted and re-registered as "new" — losing all dedup history.
+const MAX_REGISTRY_SIZE = 200;
 
 class SessionFileRegistry {
   constructor() {
@@ -52,10 +78,22 @@ class SessionFileRegistry {
     return this._seen.get(key) ?? null;
   }
 
+  // BUG-5 FIX: Eviction changed from insertion-order (oldest inserted key)
+  // to LRU (entry with lowest turnIndex = least recently accessed).
+  // The oldest-inserted entry is often the most stable anchor (e.g. the
+  // first read of package.json or app.js). Evicting it destroys dedup
+  // history for the most frequently referenced files.
   set(key, entry) {
     if (!this._seen.has(key) && this._seen.size >= MAX_REGISTRY_SIZE) {
-      const oldestKey = this._seen.keys().next().value;
-      this._seen.delete(oldestKey);
+      let oldestKey = null;
+      let oldestTurn = Infinity;
+      for (const [k, v] of this._seen) {
+        if (v.turnIndex < oldestTurn) {
+          oldestTurn = v.turnIndex;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey) this._seen.delete(oldestKey);
     }
     this._seen.set(key, { ...entry, turnIndex: this._turnIndex });
   }
@@ -234,14 +272,18 @@ function normalizeFilePath(rawPath) {
 // ─────────────────────────────────────────────
 // buildMessageKey
 //
-// FIX-D: Was returning null for "code" messages without an extractable
-// filename. This caused the no-key count to grow every turn as graph
-// query results, read_file_chunk responses, and vault retrieve results
-// (all tagged "code") accumulated in history without dedup keys.
+// FIX-D: Falls back to content-prefix hash for code/text/markdown types.
 //
-// Fix: fall back to a content-prefix hash for ALL tagged message types,
-// not just "text". The hash is stable across turns for identical content
-// and is prefixed with the _cf_type so different types don't collide.
+// BUG-6 NOTE: The content-prefix fallback key is intentionally unstable
+// for content whose header changes every turn (generated output, error
+// messages with timestamps). This is acceptable — such content will be
+// re-registered each turn as a new entry rather than incorrectly deduped.
+//
+// "json" type is explicitly excluded from the fallback. Graph query results
+// are tagged "json" and are highly volatile (different symbols, different
+// turn context). Deduping them by prefix would cause false hits where two
+// different graph queries that happen to start with the same JSON prefix
+// are treated as duplicates.
 // ─────────────────────────────────────────────
 
 function buildMessageKey(msg) {
@@ -249,9 +291,8 @@ function buildMessageKey(msg) {
   const filename = extractFilename(msg);
   if (filename) return `file:${filename}`;
 
-  // Priority 2: content-prefix hash for any tagged type
-  // FIX-D: Was restricted to _cf_type === "text" only.
-  // Now covers "code" and "markdown" too — the types that were producing no-key.
+  // Priority 2: content-prefix hash for stable tagged types only.
+  // Explicitly excludes "json" — graph results are volatile.
   const cfType = msg._cf_type;
   if (
     cfType &&
@@ -259,9 +300,6 @@ function buildMessageKey(msg) {
     typeof msg.content === "string" &&
     msg.content.length >= 100
   ) {
-    // Use first 200 chars as the key basis.
-    // This is stable for identical content but will differ if the
-    // content changed — which is exactly when we want a different key.
     const prefix = msg.content.slice(0, 200);
     return `${cfType}:` + fnv1a64(prefix);
   }
@@ -273,11 +311,25 @@ function buildMessageKey(msg) {
 // SimHash wrappers
 // ─────────────────────────────────────────────
 
+// BUG-4 FIX: Added normalization for ISO timestamps, call IDs, index UUIDs,
+// and size fields. These change every turn on otherwise identical content,
+// causing SimHash to report false mismatches (fingerprint distance > 0 on
+// content that is semantically identical).
 function normalizeForFingerprint(content) {
-  return content
-    .replace(/cf_vault_[a-f0-9]+/g, "VAULT_ID")
-    .replace(/\[CF_COMPRESSED_FILE vault_id:"[^"]+"\]/g, "[CF_COMPRESSED]")
-    .replace(/vault_id="[^"]+"/g, 'vault_id="STABLE"');
+  return (
+    content
+      // Existing normalizations
+      .replace(/cf_vault_[a-f0-9]+/g, "VAULT_ID")
+      .replace(/\[CF_COMPRESSED_FILE vault_id:"[^"]+"\]/g, "[CF_COMPRESSED]")
+      .replace(/vault_id="[^"]+"/g, 'vault_id="STABLE"')
+      // New normalizations (BUG-4)
+      .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z/g, "TIMESTAMP")
+      .replace(/call_cf_\d+_\d+/g, "CALL_ID")
+      .replace(/IDX_[0-9a-f-]{36}/g, "IDX_ID")
+      .replace(/"size":\s*\d+/g, '"size": SIZE')
+      .replace(/"lastPatchedAt":\s*"[^"]+"/g, '"lastPatchedAt": TIMESTAMP')
+      .replace(/\bat\s+\d{2}:\d{2}:\d{2}\b/g, "at TIMESTAMP")
+  );
 }
 
 function computeFingerprint(text) {
@@ -300,31 +352,44 @@ function fingerprintDistance(a, b) {
 }
 
 // ─────────────────────────────────────────────
-// Fast content identity check (FNV-1a 64-bit)
+// FNV-1a 64-bit (two independent 32-bit lanes)
+//
+// BUG-3 FIX: Previous implementation had two critical flaws:
+//   1. h2 used the same seed (0x811c9dc5) as h1 — not independent
+//   2. h2 only processed even-indexed characters (i % 2 === 0) —
+//      two strings differing only at odd positions had identical h2,
+//      dramatically increasing the effective collision rate.
+//
+// Fix: Two independent seeds, both lanes process every character.
+// h1 seed: standard FNV-1a 32-bit offset basis (0x811c9dc5)
+// h2 seed: different value (0x4b9ace2f) for independence
+// Both use the standard FNV-1a 32-bit prime (0x01000193)
+// Output: zero-padded hex strings concatenated to form a 64-bit key
 // ─────────────────────────────────────────────
 
 function fnv1a64(str) {
-  let h1 = 0x811c9dc5;
-  let h2 = 0x811c9dc5;
+  let h1 = 0x811c9dc5; // FNV-1a 32-bit offset basis
+  let h2 = 0x4b9ace2f; // Independent seed for second lane
 
   for (let i = 0; i < str.length; i++) {
     const c = str.charCodeAt(i);
+
+    // Both lanes process every character — no skipping
     h1 ^= c;
     h1 = Math.imul(h1, 0x01000193) >>> 0;
-    if (i % 2 === 0) {
-      h2 ^= c;
-      h2 = Math.imul(h2, 0x01000193) >>> 0;
-    }
+
+    h2 ^= c;
+    h2 = Math.imul(h2, 0x01000193) >>> 0;
   }
 
-  return `${h1.toString(16)}_${h2.toString(16)}`;
+  // Zero-pad to 8 hex chars each so hash length is stable
+  return `${h1.toString(16).padStart(8, "0")}_${h2.toString(16).padStart(8, "0")}`;
 }
 
 // ─────────────────────────────────────────────
 // Dynamic threshold
 // ─────────────────────────────────────────────
 
-// FIX-A: Receives { contentLength, fileType } object — not a bare number.
 function getDynamicThreshold({ contentLength }) {
   if (contentLength > 200_000) return 24;
   if (contentLength > 100_000) return 20;
@@ -336,35 +401,46 @@ function getDynamicThreshold({ contentLength }) {
 // ─────────────────────────────────────────────
 // Core deduplication
 //
-// Removed: Myers diff, fastLineDiff, formatDeltaForLLM
+// BUG-7 FIX: Threshold split into two values:
+//   MIN_EXACT_DEDUP_CHARS = 100  → FNV-1a exact-match path
+//   MIN_NEARDUP_DEDUP_CHARS = 500 → SimHash near-dup path
 //
-// These produced delta representations that were consistently LARGER
-// than the original content (-173% savings observed in logs). The delta
-// format adds headers, context lines, change markers, and vault references
-// that inflate the output for small changes.
+// Rationale: SimHash is unreliable on short strings (< 500 chars) because
+// the bit distribution is sparse and small edits can flip many bits,
+// producing false distances. But exact-match dedup via FNV-1a is reliable
+// at any length. Lowering the exact-match threshold catches repeated short
+// messages (patch confirmations, error strings) that were previously skipped.
 //
-// Replacement: near-duplicates now always send a vault stub.
-// The stub is 1 line, the LLM knows how to retrieve it, and the vault
-// already holds the original content from the first time we saw this key.
+// BUG-1 FIX: SimHash distance=0 with FNV mismatch is now correctly handled
+// as a SimHash false negative (content changed but fingerprint didn't).
+// Previously this path logged "collision" and sent a stale vault stub,
+// causing the LLM to work on an outdated version of an actively edited file.
+//
+// BUG-2 FIX: Registry is NOT overwritten on genuine near-duplicates.
+// The original anchor is preserved so future turns compare against the
+// first version of the content, not a drifting chain of near-dups.
 // ─────────────────────────────────────────────
 
-const MIN_DEDUP_CHARS = 500;
+const MIN_EXACT_DEDUP_CHARS = 100;
+const MIN_NEARDUP_DEDUP_CHARS = 500;
 
 async function deduplicateMessage(msg, key) {
   const content = msg.content;
-  if (!content || content.length < MIN_DEDUP_CHARS) {
+
+  // Below minimum for any dedup — skip entirely
+  if (!content || content.length < MIN_EXACT_DEDUP_CHARS) {
     return { deduplicated: false, msg };
   }
 
   const existing = sessionRegistry.get(key);
 
   // ── Fast-path: FNV-1a exact match ────────────────────────────────────
+  // Runs on any content >= MIN_EXACT_DEDUP_CHARS (includes short messages)
   if (existing?.contentHash) {
     const contentHash = fnv1a64(content);
     if (contentHash === existing.contentHash) {
-      if (existing.turnIndex !== sessionRegistry._turnIndex) {
-        sessionRegistry.set(key, { ...existing, contentHash });
-      }
+      // Update turnIndex so LRU eviction knows this entry was recently used
+      sessionRegistry.set(key, { ...existing, contentHash });
       const tokensSaved = Math.round(content.length / 4);
       statsEmitter.recordCacheHit("semanticDedup", true);
       return {
@@ -380,6 +456,33 @@ async function deduplicateMessage(msg, key) {
     }
   }
 
+  // ── Below near-dup threshold — register for exact matching only ───────
+  // SimHash is unreliable on short content. Register the entry so future
+  // exact matches are caught, but do not attempt near-dup classification.
+  if (content.length < MIN_NEARDUP_DEDUP_CHARS) {
+    if (!existing) {
+      const vaultId = saveToVault(content);
+      sessionRegistry.set(key, {
+        fingerprint: null, // no fingerprint — too short for SimHash
+        contentHash: fnv1a64(content),
+        vaultId,
+        contentLength: content.length,
+      });
+      statsEmitter.recordCacheHit("semanticDedup", false);
+    } else {
+      // Content changed (FNV mismatch above) — update registry
+      const vaultId = saveToVault(content);
+      sessionRegistry.set(key, {
+        fingerprint: null,
+        contentHash: fnv1a64(content),
+        vaultId,
+        contentLength: content.length,
+      });
+    }
+    return { deduplicated: false, msg };
+  }
+
+  // ── SimHash near-dup path (content >= MIN_NEARDUP_DEDUP_CHARS) ────────
   const fingerprint = computeFingerprint(content);
   if (fingerprint === null) return { deduplicated: false, msg };
 
@@ -400,9 +503,52 @@ async function deduplicateMessage(msg, key) {
     return { deduplicated: false, msg };
   }
 
+  // ── Existing entry has no fingerprint (was registered below threshold) ─
+  // Content grew above threshold — re-register with fingerprint
+  if (!existing.fingerprint) {
+    const vaultId = saveToVault(content);
+    sessionRegistry.set(key, {
+      fingerprint,
+      contentHash: fnv1a64(content),
+      vaultId,
+      contentLength: content.length,
+    });
+    return { deduplicated: false, msg };
+  }
+
   const distance = fingerprintDistance(fingerprint, existing.fingerprint);
   const similarityPct = Math.round(((64 - distance) / 64) * 100);
   const dynamicThreshold = getDynamicThreshold({ contentLength: content.length });
+
+  // ── BUG-1 FIX: SimHash false negative ────────────────────────────────
+  // distance=0 means SimHash says "identical" but FNV already confirmed
+  // the content IS different (we only reach here after FNV mismatch above).
+  //
+  // This is a SimHash false negative — the 64-bit fingerprint lacks the
+  // resolution to detect this particular change. FNV-1a is exact and
+  // must be trusted. Treat as a real content change: update registry and
+  // pass through so the LLM receives the current version of the content.
+  //
+  // Do NOT send a vault stub here. The vault holds the old version.
+  // Sending that stub would cause the LLM to retrieve stale content for
+  // a file it is actively modifying — the root cause of the repeated
+  // "SimHash collision" log entries seen every turn in long agentic sessions.
+  if (distance === 0) {
+    const vaultId = saveToVault(content);
+    sessionRegistry.set(key, {
+      fingerprint,
+      contentHash: fnv1a64(content),
+      vaultId,
+      contentLength: content.length,
+    });
+    // Log at debug level only — this is expected behavior, not an error
+    if (process.env.CF_DEBUG_DEDUP === "1") {
+      console.log(
+        `[SemanticDedup] 🔄 Content changed (SimHash blind spot): ${key} — updating registry`
+      );
+    }
+    return { deduplicated: false, msg };
+  }
 
   // ── Sufficiently different — update registry, pass through ────────────
   if (distance > dynamicThreshold) {
@@ -417,31 +563,25 @@ async function deduplicateMessage(msg, key) {
     return { deduplicated: false, msg };
   }
 
-  // ── Near-duplicate (distance === 0 with FNV mismatch, or distance ≤ threshold) ──
+  // ── Genuine near-duplicate (distance > 0 and distance ≤ threshold) ───
   // FIX-C: Always send vault stub. Never send diff.
-  // The diff representation was producing negative savings (-173% in logs).
-  // The vault already holds the original content — stub is always smaller.
+  //
+  // BUG-2 FIX: Do NOT overwrite the registry entry. Preserve the original
+  // anchor so future turns compare against the first version of the content,
+  // not a drifting chain where each near-dup becomes the new reference.
+  //
+  // We save the new content to a NEW vault ID so the LLM can retrieve
+  // the current version if needed. But the registry keeps the original
+  // fingerprint and hash as the stable comparison anchor.
   console.log(
     `[SemanticDedup] 🎯 Near-duplicate: ${key} ` +
       `(distance=${distance}, ${similarityPct}% similar to turn ${existing.turnIndex})`
   );
 
-  // Handle distance === 0 SimHash collision (FNV already confirmed mismatch above)
-  if (distance === 0) {
-    console.log(
-      `[SemanticDedup] 🔀 SimHash collision on ${key}: ` +
-        `distance=0 but FNV-1a differs — treating as near-duplicate`
-    );
-  }
-
-  // Update vault with new content so future retrievals get latest version
   const newVaultId = saveToVault(content);
-  sessionRegistry.set(key, {
-    fingerprint,
-    contentHash: fnv1a64(content),
-    vaultId: newVaultId,
-    contentLength: content.length,
-  });
+
+  // BUG-2 FIX: sessionRegistry.set() intentionally NOT called here.
+  // The existing entry remains as the stable anchor for future comparisons.
 
   statsEmitter.recordCacheHit("semanticDedup", true);
 
@@ -485,6 +625,22 @@ export async function applySemanticDedup(payload) {
         newMessages.push(msg);
         continue;
       }
+      if (msg._cf_pruned) {
+        newMessages.push(msg);
+        continue;
+      }
+      // ✅ Issue 3 FIX: Guard _cf_editable on OpenAI path.
+      // This flag is set by tagToolResults for targeted read_file_chunk
+      // results (≤800 lines). These are verification reads immediately
+      // after a patch — deduping them returns stale pre-patch content
+      // to the LLM, making patch verification impossible.
+      // The Anthropic format path already had this guard — this was
+      // the missing symmetric check on the OpenAI path.
+      if (msg._cf_editable) {
+        newMessages.push(msg);
+        continue;
+      }
+
       if (!["code", "text", "markdown"].includes(msg._cf_type)) {
         stats.skippedType++;
         newMessages.push(msg);
@@ -518,6 +674,10 @@ export async function applySemanticDedup(payload) {
             newBlocks.push(block);
             continue;
           }
+          if (block._cf_editable) {
+            newBlocks.push(block);
+            continue;
+          } // ← NEW
           if (!["code", "text", "markdown"].includes(block._cf_type)) {
             stats.skippedType++;
             newBlocks.push(block);
@@ -570,20 +730,36 @@ export async function applySemanticDedup(payload) {
 // ─────────────────────────────────────────────
 
 export function invalidateRegistryEntry(filePath) {
+  if (!filePath || typeof filePath !== "string") return false;
+
+  // Try exact normalized match first
   const normalized = normalizeFilePath(filePath);
 
-  if (!normalized) {
+  // Extract basename as fallback — handles cases where the LLM passes
+  // an absolute path but the registry was built from a relative path,
+  // or vice versa. Also catches typos in directory segments since the
+  // filename itself is rarely misspelled.
+  const basename = filePath.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+
+  if (!normalized && !basename) {
     console.warn(
       `[SemanticDedup] ⚠️ invalidateRegistryEntry: could not normalize "${filePath}" — skipped`
     );
     return false;
   }
 
-  const prefix = `file:${normalized}`;
   let invalidated = 0;
 
   for (const key of sessionRegistry._seen.keys()) {
-    if (key === prefix || key.startsWith(prefix + "|tool:")) {
+    if (!key.startsWith("file:")) continue;
+
+    const keyPath = key.slice(5); // strip "file:" prefix
+    const keyBasename = keyPath.split("/").pop() ?? "";
+
+    const exactMatch = normalized && keyPath === normalized;
+    const basenameMatch = basename && keyBasename === basename;
+
+    if (exactMatch || basenameMatch) {
       sessionRegistry._seen.delete(key);
       console.log(`[SemanticDedup] 🗑️ Registry invalidated: ${key}`);
       invalidated++;
@@ -591,7 +767,9 @@ export function invalidateRegistryEntry(filePath) {
   }
 
   if (invalidated === 0) {
-    console.log(`[SemanticDedup] ℹ️ invalidateRegistryEntry: no entry found for "${normalized}"`);
+    console.log(
+      `[SemanticDedup] ℹ️ invalidateRegistryEntry: no entry found for "${normalized ?? basename}"`
+    );
   }
 
   return invalidated > 0;

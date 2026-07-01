@@ -1,30 +1,44 @@
 import crypto from "node:crypto";
+
 // ========================================================
 // 1. INBOUND TRANSLATION: Anthropic JSON -> OpenAI JSON
 // ========================================================
 
 // ─────────────────────────────────────────────
 // Tool array cache
-// One entry per unique tool set — keyed by fast integer fingerprint.
-// Tools never change mid-session so this is a permanent cache.
+//
+// TR-3 FIX: _toolArrayKey now hashes full schema CONTENT, not just
+// schema string length. Previously two tools with identical names and
+// schema lengths but different schema content produced the same key,
+// causing stale minimized schemas to be served.
 // ─────────────────────────────────────────────
 
 const _toolArrayCache = new Map();
 const _TOOL_ARRAY_CACHE_MAX = 20;
 
 function _toolArrayKey(tools) {
-  let key = tools.length;
+  // Two independent FNV-1a 32-bit lanes over full content
+  // (same implementation as fixed fnv1a64 in semanticDedup.js)
+  let h1 = 0x811c9dc5;
+  let h2 = 0x4b9ace2f;
+
   for (let i = 0; i < tools.length; i++) {
     const t = tools[i];
     const name = t.name || t.function?.name || "";
+    // TR-3 FIX: Hash full schema content, not just length
     const schemaStr = JSON.stringify(t.input_schema || t.parameters || {});
-    // Hash name characters, not just length
-    for (let j = 0; j < name.length; j++) {
-      key = (key * 31 + name.charCodeAt(j)) | 0;
+    const combined = `${i}:${name}:${schemaStr}`;
+
+    for (let j = 0; j < combined.length; j++) {
+      const c = combined.charCodeAt(j);
+      h1 ^= c;
+      h1 = Math.imul(h1, 0x01000193) >>> 0;
+      h2 ^= c;
+      h2 = Math.imul(h2, 0x01000193) >>> 0;
     }
-    key = (key * 31 + schemaStr.length + i) | 0;
   }
-  return key;
+
+  return `${h1.toString(16).padStart(8, "0")}_${h2.toString(16).padStart(8, "0")}`;
 }
 
 function _sanitizeToolArray(tools) {
@@ -42,12 +56,6 @@ function _sanitizeToolArray(tools) {
 
 // ─────────────────────────────────────────────
 // Per-message cache
-// Only useful for array-content messages (Anthropic format).
-// String-content and already-translated messages hit fast paths
-// before reaching the cache.
-//
-// Key: role + block count + first block fingerprint + last block fingerprint
-// Avoids full JSON.stringify on the entire content array.
 // ─────────────────────────────────────────────
 
 const _msgCache = new Map();
@@ -58,10 +66,11 @@ function _msgKey(msg) {
   const last = msg.content[msg.content.length - 1];
   const firstStr = first
     ? (first.type || "") +
-      (first.text?.slice(0, 40) || first.tool_use_id || first.tool_call_id || "")
+      (first.text?.slice(0, 40) || first.id || first.tool_use_id || first.tool_call_id || "")
     : "";
   const lastStr = last
-    ? (last.type || "") + (last.text?.slice(0, 40) || last.tool_use_id || last.tool_call_id || "")
+    ? (last.type || "") +
+      (last.text?.slice(0, 40) || last.id || last.tool_use_id || last.tool_call_id || "")
     : "";
   return msg.role + "|" + msg.content.length + "|" + firstStr + "|" + lastStr;
 }
@@ -74,7 +83,6 @@ function _cacheGet(msg) {
 function _cacheSet(msg, translated) {
   if (!Array.isArray(msg.content)) return;
   if (_msgCache.size >= _MSG_CACHE_MAX) {
-    // Evict oldest entry
     _msgCache.delete(_msgCache.keys().next().value);
   }
   _msgCache.set(_msgKey(msg), translated);
@@ -82,30 +90,8 @@ function _cacheSet(msg, translated) {
 
 // ─────────────────────────────────────────────
 // Per-request prefix cache
-//
-// Stores the previous request's raw input messages and translated output.
-// On each request, find how many messages at the START are identical
-// to the previous request (stable prefix), translate only the suffix.
-//
-// System message is handled OUTSIDE this cache — it's prepended after
-// translation so it doesn't interfere with prefix comparison.
-//
-// LATENCY OPTIMIZATION:
-// In a typical agentic conversation, Claude sends the ENTIRE history
-// every request. Only the last 1-2 messages are new. This prefix cache
-// means we skip re-translating potentially hundreds of old messages —
-// we just slice the already-translated output array and append the
-// translation of only the new messages at the end.
 // ─────────────────────────────────────────────
 
-/**
- * Count how many OUTPUT messages the first N input messages produce.
- * Does NOT re-translate — inspects input shape only.
- *
- * Expansion rules:
- *   user with tool_results → (N tool messages) + (1 user message if has text)
- *   everything else        → 1 output message
- */
 function _countOutputMessages(inputSlice) {
   let count = 0;
   for (const msg of inputSlice) {
@@ -131,7 +117,6 @@ export function createTranslationContext() {
   };
 }
 
-// Update _translateMessages to accept context:
 function _translateMessages(messages, ctx) {
   const stableCount = _findStablePrefix(messages, ctx);
 
@@ -148,7 +133,6 @@ function _translateMessages(messages, ctx) {
     translated = [...stableOutputPrefix, ...newSuffix];
   }
 
-  // Write back to context, not module-level variable
   ctx.prevInputMessages = messages;
   ctx.prevOutputMessages = translated;
 
@@ -156,14 +140,15 @@ function _translateMessages(messages, ctx) {
 }
 
 // ─────────────────────────────────────────────
-// Fast structural fingerprint for array content
-// Avoids JSON.stringify on large tool result arrays.
-// Checks: block count + first block type/id + last block type/id
-// If all match, falls back to full stringify only on the
-// first and last blocks (not the entire array).
+// Structural equality for array content
+//
+// TR-2 FIX: Tool result equality check now includes content length
+// verification. Previously assumed same tool_use_id = same content,
+// which could cause false stable-prefix matches when the ghost interceptor
+// reuses tool call IDs across hops with different result content.
 // ─────────────────────────────────────────────
+
 function _contentArrayEqual(cur, prev) {
-  // Length already checked before this is called
   const len = cur.length;
   if (len === 0) return true;
 
@@ -172,28 +157,32 @@ function _contentArrayEqual(cur, prev) {
   const last_c = cur[len - 1];
   const last_p = prev[len - 1];
 
-  // ── Cheap structural checks ──
-  // Type mismatch on first block — almost certainly different
   if (first_c?.type !== first_p?.type) return false;
   if (last_c?.type !== last_p?.type) return false;
 
-  // Tool result blocks — compare by tool_use_id (unique per call)
-  // If IDs match, content is the same call — no need to serialize content
   if (first_c?.type === "tool_result") {
     if (first_c.tool_use_id !== first_p.tool_use_id) return false;
     if (last_c.tool_use_id !== last_p.tool_use_id) return false;
 
-    // IDs match on both ends — high confidence same array
-    // Only do full check if array is small enough to be cheap
+    // TR-2 FIX: Also verify content length. Same tool_use_id with different
+    // content length means the result changed (e.g. ghost interceptor reuse).
+    const getLen = (block) =>
+      typeof block.content === "string"
+        ? block.content.length
+        : JSON.stringify(block.content ?? "").length;
+
+    if (getLen(first_c) !== getLen(first_p)) return false;
+    if (getLen(last_c) !== getLen(last_p)) return false;
+
     if (len <= 4) {
       for (let i = 1; i < len - 1; i++) {
         if (cur[i]?.tool_use_id !== prev[i]?.tool_use_id) return false;
+        if (getLen(cur[i]) !== getLen(prev[i])) return false;
       }
     }
     return true;
   }
 
-  // Text blocks — compare by text length + first 80 chars
   if (first_c?.type === "text") {
     if (first_c.text?.length !== first_p.text?.length) return false;
     if (last_c.text?.length !== last_p.text?.length) return false;
@@ -202,8 +191,6 @@ function _contentArrayEqual(cur, prev) {
     return true;
   }
 
-  // Unknown block type — fall back to stringify on first+last only
-  // Still avoids serializing the entire middle of the array
   if (JSON.stringify(first_c) !== JSON.stringify(first_p)) return false;
   if (JSON.stringify(last_c) !== JSON.stringify(last_p)) return false;
   return true;
@@ -219,26 +206,20 @@ function _findStablePrefix(currentMsgs, ctx) {
     const cur = currentMsgs[i];
     const prev = ctx.prevInputMessages[i];
 
-    // Same object reference — identical (V8 short-circuits immediately)
     if (cur === prev) continue;
-
-    // Role mismatch — stop
     if (cur.role !== prev.role) break;
 
-    // String content — direct compare, no allocation
     if (typeof cur.content === "string" && typeof prev.content === "string") {
       if (cur.content !== prev.content) break;
       continue;
     }
 
-    // Array content — structural fingerprint first, no full stringify
     if (Array.isArray(cur.content) && Array.isArray(prev.content)) {
       if (cur.content.length !== prev.content.length) break;
       if (!_contentArrayEqual(cur.content, prev.content)) break;
       continue;
     }
 
-    // Mixed types — bail
     break;
   }
 
@@ -308,18 +289,15 @@ function _stripJsonSchemaMeta(obj) {
 // ─────────────────────────────────────────────
 
 function _translateMessage(msg) {
-  // ── Fast paths — no allocation, no cache lookup ──
-  if (msg.role === "tool") return msg; // already OpenAI format
-  if (msg.role === "system") return msg; // passthrough
-  if (!Array.isArray(msg.content)) return msg; // already flat string content
+  if (msg.role === "tool") return msg;
+  if (msg.role === "system") return msg;
+  if (!Array.isArray(msg.content)) return msg;
 
-  // ── Cache check (array-content only) ──
   const cached = _cacheGet(msg);
   if (cached) return cached;
 
   let result;
 
-  // ── User message with tool_result blocks ──
   if (msg.role === "user" && msg.content.some((b) => b.type === "tool_result")) {
     const toolMessages = [];
     const textParts = [];
@@ -353,7 +331,6 @@ function _translateMessage(msg) {
     return result;
   }
 
-  // ── Assistant message with tool_use blocks ──
   if (msg.role === "assistant" && msg.content.some((b) => b.type === "tool_use")) {
     const textParts = [];
     const tool_calls = [];
@@ -385,12 +362,15 @@ function _translateMessage(msg) {
     return result;
   }
 
-  // ── Standard formatting (Text + Images) ──
   const hasImages = msg.content.some((b) => b.type === "image");
   if (hasImages) {
     const formattedContent = msg.content.map((b) => {
       if (b.type === "text") return { type: "text", text: b.text };
-      if (b.type === "thinking") return { type: "text", text: `<thinking>\n${b.thinking}\n</thinking>` };
+      if (b.type === "thinking")
+        return {
+          type: "text",
+          text: `<thinking>\n${b.thinking}\n</thinking>`,
+        };
       if (b.type === "image") {
         return {
           type: "image_url",
@@ -399,17 +379,16 @@ function _translateMessage(msg) {
           },
         };
       }
-      return b; // passthrough unknown
+      return b;
     });
     result = { ...msg, content: formattedContent };
     _cacheSet(msg, result);
     return result;
   }
 
-  // ── Text-only flattening ──
   const textContent = msg.content
     .filter((b) => b.type === "text" || b.type === "thinking")
-    .map((b) => b.type === "thinking" ? `<thinking>\n${b.thinking}\n</thinking>` : b.text)
+    .map((b) => (b.type === "thinking" ? `<thinking>\n${b.thinking}\n</thinking>` : b.text))
     .join("\n");
 
   result = { ...msg, content: textContent };
@@ -437,7 +416,6 @@ export function translateAnthropicToOpenAI(payload, ctx = null) {
   }
 
   if (out.messages) {
-    // Use per-request context if provided, else no prefix caching
     const translatedMsgs = ctx
       ? _translateMessages(out.messages, ctx)
       : out.messages.map(_translateMessage).flat();
@@ -449,167 +427,15 @@ export function translateAnthropicToOpenAI(payload, ctx = null) {
 
   if (Array.isArray(out.tools)) {
     out.tools = _sanitizeToolArray(out.tools);
-    //     console.log(
-    //       `[Tool Translator] 🛠️ Natively mapped ${out.tools.length} schemas`,
-    //     );
   }
 
   return out;
 }
 
-/**
- * Validates and repairs OpenAI message sequence.
- * Returns { valid: boolean, issues: string[], messages: Message[] }
- *
- * Repair strategy (in order):
- *  1. Orphaned tool messages   → dropped
- *  2. tool_call_id mismatch    → remapped (1 candidate) or dropped (ambiguous)
- *  3. assistant content=""     → null when tool_calls present
- *  4. consecutive assistant    → merged
- *  5. consecutive user         → merged
- *  6. ends on bare assistant   → flagged only (not mutated)
- */
-// export function validateAndRepairMessages(messages) {
-//   const issues = [];
-//   const fixed = [];
-
-//   for (let i = 0; i < messages.length; i++) {
-//     const msg = messages[i];
-//     const prev = fixed[fixed.length - 1];
-
-//     // ── Rule 1: tool message must follow assistant with tool_calls ──
-//     if (msg.role === "tool") {
-//       if (!prev || prev.role !== "assistant" || !prev.tool_calls?.length) {
-//         issues.push(
-//           `[${i}] orphaned tool message dropped (prev role: ${prev?.role ?? "none"})`,
-//         );
-//         continue;
-//       }
-
-//       // ── Rule 2: tool_call_id must match preceding assistant's tool_calls ──
-//       if (msg.tool_call_id) {
-//         const ids = prev.tool_calls.map((tc) => tc.id);
-//         const exactMatch = ids.includes(msg.tool_call_id);
-
-//         if (!exactMatch) {
-//           if (ids.length === 1) {
-//             // Only one candidate — unambiguous remap
-//             issues.push(
-//               `[${i}] tool_call_id remapped: "${msg.tool_call_id}" → "${ids[0]}"`,
-//             );
-//             fixed.push({ ...msg, tool_call_id: ids[0] });
-//             continue;
-//           }
-
-//           // Multiple candidates — find best match by name if available
-//           const msgName = msg.name;
-//           if (msgName) {
-//             const nameMatch = prev.tool_calls.find(
-//               (tc) => tc.function?.name === msgName,
-//             );
-//             if (nameMatch) {
-//               issues.push(
-//                 `[${i}] tool_call_id remapped by name match "${msgName}": ` +
-//                   `"${msg.tool_call_id}" → "${nameMatch.id}"`,
-//               );
-//               fixed.push({ ...msg, tool_call_id: nameMatch.id });
-//               continue;
-//             }
-//           }
-
-//           // Ambiguous — cannot safely remap, drop to prevent model confusion
-//           issues.push(
-//             `[${i}] tool_call_id "${msg.tool_call_id}" ambiguous across ` +
-//               `[${ids.join(", ")}] — dropped`,
-//           );
-//           continue;
-//         }
-//       }
-//     }
-
-//     // ── Rule 3: assistant content="" → null when tool_calls present ──
-//     if (msg.role === "assistant" && msg.tool_calls?.length > 0) {
-//       if (msg.content === "" || msg.content === undefined) {
-//         if (msg.content === "") {
-//           issues.push(`[${i}] assistant content="" → null`);
-//         }
-//         fixed.push({ ...msg, content: null });
-//         continue;
-//       }
-//     }
-
-//     // ── Rule 4: no two assistant messages in a row ──
-//     if (msg.role === "assistant" && prev?.role === "assistant") {
-//       issues.push(`[${i}] consecutive assistant messages → merged`);
-//       const last = fixed[fixed.length - 1];
-
-//       const mergedContent =
-//         [last.content, msg.content]
-//           .filter((c) => c != null && c !== "")
-//           .join("\n") || null;
-
-//       const seenIds = new Set();
-//       const mergedToolCalls = [
-//         ...(last.tool_calls || []),
-//         ...(msg.tool_calls || []),
-//       ].filter((tc) => {
-//         // Deduplicate tool_calls by id during merge
-//         if (seenIds.has(tc.id)) return false;
-//         seenIds.add(tc.id);
-//         return true;
-//       });
-
-//       fixed[fixed.length - 1] = {
-//         ...last,
-//         content: mergedContent,
-//         ...(mergedToolCalls.length ? { tool_calls: mergedToolCalls } : {}),
-//       };
-//       continue;
-//     }
-
-//     // ── Rule 5: no two user messages in a row ──
-//     if (msg.role === "user" && prev?.role === "user") {
-//       issues.push(`[${i}] consecutive user messages → merged`);
-//       const last = fixed[fixed.length - 1];
-
-//       // Handle both string and array content formats
-//       const lastContent = Array.isArray(last.content)
-//         ? last.content
-//         : [{ type: "text", text: last.content ?? "" }];
-//       const msgContent = Array.isArray(msg.content)
-//         ? msg.content
-//         : [{ type: "text", text: msg.content ?? "" }];
-
-//       fixed[fixed.length - 1] = {
-//         ...last,
-//         content: [...lastContent, ...msgContent],
-//       };
-//       continue;
-//     }
-
-//     fixed.push(msg);
-//   }
-
-//   // ── Rule 6: flag if sequence ends on a bare assistant turn ──
-//   const last = fixed[fixed.length - 1];
-//   if (
-//     last?.role === "assistant" &&
-//     (!last.tool_calls || last.tool_calls.length === 0)
-//   ) {
-//     issues.push(`Sequence ends on bare assistant message — model may loop`);
-//   }
-
-//   if (issues.length > 0) {
-//     console.warn(`[MsgValidator] ⚠️  Fixed ${issues.length} issue(s):`);
-//     for (const issue of issues) console.warn(`  • ${issue}`);
-//   }
-
-//   return { valid: issues.length === 0, issues, messages: fixed };
-// }
-
 // ========================================================
 // 2. STRIP ANTHROPIC NON-STANDARD ROOT PARAMETERS
 // ========================================================
+
 export function stripAnthropicSpecificFields(payload) {
   const {
     anthropic_version,
@@ -624,23 +450,48 @@ export function stripAnthropicSpecificFields(payload) {
   return cleaned;
 }
 
+// ─────────────────────────────────────────────
+// minimizeToolSchemas
+//
+// TR-4 FIX: ContextForge tool descriptions are never truncated.
+// These descriptions contain usage instructions referenced by compression
+// stubs injected into tool results (e.g. "use contextforge_retrieve with
+// vault_id=..."). Truncating them to 80 chars cuts the instructions the
+// LLM needs to follow vault retrieval correctly.
+//
+// TR-6 NOTE: The prefix cache (createTranslationContext / _translateMessages)
+// is implemented and correct but requires the adapter to pass a ctx object
+// through toInternal(). Without ctx, translation falls back to per-message
+// cache only. Activating the prefix cache requires adapter-level changes
+// outside this file — documented here for the next audit pass.
+// ─────────────────────────────────────────────
+
 const _toolSchemaCacheMap = new Map();
 
-// Wrap minimizeToolSchemas:
+// ─────────────────────────────────────────────
+// Tools whose descriptions must be fully preserved.
+//
+// AskUserQuestion: truncating changes when the LLM decides
+//   to ask vs proceed — behavioral regression risk.
+// Agent: complex orchestration instructions, truncating breaks
+//   sub-agent delegation behavior.
+// All CF tools: contain vault retrieval instructions that
+//   compression stubs reference by exact wording (TR-4).
+// ─────────────────────────────────────────────
+const PRESERVE_FULL_DESCRIPTION = new Set(["AskUserQuestion", "Agent"]);
+
+const MAX_TOOL_DESCRIPTION_CHARS = 200;
+const MAX_PARAM_DESCRIPTION_CHARS = 80;
+
 export function minimizeToolSchemas(payload) {
   if (!payload.tools || payload.tools.length === 0) return payload;
 
-  // Hash the current tools array
   const toolsJson = JSON.stringify(payload.tools);
   const hash = crypto.createHash("sha256").update(toolsJson).digest("hex").slice(0, 16);
 
   if (_toolSchemaCacheMap.has(hash)) {
     const cachedTools = _toolSchemaCacheMap.get(hash);
 
-    // ── Stamp savings on cache hit so pipeline reporting is accurate ──
-    // Previously cache hits returned silently with no savings stamp.
-    // This caused the dashboard to show 0 minimize savings on turn 2+
-    // even though the tools ARE being served in minimized form.
     const originalSize = toolsJson.length;
     const cachedSize = JSON.stringify(cachedTools).length;
     const savedTokens = Math.floor((originalSize - cachedSize) / 4);
@@ -652,26 +503,62 @@ export function minimizeToolSchemas(payload) {
     return payload;
   }
 
-  // ... existing minimization logic unchanged ...
   const originalSize = toolsJson.length;
 
   payload.tools = payload.tools.map((tool) => {
     const fn = tool.function || tool;
+    const toolName = fn.name || tool.name || "";
 
-    // Deep clone to safely mutate
+    // Determine if this tool's descriptions should be fully preserved
+    const isCFTool =
+      toolName.includes("contextforge") ||
+      toolName.includes("mcp__contextforge") ||
+      toolName.startsWith("cf_");
+
+    // isProtected = never truncate description or params
+    const isProtected = isCFTool || PRESERVE_FULL_DESCRIPTION.has(toolName);
+
     const newFn = JSON.parse(JSON.stringify(fn));
 
-    // Recursive function to minimize descriptions but keep structure intact
-    function minimizeSchema(schema) {
-      if (!schema) return;
-      if (schema.description) {
-        schema.description = schema.description.slice(0, 80);
+    // ── Top-level tool description ──────────────────────────────────────
+    // Protected tools: keep in full.
+    // All others: truncate to MAX_TOOL_DESCRIPTION_CHARS.
+    // The LLM knows how to use Bash, Glob, Grep etc from training —
+    // it does not need the full description on every request.
+    if (!isProtected && typeof newFn.description === "string") {
+      if (newFn.description.length > MAX_TOOL_DESCRIPTION_CHARS) {
+        newFn.description = newFn.description.slice(0, MAX_TOOL_DESCRIPTION_CHARS) + "…";
       }
+    }
+
+    // ── Parameter schema minimization ───────────────────────────────────
+    function minimizeSchema(schema) {
+      if (!schema || typeof schema !== "object") return;
+
+      // Truncate parameter descriptions for non-protected tools.
+      // LLM infers parameter meaning from name + type + required list.
+      if (!isProtected && typeof schema.description === "string") {
+        if (schema.description.length > MAX_PARAM_DESCRIPTION_CHARS) {
+          schema.description = schema.description.slice(0, MAX_PARAM_DESCRIPTION_CHARS) + "…";
+        }
+      }
+
+      // Strip large enum arrays for non-protected tools.
+      // Keep enums with < 5 values — cheap and provide validation hints.
+      // Keep enums for CF tools — query_type enum is how LLM knows
+      // which graph operations are available.
+      if (!isProtected && Array.isArray(schema.enum) && schema.enum.length >= 5) {
+        delete schema.enum;
+      }
+
+      // Recurse into nested properties
       if (schema.properties) {
         for (const key of Object.keys(schema.properties)) {
           minimizeSchema(schema.properties[key]);
         }
       }
+
+      // Recurse into array items
       if (schema.items) {
         minimizeSchema(schema.items);
       }
@@ -691,16 +578,11 @@ export function minimizeToolSchemas(payload) {
   const savedChars = originalSize - newSize;
   const savedTokens = Math.floor(savedChars / 4);
 
-  // Cache the result
   _toolSchemaCacheMap.set(hash, payload.tools);
 
-  //   console.log(
-  //     `[Tool Minimizer] ${originalSize} → ${newSize} chars ` +
-  //       `(saved ~${savedTokens} tokens across ${payload.tools.length} tools) [cached as ${hash}]`,
-  //   );
-
-  // FIX F5: Stamp savings for observability and baseline derivation
-  payload._cf_minimizeTokensSaved = savedTokens;
+  if (savedTokens > 0) {
+    payload._cf_minimizeTokensSaved = savedTokens;
+  }
 
   return payload;
 }
@@ -708,18 +590,16 @@ export function minimizeToolSchemas(payload) {
 // ========================================================
 // 3. STREAM TRANSLATOR: OpenAI Server Deltas -> Anthropic SSE
 // ========================================================
+
 export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, toolState) {
   const events = [];
 
-  // Initialize sequential block index counter — persists across chunks
-  // This guarantees Anthropic never sees two blocks with the same index
   if (toolState.nextBlockIndex === undefined) {
     toolState.nextBlockIndex = 0;
-    toolState.textBlockIndex = -1; // -1 = not yet opened
+    toolState.textBlockIndex = -1;
     toolState.currentToolIndex = -1;
   }
 
-  // ── Stream Terminus Processing ──
   if (openAIData.trim() === "[DONE]") {
     if (toolState.inToolCall && toolState.currentToolIndex >= 0) {
       events.push(
@@ -746,7 +626,7 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
       }
       let finalStopReason = "end_turn";
       if (toolState.finishReason === "length") finalStopReason = "max_tokens";
-      
+
       events.push(
         `event: message_delta\ndata: ${JSON.stringify({
           type: "message_delta",
@@ -759,7 +639,6 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
     return events;
   }
 
-  // ── Parse incoming chunk ──
   let parsed;
   try {
     parsed = JSON.parse(openAIData);
@@ -773,7 +652,6 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
   const delta = choice.delta;
   const finishReason = choice.finish_reason;
 
-  // ── Initial Transaction Framing ──
   if (isFirst) {
     events.push(
       `event: message_start\ndata: ${JSON.stringify({
@@ -793,11 +671,6 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
     events.push(`event: ping\ndata: {"type":"ping"}\n\n`);
   }
 
-  // ── Text & Reasoning Streaming ──
-  // Nemotron/DeepSeek-R1 stream chain-of-thought in delta.reasoning
-  // before outputting content or tool calls.
-  // Combining both preserves the full reasoning in conversation history,
-  // which prevents agent amnesia on the next turn.
   const reasoningContent = delta?.reasoning || "";
   const textContent = delta?.content || "";
   const combinedText = reasoningContent + textContent;
@@ -816,8 +689,6 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
       );
     }
 
-    // Only emit delta if text block is actually open
-    // Guards against reasoning arriving after a tool call started
     if (toolState.inTextBlock && toolState.textBlockIndex >= 0) {
       events.push(
         `event: content_block_delta\ndata: ${JSON.stringify({
@@ -829,10 +700,8 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
     }
   }
 
-  // ── Tool Call Streaming ──
   if (delta?.tool_calls) {
     for (const tc of delta.tool_calls) {
-      // Close open text block before first tool block opens
       if (toolState.inTextBlock && !toolState.inToolCall) {
         toolState.inTextBlock = false;
         events.push(
@@ -843,9 +712,7 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
         );
       }
 
-      // First chunk for this tool carries id + name → open the block
       if (tc.id && tc.function?.name) {
-        // Close previous tool block if we're opening a new parallel one
         if (toolState.inToolCall && toolState.currentToolIndex >= 0) {
           events.push(
             `event: content_block_stop\ndata: ${JSON.stringify({
@@ -856,7 +723,6 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
         }
 
         toolState.inToolCall = true;
-        // KEY FIX: auto-increment so tool block never shares index with text block
         toolState.currentToolIndex = toolState.nextBlockIndex++;
 
         events.push(
@@ -873,7 +739,6 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
         );
       }
 
-      // Argument fragments — only emit if tool block is open
       if (tc.function?.arguments && toolState.currentToolIndex >= 0) {
         events.push(
           `event: content_block_delta\ndata: ${JSON.stringify({
@@ -889,8 +754,6 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
     }
   }
 
-  // ── Finish Reason Handling ──
-  // Close text block on finish_reason — tool blocks close at [DONE]
   if (finishReason && finishReason !== "null") {
     toolState.finishReason = finishReason;
     if (toolState.inTextBlock && toolState.textBlockIndex >= 0) {

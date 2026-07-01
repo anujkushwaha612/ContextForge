@@ -657,7 +657,7 @@ export function getFileRecord(filePath) {
 
 function normalizeFilePath(filePath) {
   if (!filePath) return filePath;
-  return filePath.replace(/\\/g, "/");
+  return filePath.replace(/\\/g, "/").toLowerCase();
 }
 
 export function closeGraphDb() {
