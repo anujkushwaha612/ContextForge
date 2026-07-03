@@ -66,6 +66,16 @@ export const GeminiAdapter = {
     // 2. Strip query parameters (Google's shim hates Anthropic's ?beta=true)
     normalizedUrl = normalizedUrl.split("?")[0];
 
+    // PG-1 FIX: a gemini-cli CLIENT sends the NATIVE Gemini path
+    // (/v1beta/models/<model>:generateContent) — but the proxy body is
+    // OpenAI format, so it must go to the shim's /chat/completions, not
+    // be prefix-rewritten into /v1beta/openai/models/... (Google 404s).
+    // This made the most natural pairing — gemini client + gemini
+    // upstream — fail on every request.
+    if (/generatecontent/i.test(normalizedUrl)) { // matches :generateContent AND :streamGenerateContent
+      normalizedUrl = "/v1/chat/completions";
+    }
+
     // 3. Prepend the Gemini shim base
     const shimBase = `/${this._apiVersion}/openai`;
 

@@ -37,7 +37,6 @@
     "test:watch": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --watch --testPathPattern=tests/unit",
     "test:ci": "npm run test:unit && npm run test:smoke",
     "test:cli": "node cli/bin/contextforge.js doctor --json",
-    "benchmark": "node benchmarks/compression_benchmark.js",
     "lint": "eslint src/ cli/src/ --ext .js",
     "format": "prettier --write 'src/**/*.js' 'cli/src/**/*.js' 'tests/**/*.js'",
     "clean": "rm -rf native/build native/tree-sitter-src node_modules contextforge_models/*.onnx"

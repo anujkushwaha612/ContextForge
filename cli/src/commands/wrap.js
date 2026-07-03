@@ -44,7 +44,10 @@ async function ensureEnvironment() {
       onEvent: (ev) => {
         if (ev.type === "start") bar = progressBar(ev.asset.name);
         else if (ev.type === "progress") bar?.update(ev.received, ev.total);
-        else if (ev.type === "done") { bar?.finish(`${ev.asset.label} ready`); bar = null; }
+        else if (ev.type === "done") {
+          bar?.finish(`${ev.asset.label} ready`);
+          bar = null;
+        }
       },
     });
   }
@@ -70,7 +73,10 @@ function printSavingsSummary(before, after) {
   if (!before || !after) return;
   const d = (k) => (after[k] ?? 0) - (before[k] ?? 0);
   const requests = d("requests");
-  if (requests <= 0) { info(dim("No requests went through the proxy this session")); return; }
+  if (requests <= 0) {
+    info(dim("No requests went through the proxy this session"));
+    return;
+  }
 
   const tokensBefore = d("tokens_before");
   const saved = d("tokens_saved");
@@ -78,12 +84,18 @@ function printSavingsSummary(before, after) {
 
   console.log("");
   if (saved >= 0) {
-    ok(bold(`Session: ${requests} requests · ${tokensBefore.toLocaleString()} tokens in → ` +
-      `${(tokensBefore - saved).toLocaleString()} sent · ${pct}% saved (est)`));
+    ok(
+      bold(
+        `Session: ${requests} requests · ${tokensBefore.toLocaleString()} tokens in → ` +
+          `${(tokensBefore - saved).toLocaleString()} sent · ${pct}% saved (est)`
+      )
+    );
   } else {
     // savingsTracker ST-1: negative = multi-hop ghost interceptor overhead
-    info(`Session: ${requests} requests · ${Math.abs(saved).toLocaleString()} extra tokens ` +
-      dim("(multi-hop overhead — honest accounting, see savings tracker)"));
+    info(
+      `Session: ${requests} requests · ${Math.abs(saved).toLocaleString()} extra tokens ` +
+        dim("(multi-hop overhead — honest accounting, see savings tracker)")
+    );
   }
 }
 
@@ -112,23 +124,45 @@ export async function wrap(agentName, opts = {}, command) {
       if (!process.stdout.isTTY) return;
       let line = "";
       if (ev.phase === "starting") line = "starting proxy…";
-      else if (ev.phase === "indexing") line = `indexing ${path.basename(workspace)} … ${ev.current ?? 0}/${ev.total ?? "?"} files`;
+      else if (ev.phase === "indexing")
+        line = `indexing ${path.basename(workspace)} … ${ev.current ?? 0}/${ev.total ?? "?"} files`;
       else if (ev.phase === "restarting") line = `restarting proxy (${ev.reason})…`;
-      else if (ev.phase === "ready") { process.stdout.write("\r\x1b[2K"); return; }
-      if (line !== lastPhase) { process.stdout.write(`\r\x1b[2K  ${dim("⠿")} ${line}`); lastPhase = line; }
+      else if (ev.phase === "ready") {
+        process.stdout.write("\r\x1b[2K");
+        return;
+      }
+      if (line !== lastPhase) {
+        process.stdout.write(`\r\x1b[2K  ${dim("⠿")} ${line}`);
+        lastPhase = line;
+      }
     },
   });
 
   const port = runfile.port;
   const health = await fetchHealth(port);
   if (reused) ok(`Reusing proxy on :${port} ${dim(`(pid ${runfile.pid})`)}`);
-  else ok(`Proxy started on :${port} ${dim(`(pid ${runfile.pid}, ${health?.indexedFiles ?? "?"} files indexed)`)}`);
-  info(`upstream ${values["provider.name"]} · dashboard ${cyan(`http://localhost:${port}/dashboard`)}`);
+  else
+    ok(
+      `Proxy started on :${port} ${dim(`(pid ${runfile.pid}, ${health?.indexedFiles ?? "?"} files indexed)`)}`
+    );
+  info(
+    `upstream ${values["provider.name"]} · dashboard ${cyan(`http://localhost:${port}/dashboard`)}`
+  );
 
   // ── Launch agent ──
   const prep = agent.prepare({ port });
-  ok(`Launching ${bold(agentName)} ${dim(`(ANTHROPIC_BASE_URL=http://127.0.0.1:${port}` +
-    `${prep.mcpRegistered ? ", MCP tools registered" : ""})`)}`);
+  if (agent.experimental) {
+    warn(`${agentName} wrap support is EXPERIMENTAL — report issues with \`cf logs\``);
+  }
+  const baseUrlVar = Object.keys(prep.env).find((k) => k.endsWith("_BASE_URL"));
+  const routeNote = baseUrlVar
+    ? `${baseUrlVar}=http://127.0.0.1:${port}`
+    : `proxy http://127.0.0.1:${port} via CLI config`;
+  ok(
+    `Launching ${bold(agentName)} ${dim(
+      `(${routeNote}` + `${prep.mcpRegistered ? ", MCP tools registered" : ""})`
+    )}`
+  );
   console.log("");
 
   const savingsBefore = await fetchSavings(port);
@@ -143,7 +177,13 @@ export async function wrap(agentName, opts = {}, command) {
   });
 
   // Forward signals; the agent owns the TTY, we just relay and wait.
-  const forward = (sig) => () => { try { child.kill(sig); } catch { /* gone */ } };
+  const forward = (sig) => () => {
+    try {
+      child.kill(sig);
+    } catch {
+      /* gone */
+    }
+  };
   const onInt = forward("SIGINT");
   const onTerm = forward("SIGTERM");
   process.on("SIGINT", onInt);
@@ -165,7 +205,13 @@ export async function wrap(agentName, opts = {}, command) {
   const savingsAfter = await fetchSavings(port);
   printSavingsSummary(savingsBefore, savingsAfter);
 
-  for (const f of prep.cleanupFiles) { try { unlinkSync(f); } catch { /* tmp */ } }
+  for (const f of prep.cleanupFiles) {
+    try {
+      unlinkSync(f);
+    } catch {
+      /* tmp */
+    }
+  }
 
   // Only stop a proxy WE started this session. Reused/pre-existing stays up.
   if (!reused && !opts.keepAlive) {

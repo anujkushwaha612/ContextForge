@@ -44,6 +44,14 @@ export const OllamaAdapter = {
       normalized = "/v1/chat/completions";
     }
 
+    // PO-FIX: gemini-cli clients send /v1beta/models/<model>:generateContent
+    // (or :streamGenerateContent). The proxy translates the BODY to OpenAI
+    // format, but the PATH fell through untouched → upstream 404 on every
+    // gemini-wrapped session. Map it like /messages.
+    if (/generatecontent/i.test(normalized)) { // matches :generateContent AND :streamGenerateContent
+      normalized = "/v1/chat/completions";
+    }
+
     // Already correct path — pass through
     if (!normalized || normalized === "/") {
       normalized = "/v1/chat/completions";

@@ -307,7 +307,11 @@ async function gatherContextChunks(query, existingEvidence) {
       .replace(/\r\n/g, "\n")
       .split("\n");
 
-    if (targetSym?.startLine) {
+    // RP-12 FIX: `targetSym?.startLine` treats a symbol on line 0 (a fully
+    // valid 0-indexed line number — e.g. the very first declaration in a
+    // file) as falsy, silently falling through to the "no symbol" branch
+    // below. Explicit null/undefined check instead.
+    if (targetSym?.startLine != null) {
       const start = Math.max(0, targetSym.startLine - 20);
       const end   = Math.min(lines.length, targetSym.startLine + 40);
       chunks.push({
@@ -386,8 +390,17 @@ function readFunctionBody(sym) {
       .replace(/\r\n/g, "\n")
       .split("\n");
 
-    const start = Math.max(0, sym.startLine - 1);
-    const end   = Math.min(lines.length, sym.endLine ?? sym.startLine + 60);
+    // RP-11 FIX: sym.startLine/endLine are 0-indexed, inclusive (the
+    // convention symbolExtractor.js writes and graphTools.js's read_function
+    // already correctly uses: lines.slice(start_line, end_line + 1)). This
+    // function instead treated startLine as 1-indexed (`- 1`) and endLine as
+    // an exclusive bound (no `+1`) — same symbol, same DB row, but a body
+    // shifted one line early and missing its final line (e.g. a truncated
+    // closing brace) compared to what read_function returns for the
+    // identical symbol. Corrupted every implementation/architecture/debug
+    // intent tier that goes through gatherFunctionBodies/gatherCallGraph.
+    const start = Math.max(0, sym.startLine);
+    const end   = Math.min(lines.length, (sym.endLine ?? sym.startLine + 60) + 1);
 
     return {
       type:        "symbol",   // consistent type field for extractSymbols

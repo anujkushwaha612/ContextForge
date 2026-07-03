@@ -65,6 +65,7 @@ import { isPatchToolCall, executePatchToolCall, PATCH_TOOL_NAME } from "../graph
 import { hasMemoryToolCalls, executeMemoryToolCalls } from "../memory/memoryTools.js";
 import { normalizeConceptKey } from "../graph/semanticResolver.js";
 import { invalidateRegistryEntry } from "../compression/semanticDedup.js";
+import { DEFAULT_MEMORY_USER_ID } from "./memoryDecision.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -687,7 +688,7 @@ class ToolInterceptor {
         // ── Memory tool ───────────────────────────────────────────────────────
       } else if (hasMemoryToolCalls({ tool_calls: [tc] })) {
         isActionTool = true;
-        const userId = this.req.headers["x-contextforge-user-id"] ?? "anonymous";
+        const userId = this.req.headers["x-contextforge-user-id"] ?? DEFAULT_MEMORY_USER_ID;
         const workspace = this.req.headers["x-contextforge-workspace"] ?? "";
         const toolResults = await executeMemoryToolCalls({ tool_calls: [tc] }, this.memoryHandler, {
           userId,

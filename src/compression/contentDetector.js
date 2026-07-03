@@ -77,6 +77,16 @@ const SIGNALS = {
       /^pub(lic)?\s+fn\s+\w+/m,
       /^func\s+\w+/m,
       /^#include\s*[<"]/m,
+      // CD-10: JVM/C#/Ruby coverage — these all classified as "text",
+      // so astCompressor (which fires only on _cf_type==="code") never
+      // compressed Java reads even though tree-sitter-java is vendored.
+      /^package\s+[\w.]+\s*;/m,                       // Java package decl
+      /^using\s+[\w.]+\s*;/m,                          // C# using
+      /^namespace\s+[\w.]+/m,                            // C# namespace
+      /^(public|private|protected|abstract|final|static)\s+(static\s+)?(class|interface|enum|record|void|[\w<>\[\]]+\s+\w+\s*\()/m, // Java/C# member
+      /^require(_relative)?\s+['"]/m,                    // Ruby require
+      /^class\s+\w+(\s*<\s*\w+)?\s*$/m,             // Ruby class (no brace)
+      /^<\?php/m,                                          // PHP open tag
     ],
     weak: [
       /[{};]/, /=>/, /===/, /!==/, /\?\?/,
@@ -96,6 +106,13 @@ const SIGNALS = {
       /^\[[\d\-T:Z.]+\]\s+/m,
       /^\[(INFO|WARN(?:ING)?|ERROR|DEBUG|TRACE|FATAL|CRITICAL)\]/m,
       /\blevel[=:]["']?(INFO|WARN|ERROR|DEBUG|TRACE|FATAL)/i,
+      // CD-11: stack traces are logs. Node frames ("at fn (file:1:2)")
+      // and Python tracebacks scored only +0.1 weak — under the 0.35
+      // threshold — so error output fell to "text", which is DEDUPABLE
+      // and vault-eligible. A deduped stack trace = model debugging blind.
+      /^\s+at\s+.+\(.+:\d+:\d+\)\s*$/m,             // Node/JVM frame
+      /^Traceback \(most recent call last\):/m,          // Python
+      /^\s+File ".+", line \d+, in /m,                   // Python frame
     ],
     weak: [
       /^\d{2}:\d{2}:\d{2}/m,
@@ -300,7 +317,7 @@ function _classify(text) {
 function _cacheKey(text) {
   return crypto
     .createHash("md5")
-    .update(`${text.length}:${text.slice(0, 512)}`)
+    .update(`${text.length}:${text.slice(0, 512)}:${text.slice(-256)}`)
     .digest("hex")
     .slice(0, 16);
 }

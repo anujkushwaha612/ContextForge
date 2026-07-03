@@ -59,7 +59,15 @@ class StatsEmitter extends EventEmitter {
     this.maxRecentEvents = 20;
 
     // ── Periodic heartbeat broadcast ──
-    setInterval(() => this.broadcast("heartbeat"), 1000);
+    // SE-1 FIX: .unref() — this interval kept the event loop alive forever,
+    // so any embedder/importer of this module could never exit cleanly
+    // (verified: process hung past its natural end). Also skip when no
+    // dashboard is connected — getSnapshot() does a JSON deep-clone every
+    // second; that's pure GC churn with zero listeners.
+    const hb = setInterval(() => {
+      if (this.listenerCount("snapshot") > 0) this.broadcast("heartbeat");
+    }, 1000);
+    hb.unref();
   }
 
   // ─────────────────────────────────────────────
@@ -93,7 +101,13 @@ class StatsEmitter extends EventEmitter {
     this.addRecentEvent({
       type: "request",
       tokensSaved: baselineTokens - finalTokens,
-      compressionRatio: ((baselineTokens - finalTokens) / baselineTokens) * 100,
+      // SE-2 FIX: baselineTokens=0 (empty passthrough pings) produced NaN
+      // which then flowed into the dashboard JSON as null-after-serialize
+      // and broke chart math client-side.
+      compressionRatio:
+        baselineTokens > 0
+          ? ((baselineTokens - finalTokens) / baselineTokens) * 100
+          : 0,
       pipelineLatency,
       upstreamLatency,
     });
@@ -178,11 +192,17 @@ class StatsEmitter extends EventEmitter {
       trigger: triggerType,
       at: Date.now(),
       session: { ...this.session },
-      stages: { ...this.stages },
+      // SE-3 FIX: shallow spread shared the INNER per-stage objects — any
+      // consumer mutating a snapshot (dashboard code, tests) corrupted the
+      // live counters. Verified: writing to snapshot.stages.X.totalMs
+      // changed the emitter's real state.
+      stages: Object.fromEntries(
+        Object.entries(this.stages).map(([k, v]) => [k, { ...v }])
+      ),
       cache: JSON.parse(JSON.stringify(this.cache)),
-      graph: { ...this.graph },
+      graph: { ...this.graph, lastQuery: this.graph.lastQuery ? { ...this.graph.lastQuery } : null },
       agentActions: { ...this.agentActions },
-      recentEvents: [...this.recentEvents],
+      recentEvents: this.recentEvents.map((ev) => ({ ...ev })),
       uptime: Date.now() - this.session.startedAt,
     };
   }

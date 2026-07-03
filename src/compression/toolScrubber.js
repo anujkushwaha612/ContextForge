@@ -4,12 +4,57 @@ import { classifyContentAsync } from "./contentDetector.js";
 // PHASE 1, FEATURE 1: NATIVE TERMINAL SCRUBBER (RTK Replacement)
 // ============================================================
 
-const ANSI_PATTERN = /\x1b\[[0-9;]*[a-zA-Z]/g;
-const OSC_PATTERN = /\x1b\][^\x07]*\x07/g;
+// TS-2 FIX: broadened ANSI coverage.
+//
+// Old CSI pattern /\x1b\[[0-9;]*[a-zA-Z]/ missed PRIVATE-mode sequences —
+// \x1b[?25l / \x1b[?25h (cursor hide/show) are emitted by EVERY spinner
+// library (ora, listr2, ink) and leaked into tool results verbatim.
+// CSI grammar: params 0x30-0x3F, intermediates 0x20-0x2F, final 0x40-0x7E.
+const ANSI_PATTERN = /\x1b\[[0-9;:?<=>]*[ -/]*[@-~]/g;
+
+// Old OSC pattern required BEL (\x07) terminator. xterm titles are just as
+// often terminated by ST (ESC \) — those leaked whole title strings.
+const OSC_PATTERN = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
 const SINGLE_ESC = /\x1b[()][0-9a-zA-Z]/g;
 
-const SPINNER_LINE_PATTERN = /^[\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷#=\-|/\\%.\d(){}\]\[∧>]+$/;
+// TS-1 FIX (P0 — silent code corruption): the old SPINNER_LINE_PATTERN was
+//
+//   /^[\s⠋⠙…#=\-|/\\%.\d(){}\]\[∧>]+$/
+//
+// i.e. "any line made only of whitespace/braces/brackets/parens/digits/
+// punctuation is spinner junk". That matches REAL CODE:
+//
+//   }        ← JS/JSON closing brace
+//   );       ← call close
+//   ]        ← array close
+//
+// Three or more consecutive such lines (the tail of literally any nested
+// file) were treated as a progress run and DELETED — and because the last
+// line also matched the pattern, the "[N lines collapsed]" marker was
+// suppressed, so the deletion was silent. Reproduced: reading
+// "  );\n}\n)\n]\nexport default App;" through the scrubber returned
+// ");\nexport default App;" — brace/bracket lines gone, file corrupted.
+//
+// New rules: a line only counts as "progress junk" if it carries a
+// POSITIVE spinner/progress signal — a braille spinner glyph, or a
+// progress bar with a percentage. Pure punctuation never qualifies.
+const BRAILLE_GLYPHS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷";
+const SPINNER_LINE_PATTERN = new RegExp(`^\\s*[${BRAILLE_GLYPHS}]`);
 const NPM_PROGRESS_PATTERN = /^\[[#=\-.\s]{8,}\]\s+\d+%.*/;
+// Generic bar: [####----] 45%  or  ████░░░░ 45%  (bar chars + percentage)
+const BAR_PROGRESS_PATTERN = /^\s*[[(]?[#=\-█▓▒░.\s]{6,}[\])]?\s*\d{1,3}\s*%/;
+// Bare percentage tickers: "  45%" / "45 % (12/26)"
+const PCT_ONLY_PATTERN = /^\s*\d{1,3}\s*%\s*(?:\([^)]*\))?\s*$/;
+
+function isProgressLine(line) {
+  return (
+    SPINNER_LINE_PATTERN.test(line) ||
+    NPM_PROGRESS_PATTERN.test(line) ||
+    BAR_PROGRESS_PATTERN.test(line) ||
+    PCT_ONLY_PATTERN.test(line)
+  );
+}
 
 // ─────────────────────────────────────────────
 // Shell tool detection
@@ -35,6 +80,13 @@ export const SHELL_TOOL_NAMES = new Set([
   "shell",
   "cmd",
   "command",
+  // TS-3 FIX: real agent tool names that were missing.
+  // All lookups are done on toolName.toLowerCase().
+  "bashoutput", // Claude Code background-shell output tool ("BashOutput")
+  "run_shell_command", // gemini-cli's shell tool
+  "run_terminal_cmd", // Cursor's shell tool
+  "execute_command", // common MCP shell server name
+  "run_command", // common MCP shell server name
 ]);
 
 export function isShellToolResult(msg) {
@@ -71,23 +123,26 @@ function collapseCarriageReturnProgress(text) {
       }
     }
 
-    if (line.trim().length > 0 && (NPM_PROGRESS_PATTERN.test(line) || SPINNER_LINE_PATTERN.test(line))) {
+    if (line.trim().length > 0 && isProgressLine(line)) {
       let j = i + 1;
-      while (
-        j < lines.length &&
-        lines[j].trim().length > 0 &&
-        (NPM_PROGRESS_PATTERN.test(lines[j]) || SPINNER_LINE_PATTERN.test(lines[j]))
-      ) {
+      while (j < lines.length && lines[j].trim().length > 0 && isProgressLine(lines[j])) {
         j++;
       }
 
       const consecutiveProgressLines = j - i;
       if (consecutiveProgressLines > 2) {
-        const lastProgress = lines[j - 1].trim();
-        if (lastProgress && !SPINNER_LINE_PATTERN.test(lastProgress)) {
-          result.push(
-            lastProgress + `  [${consecutiveProgressLines - 1} progress lines collapsed]`
-          );
+        // TS-4 FIX: the old code suppressed the "[N lines collapsed]"
+        // marker whenever the LAST line of the run also matched the
+        // spinner pattern — which for bar-style progress was ALWAYS,
+        // so entire runs vanished with no trace. Always leave a marker.
+        // Keep the last line's human-readable text when it has any
+        // (strip spinner glyphs first), otherwise emit the bare marker.
+        const lastRaw = lines[j - 1].trim();
+        const lastText = lastRaw.replace(new RegExp(`[${BRAILLE_GLYPHS}]`, "g"), "").trim();
+        if (lastText) {
+          result.push(lastText + `  [${consecutiveProgressLines - 1} progress lines collapsed]`);
+        } else {
+          result.push(`[${consecutiveProgressLines} progress lines collapsed]`);
         }
         i = j;
         continue;
@@ -109,6 +164,11 @@ export function scrubTerminalOutput(text) {
   cleaned = cleaned.replace(ANSI_PATTERN, "");
   cleaned = cleaned.replace(OSC_PATTERN, "");
   cleaned = cleaned.replace(SINGLE_ESC, "");
+  // TS-2 FIX: drop any orphaned ESC bytes left by unterminated/exotic
+  // sequences. A raw 0x1B byte carries no meaning for an LLM, and a
+  // genuine ESC byte inside a source file read is practically impossible
+  // (source code contains the "\x1b" escape SEQUENCE, not the byte).
+  cleaned = cleaned.replace(/\x1b/g, "");
 
   cleaned = collapseCarriageReturnProgress(cleaned);
 
@@ -239,8 +299,8 @@ export async function tagToolResults(payload) {
       const meta = toolCallMeta.get(msg.tool_call_id);
       if (meta) {
         if (meta.filePath && !msg._filename) msg._filename = meta.filePath;
-        if (meta.toolName && !msg._toolName)  msg._toolName = meta.toolName;
-        if (meta.command && !msg._command)    msg._command = meta.command;
+        if (meta.toolName && !msg._toolName) msg._toolName = meta.toolName;
+        if (meta.command && !msg._command) msg._command = meta.command;
         if (!msg._args) msg._args = meta.args;
 
         const lowerName = meta.toolName.toLowerCase();
@@ -266,12 +326,15 @@ export async function tagToolResults(payload) {
 
         // ── Read tool editable flag ─────────────────────────────────────
         if (msg._cf_editable === undefined) {
-          const isReadTool = /^(?:mcp__\w+__|[\w]+__)?(?:read_file|read_file_chunk|read_function|view_file)$/.test(lowerName);
+          const isReadTool =
+            /^(?:mcp__\w+__|[\w]+__)?(?:read_file|read_file_chunk|read_function|view_file)$/.test(
+              lowerName
+            );
 
           if (isReadTool) {
             const args = meta.args || {};
             const startLine = args.start_line ?? args.startLine ?? args.start ?? args.StartLine;
-            const endLine   = args.end_line   ?? args.endLine   ?? args.end   ?? args.EndLine;
+            const endLine = args.end_line ?? args.endLine ?? args.end ?? args.EndLine;
 
             if (startLine !== undefined && endLine !== undefined) {
               const linesRequested = Number(endLine) - Number(startLine);
@@ -293,11 +356,20 @@ export async function tagToolResults(payload) {
       }
 
       // New message — classify and tag
+      // TS-5 FIX: .catch() added. classifyContentAsync rejecting (Magika
+      // load failure, malformed input) made Promise.all(classifyJobs)
+      // reject → tagToolResults threw → whole request 500'd. A failed
+      // classification must degrade to "text", never crash the pipeline.
       classifyJobs.push(
-        classifyContentAsync(msg.content).then((type) => {
-          msg._cf_type = type;
-          typesReport[type] = (typesReport[type] || 0) + 1;
-        })
+        classifyContentAsync(msg.content)
+          .then((type) => {
+            msg._cf_type = type;
+            typesReport[type] = (typesReport[type] || 0) + 1;
+          })
+          .catch(() => {
+            msg._cf_type = "text";
+            typesReport.text = (typesReport.text || 0) + 1;
+          })
       );
     }
 
@@ -307,8 +379,8 @@ export async function tagToolResults(payload) {
           const meta = toolCallMeta.get(block.tool_use_id);
           if (meta) {
             if (meta.filePath && !block._filename) block._filename = meta.filePath;
-            if (meta.toolName && !block._toolName)  block._toolName = meta.toolName;
-            if (meta.command && !block._command)    block._command = meta.command;
+            if (meta.toolName && !block._toolName) block._toolName = meta.toolName;
+            if (meta.command && !block._command) block._command = meta.command;
             if (!block._args) block._args = meta.args;
 
             const lowerName = meta.toolName.toLowerCase();
@@ -322,12 +394,15 @@ export async function tagToolResults(payload) {
             }
 
             if (block._cf_editable === undefined) {
-              const isReadTool = /^(?:mcp__\w+__|[\w]+__)?(?:read_file|read_file_chunk|read_function|view_file)$/.test(lowerName);
+              const isReadTool =
+                /^(?:mcp__\w+__|[\w]+__)?(?:read_file|read_file_chunk|read_function|view_file)$/.test(
+                  lowerName
+                );
 
               if (isReadTool) {
                 const args = meta.args || {};
                 const startLine = args.start_line ?? args.startLine ?? args.start ?? args.StartLine;
-                const endLine   = args.end_line   ?? args.endLine   ?? args.end   ?? args.EndLine;
+                const endLine = args.end_line ?? args.endLine ?? args.end ?? args.EndLine;
 
                 if (startLine !== undefined && endLine !== undefined) {
                   const linesRequested = Number(endLine) - Number(startLine);
@@ -347,11 +422,17 @@ export async function tagToolResults(payload) {
             continue;
           }
 
+          // TS-5 FIX: same .catch() as OpenAI path above.
           classifyJobs.push(
-            classifyContentAsync(block.content).then((type) => {
-              block._cf_type = type;
-              typesReport[type] = (typesReport[type] || 0) + 1;
-            })
+            classifyContentAsync(block.content)
+              .then((type) => {
+                block._cf_type = type;
+                typesReport[type] = (typesReport[type] || 0) + 1;
+              })
+              .catch(() => {
+                block._cf_type = "text";
+                typesReport.text = (typesReport.text || 0) + 1;
+              })
           );
         }
       }

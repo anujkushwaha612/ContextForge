@@ -29,8 +29,14 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 
-import { queryFindSymbol, writeFileGraph, getWorkspaceRoot } from "./graphDb.js";
+import {
+  queryFindSymbol,
+  queryNodeByStableId,
+  writeFileGraph,
+  getWorkspaceRoot,
+} from "./graphDb.js";
 import { extractSymbols, getLanguageForFile } from "./symbolExtractor.js";
+import { extractLiterals, buildNodeSummaries } from "./literalExtractor.js";
 import { invalidateByFile } from "../logging/cacheDb.js";
 import { invalidateRegistryEntry } from "../compression/semanticDedup.js";
 
@@ -62,6 +68,25 @@ function resolveFilePath(filePath) {
   }
 
   return path.resolve(getWorkspaceRoot(), p).replace(/\\/g, "/");
+}
+
+// PE-9 FIX: containment guard. file_path comes from the LLM — a relative
+// path with ../.. (or a hallucinated absolute path) previously resolved
+// OUTSIDE the workspace and create_file/atomicWrite happily wrote there.
+// Reproduced: create_file with "../../etc/evil.js" wrote /tmp/etc/evil.js.
+// Every write operation now refuses targets outside the workspace root.
+function ensureInsideWorkspace(resolvedPath) {
+  const root = getWorkspaceRoot().replace(/\\/g, "/");
+  const rel = path.relative(root, resolvedPath);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
+    return {
+      ok: false,
+      error:
+        `Refused: '${resolvedPath}' resolves outside the workspace root ` +
+        `('${root}'). Patches may only touch files inside the workspace.`,
+    };
+  }
+  return { ok: true };
 }
 
 // ─────────────────────────────────────────────
@@ -177,6 +202,23 @@ function resolveSymbol(symbolName, filePath) {
         `Symbol '${symbolName}' is indexed but not in '${filePath}'. ` +
         `Found in: ${foundIn}. Check the file_path argument.`,
     };
+  }
+
+  // PE-14 FIX: queryFindSymbol's underlying SQL (findSymbol) deliberately
+  // omits body_text (GD-5, to keep graph-query responses lean for the LLM).
+  // But checkBodyIntegrity() — the ONLY thing standing between a stale
+  // graph index and splicing new content into the wrong lines of a file —
+  // opens with `if (!row.body_text) return { stale: false }`. Since
+  // matchingRow never carries body_text, that check silently short-circuited
+  // to "not stale" on every single patch, regardless of whether the file
+  // had actually drifted since the last index pass (hand edit, git checkout,
+  // another tool). Fetch body_text separately via queryNodeByStableId
+  // (backed by getNodeByFileAndLine, which DOES select it) so the integrity
+  // check the code already believed it was performing actually runs.
+  const stableId = `${matchingRow.file_path}:${matchingRow.start_line}:${matchingRow.name}`;
+  const fullNode = queryNodeByStableId(stableId);
+  if (fullNode?.body_text) {
+    matchingRow.body_text = fullNode.body_text;
   }
 
   return { row: matchingRow, normalizedFilePath: matchingRow.file_path };
@@ -296,20 +338,53 @@ function atomicWrite(filePath, content, hasCRLF = false) {
 // Re-index — deferred to avoid blocking event loop
 // ─────────────────────────────────────────────
 
+// PE-12 FIX: writeFileGraph must receive the SAME path form the indexer
+// uses — workspace-RELATIVE (workspaceMapper passes relPath). The old code
+// passed the absolute path, so every patched file gained a SECOND graph
+// entry (fileId = sha256(path) differs) — 'sym.js' AND '/abs/ws/sym.js' —
+// and resolveSymbol then found duplicate/conflicting rows on later patches.
+// Reproduced in harness: indexer wrote "sym.js", patch reindex wrote
+// "/tmp/pe/ws/sym.js".
+function toGraphPath(filePath) {
+  const abs = filePath.replace(/\\/g, "/");
+  const root = getWorkspaceRoot().replace(/\\/g, "/");
+  const rel = path.relative(root, abs).replace(/\\/g, "/");
+  return rel && !rel.startsWith("..") ? rel : abs;
+}
+
+// PE-15 FIX: writeFileGraph unconditionally DELETEs literals/config_refs/
+// summaries for a file on every write, then only re-inserts them if the
+// caller supplies fileData.literals/configRefs/summaries. workspaceMapper's
+// initial index pass always supplies all three; this reindex path — which
+// runs on EVERY successful patch — previously supplied only nodes/edges.
+// Net effect: the moment a file was patched even once, its literals, env
+// var references, and node summaries (which also feed queryFindSymbol's
+// call_summary/env_refs/literal_refs columns, not just read_function's
+// relatedContext) were permanently wiped for the rest of the session,
+// silently degrading graph query quality with no error anywhere.
+// Fix: re-run the same extraction workspaceMapper.js uses and pass it
+// through, so a patched file's graph richness is preserved exactly like a
+// freshly-indexed one.
 function reindexFile(filePath, newSource) {
   setImmediate(() => {
     try {
+      const graphPath = toGraphPath(filePath); // PE-12
       const langInfo = getLanguageForFile(filePath);
       const language = langInfo?.language || "unknown";
       const stat = fs.statSync(filePath);
-      const { nodes, edges } = extractSymbols(newSource, filePath);
+      const { nodes, edges } = extractSymbols(newSource, graphPath);
+      const { literals, configRefs } = extractLiterals(newSource, graphPath, nodes); // PE-15
+      const summaries = buildNodeSummaries(nodes, literals, configRefs, graphPath); // PE-15
 
       writeFileGraph({
-        filePath: filePath.replace(/\\/g, "/"),
+        filePath: graphPath,
         language,
         lastModified: stat.mtimeMs,
         nodes,
         edges,
+        literals,
+        configRefs,
+        summaries,
       });
 
       console.log(
@@ -332,17 +407,23 @@ function reindexFile(filePath, newSource) {
 
 function reindexFileSync(filePath, source) {
   try {
+    const graphPath = toGraphPath(filePath); // PE-12
     const langInfo = getLanguageForFile(filePath);
     const language = langInfo?.language || "unknown";
     const stat = fs.statSync(filePath);
-    const { nodes, edges } = extractSymbols(source, filePath);
+    const { nodes, edges } = extractSymbols(source, graphPath);
+    const { literals, configRefs } = extractLiterals(source, graphPath, nodes); // PE-15
+    const summaries = buildNodeSummaries(nodes, literals, configRefs, graphPath); // PE-15
 
     writeFileGraph({
-      filePath: filePath.replace(/\\/g, "/"),
+      filePath: graphPath,
       language,
       lastModified: stat.mtimeMs,
       nodes,
       edges,
+      literals,
+      configRefs,
+      summaries,
     });
 
     console.log(
@@ -370,14 +451,24 @@ function buildDiffSummary(linesBefore, linesAfter, startLine, endLine) {
 // ─────────────────────────────────────────────
 
 function postPatchInvalidate(normalizedFilePath, newSource, semanticCache) {
+  // PE-13 FIX: cache_dependencies rows are registered under
+  // normalizePathForCache()'s form — ABSOLUTE + forward-slash + LOWERCASE
+  // (upstreamRequest.js). The old code passed the case-preserved path, so
+  // on Windows ('D:/NODE JS/…') the lookup silently matched nothing and
+  // vaults for a just-patched file were NEVER invalidated → stale vault
+  // content could be retrieved after the patch changed the file.
+  const cacheKeyPath = normalizedFilePath.replace(/\\/g, "/").toLowerCase();
   try {
     const newHash = crypto.createHash("sha256").update(newSource).digest("hex");
-    invalidateByFile(normalizedFilePath, newHash, semanticCache);
+    invalidateByFile(cacheKeyPath, newHash, semanticCache);
   } catch (err) {
     console.warn(`[PatchEngine] ⚠️  Vault invalidation failed: ${err.message}`);
   }
   try {
-    invalidateRegistryEntry(normalizedFilePath);
+    invalidateRegistryEntry(cacheKeyPath);
+    // Also invalidate under the workspace-relative form — semanticDedup's
+    // registry keys come from message _filename fields which are relative.
+    invalidateRegistryEntry(toGraphPath(normalizedFilePath).toLowerCase());
   } catch (err) {
     console.warn(`[PatchEngine] ⚠️  SimHash registry invalidation failed: ${err.message}`);
   }
@@ -449,17 +540,19 @@ export async function executePatch({
   // ── CREATE_FILE ─────────────────────────────────────────────────────────
   if (operation === PATCH_OPERATIONS.CREATE_FILE) {
     const resolvedPath = resolveFilePath(file_path);
+    const contained = ensureInsideWorkspace(resolvedPath); // PE-9
+    if (!contained.ok) return { success: false, error: contained.error };
     if (fs.existsSync(resolvedPath)) {
       return {
         success: false,
-        error: `File already exists: ${file_path}. Use replace_body to modify it.`
+        error: `File already exists: ${file_path}. Use replace_body to modify it.`,
       };
     }
     fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
-    
+
     const bodyContent = new_body || "";
     fs.writeFileSync(resolvedPath, bodyContent, "utf-8");
-    
+
     // Ensure the new file is indexed into the graph immediately
     reindexFile(resolvedPath, bodyContent);
     postPatchInvalidate(resolvedPath, bodyContent, semanticCache);
@@ -485,6 +578,10 @@ export async function executePatch({
     }
 
     const normalizedFilePath = resolveFilePath(file_path);
+    {
+      const contained = ensureInsideWorkspace(normalizedFilePath); // PE-9
+      if (!contained.ok) return { success: false, error: contained.error };
+    }
 
     let source, hasCRLF;
     try {
@@ -494,8 +591,9 @@ export async function executePatch({
         return {
           success: false,
           error: `File not found: ${file_path}`,
-          hint: "This file does not exist yet. Use operation='create_file' with " +
-                "new_body set to the full file content to create it."
+          hint:
+            "This file does not exist yet. Use operation='create_file' with " +
+            "new_body set to the full file content to create it.",
         };
       }
       return {
@@ -588,6 +686,10 @@ export async function executePatch({
     }
 
     const normalizedFilePath = resolveFilePath(file_path);
+    {
+      const contained = ensureInsideWorkspace(normalizedFilePath); // PE-9
+      if (!contained.ok) return { success: false, error: contained.error };
+    }
 
     let source, hasCRLF;
     try {
@@ -597,8 +699,9 @@ export async function executePatch({
         return {
           success: false,
           error: `File not found: ${file_path}`,
-          hint: "This file does not exist yet. Use operation='create_file' with " +
-                "new_body set to the full file content to create it."
+          hint:
+            "This file does not exist yet. Use operation='create_file' with " +
+            "new_body set to the full file content to create it.",
         };
       }
       return {

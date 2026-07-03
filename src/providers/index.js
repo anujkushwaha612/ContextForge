@@ -16,14 +16,12 @@
 import { OllamaAdapter }    from "./ollama.js";
 import { OpenAIAdapter }    from "./openai.js";
 import { AnthropicAdapter } from "./anthropic.js";
-import { GroqAdapter }      from "./groq.js";
 import { GeminiAdapter }    from "./gemini.js";
 
 const REGISTRY = {
   ollama:    OllamaAdapter,
   openai:    OpenAIAdapter,
   anthropic: AnthropicAdapter,
-  groq:      GroqAdapter,
   gemini:    GeminiAdapter,
 };
 

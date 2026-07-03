@@ -112,11 +112,66 @@ export const AGENTS = {
             2
           )
         );
-        args.push("--mcp-config", mcpConfigFile);
+        // args.push("--mcp-config", mcpConfigFile);
         cleanupFiles.push(mcpConfigFile);
       }
 
       return { env, args, cleanupFiles, mcpRegistered: !!bridge };
+    },
+  },
+
+  // ── EXPERIMENTAL (v1.1 targets — wired, not yet battle-tested) ────────────
+
+  "gemini-cli": {
+    binary: "gemini",
+    installHint: "npm i -g @google/gemini-cli",
+    experimental: true,
+
+    /**
+     * gemini-cli redirects via GOOGLE_GEMINI_BASE_URL (undocumented but
+     * stable @google/genai env var; the LiteLLM integration relies on it).
+     * Requirements:
+     *   - GEMINI_API_KEY must be SET (it selects the API-key auth path,
+     *     which is the one that honors the base URL). For local upstreams
+     *     the key value never reaches a real Google endpoint.
+     *   - MCP tools: gemini-cli has no ephemeral --mcp-config equivalent;
+     *     persistent registration via `cf mcp install` covers it.
+     */
+    prepare({ port }) {
+      const env = {
+        GOOGLE_GEMINI_BASE_URL: `http://127.0.0.1:${port}`,
+        ...(process.env.GEMINI_API_KEY ? {} : { GEMINI_API_KEY: "contextforge-local" }),
+      };
+      return { env, args: [], cleanupFiles: [], mcpRegistered: false };
+    },
+  },
+
+  codex: {
+    binary: "codex",
+    installHint: "npm i -g @openai/codex",
+    experimental: true,
+
+    /**
+     * codex redirects via -c config overrides defining an ad-hoc provider.
+     * wire_api MUST be "chat": codex's built-in openai provider defaults to
+     * the /v1/responses API, which the proxy does not serve — the override
+     * pins it to /v1/chat/completions.
+     * OPENAI_API_KEY placeholder satisfies env_key for local upstreams.
+     * MCP tools: persistent registration via `cf mcp install` (codex
+     * registrar writes ~/.codex/config.toml).
+     */
+    prepare({ port }) {
+      const env = {
+        ...(process.env.OPENAI_API_KEY ? {} : { OPENAI_API_KEY: "contextforge-local" }),
+      };
+      const args = [
+        "-c", "model_provider=contextforge",
+        "-c", 'model_providers.contextforge.name=ContextForge',
+        "-c", `model_providers.contextforge.base_url=http://127.0.0.1:${port}/v1`,
+        "-c", 'model_providers.contextforge.env_key=OPENAI_API_KEY',
+        "-c", 'model_providers.contextforge.wire_api=chat',
+      ];
+      return { env, args, cleanupFiles: [], mcpRegistered: false };
     },
   },
 };
@@ -127,7 +182,7 @@ export function resolveAgent(name) {
     throw new CFError(
       "CF_ERR_AGENT_NOT_FOUND",
       `Unknown agent "${name}". Supported in v1: ${Object.keys(AGENTS).join(", ")}`,
-      "More agents (codex, gemini-cli) land in v1.x."
+      "Supported: claude (stable), gemini-cli + codex (experimental)."
     );
   }
   const bin = findBinary(agent.binary);

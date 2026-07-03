@@ -46,8 +46,7 @@ export function getMemoryToolDefinitions() {
           properties: {
             content: {
               type: "string",
-              description:
-                "The information to remember. Be specific and self-contained.",
+              description: "The information to remember. Be specific and self-contained.",
             },
             importance: {
               type: "number",
@@ -160,8 +159,14 @@ function payloadHasMemoryContent(messages) {
 
   for (const msg of messages) {
     // Check if any tool result is from a memory tool
-    if (msg.role === "tool" && MEMORY_TOOL_NAMES.has(msg.name)) {
-      return true;
+    if (msg.role === "tool" && typeof msg.name === "string") {
+      // MT-5 FIX: match namespaced variants too (mcp__cf__memory_save).
+      // Exact-only lookup missed prefixed names → markers never detected
+      // → injection stopped after the first turn on MCP-routed setups.
+      const bare = msg.name.slice(msg.name.lastIndexOf("__") + 2);
+      if (MEMORY_TOOL_NAMES.has(msg.name) || MEMORY_TOOL_NAMES.has(bare)) {
+        return true;
+      }
     }
 
     // Check if any message content references a memory ID (mem_<hex>)
@@ -197,10 +202,57 @@ function payloadHasMemoryContent(messages) {
 // not need to pre-inject them on every turn "just in case".
 // ─────────────────────────────────────────────
 
+// ─────────────────────────────────────────────
+// MT-4: Memory-intent detection
+//
+// The MT-1 gate created a chicken-and-egg deadlock: tools are injected
+// only when the conversation already shows memory usage — but a fresh
+// session can never GET memory usage without the tools. A user saying
+// "remember that I prefer tabs" got no memory_save schema, the model
+// apologized, and the feature was effectively dead for new users.
+//
+// Fix: also inject when the LATEST user message expresses memory intent.
+// Scoped to the last user message only (not history) so a week-old
+// "remember..." doesn't re-inject forever; once the model actually calls
+// a memory tool, the tool-result marker keeps injection alive.
+// ─────────────────────────────────────────────
+
+const MEMORY_INTENT_PATTERN =
+  /\b(remember|memoriz|don'?t forget|keep in mind|save (this|that|it) (for|to memory)|note (this|that) down|for (future|next) (reference|session)|from (a )?(previous|past|last) (session|conversation)|what did (we|i) (decide|choose|say)|recall)\b/i;
+
+function latestUserMessageHasMemoryIntent(messages) {
+  if (!messages) return false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role !== "user") continue;
+    // Skip Anthropic-style pure tool_result user messages
+    if (
+      Array.isArray(msg.content) &&
+      msg.content.length > 0 &&
+      msg.content.every((b) => b?.type === "tool_result")
+    )
+      continue;
+
+    const text =
+      typeof msg.content === "string"
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content
+              .filter((b) => b?.type === "text")
+              .map((b) => b.text || "")
+              .join(" ")
+          : "";
+    return MEMORY_INTENT_PATTERN.test(text);
+  }
+  return false;
+}
+
 export function injectMemoryTools(payload, { sessionHasMemory = false } = {}) {
-  // MT-1: Wire up the condition that was previously computed but ignored
+  // MT-1: markers/session flag; MT-4: fresh-session intent escape hatch
   const shouldInject =
-    sessionHasMemory || payloadHasMemoryContent(payload.messages);
+    sessionHasMemory ||
+    payloadHasMemoryContent(payload.messages) ||
+    latestUserMessageHasMemoryIntent(payload.messages);
 
   if (!shouldInject) return payload;
 
@@ -224,9 +276,7 @@ export function injectMemoryTools(payload, { sessionHasMemory = false } = {}) {
 
 export function hasMemoryToolCalls(message) {
   if (!message?.tool_calls) return false;
-  return message.tool_calls.some((tc) =>
-    MEMORY_TOOL_NAMES.has(tc.function?.name),
-  );
+  return message.tool_calls.some((tc) => MEMORY_TOOL_NAMES.has(tc.function?.name));
 }
 
 // ─────────────────────────────────────────────
@@ -235,11 +285,7 @@ export function hasMemoryToolCalls(message) {
 // Returns array of role:"tool" result messages to append.
 // ─────────────────────────────────────────────
 
-export async function executeMemoryToolCalls(
-  message,
-  memoryHandler,
-  { userId, workspace = "" },
-) {
+export async function executeMemoryToolCalls(message, memoryHandler, { userId, workspace = "" }) {
   if (!message?.tool_calls) return [];
 
   const results = [];
@@ -256,82 +302,77 @@ export async function executeMemoryToolCalls(
     }
 
     const callId = tc.id;
-    let content  = "";
+    let content = "";
 
     try {
       if (name === "memory_save") {
         const id = await memoryHandler.save({
           userId,
           workspace,
-          content:    args.content || "",
+          content: args.content || "",
           importance: args.importance ?? 0.5,
         });
 
         if (!id) {
           content = JSON.stringify({
             status: "error",
-            error:  "Failed to save — content was empty or store rejected it",
+            error: "Failed to save — content was empty or store rejected it",
           });
         } else {
           content = JSON.stringify({
-            status:    "saved",
+            status: "saved",
             memory_id: id,
-            content:   (args.content || "").slice(0, 100),
+            content: (args.content || "").slice(0, 100),
           });
         }
-
       } else if (name === "memory_search") {
         const found = await memoryHandler.search({
           userId,
           workspace,
           query: args.query || "",
-          topK:  args.top_k ?? 5,
+          topK: args.top_k ?? 5,
         });
 
         const safeFound = Array.isArray(found) ? found : [];
         content = JSON.stringify({
-          status:   "found",
-          count:    safeFound.length,
+          status: "found",
+          count: safeFound.length,
           memories: safeFound.map((r) => ({
-            id:      r.id,
+            id: r.id,
             content: r.content || "",
-            score:   Math.round((r.score || 0) * 1000) / 1000,
+            score: Math.round((r.score || 0) * 1000) / 1000,
           })),
         });
-
       } else if (name === "memory_update") {
         const ok = await memoryHandler.update({
-          id:      args.memory_id || "",
+          id: args.memory_id || "",
           content: args.new_content || "",
         });
         content = JSON.stringify({
-          status:    ok ? "updated" : "not_found",
+          status: ok ? "updated" : "not_found",
           memory_id: args.memory_id,
         });
-
       } else if (name === "memory_delete") {
         const ok = memoryHandler.delete(args.memory_id || "");
         content = JSON.stringify({
-          status:    ok ? "deleted" : "not_found",
+          status: ok ? "deleted" : "not_found",
           memory_id: args.memory_id,
         });
-
       } else if (name === "memory_list") {
-        const limit     = Math.min(args.limit ?? 10, 50);
-        const items     = memoryHandler.list({ userId, workspace, limit });
+        const limit = Math.min(args.limit ?? 10, 50);
+        const items = memoryHandler.list({ userId, workspace, limit });
         const safeItems = Array.isArray(items) ? items : [];
 
         content = JSON.stringify({
-          status:   "ok",
-          count:    safeItems.length,
+          status: "ok",
+          count: safeItems.length,
           memories: safeItems.map((r) => ({
-            id:         r.id,
-            content:    r.content || "",
+            id: r.id,
+            content: r.content || "",
             created_at: r.createdAt,
           })),
         });
       }
-
     } catch (err) {
       console.error(`[Memory] Tool ${name} failed:`, err.message);
       content = JSON.stringify({ status: "error", error: err.message });
@@ -340,7 +381,7 @@ export async function executeMemoryToolCalls(
     console.log(`[Memory] Executed: ${name} → ${content.slice(0, 80)}`);
 
     results.push({
-      role:         "tool",
+      role: "tool",
       tool_call_id: callId,
       name,
       content,

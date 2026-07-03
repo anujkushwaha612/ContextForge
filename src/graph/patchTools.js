@@ -98,7 +98,13 @@ export function getPatchToolDefinition() {
               "replace_body",
               "insert_after",
               "insert_before",
-              "delete_node",
+              // PT-5 FIX: was "delete_node" — patchEngine.js's PATCH_OPERATIONS.DELETE
+              // is the string "delete". Any LLM that read this enum and passed
+              // "delete_node" (exactly as instructed) was rejected outright by
+              // patchEngine's `Object.values(PATCH_OPERATIONS).includes(operation)`
+              // validation gate before the delete logic ever ran — the delete
+              // capability was unreachable end-to-end for schema-honoring callers.
+              "delete",
               "replace_string",
               "insert_at_line",
               "create_file",
@@ -286,7 +292,11 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
     ) {
       oldText = "";
       newText = args.new_body ?? "";
-    } else if (args.operation === "delete_symbol" || args.operation === "delete_string") {
+    } else if (args.operation === PATCH_OPERATIONS.DELETE) {
+      // PT-5 FIX: was checking "delete_symbol" / "delete_string" — neither
+      // ever matched the engine's real operation name ("delete"), so this
+      // branch was dead code; successful deletes never got a diff, only
+      // the (much larger) verified_state fallback snippet below.
       oldText = args.search_string ?? args.new_body ?? "";
       newText = "";
     }
@@ -401,9 +411,13 @@ let _patchInjectedOnce = false;
 export function injectPatchTool(tools) {
   const currentTools = tools || [];
 
+  // RQ-7 FIX: same class of bug as injectGraphTool in graphTools.js —
+  // bare-name-only comparison missed an MCP-discovered alias already
+  // present (mcp__contextforge__contextforge_patch_ast). isPatchToolCall()
+  // already checks PATCH_TOOL_ALIASES (bare name + both MCP prefix forms).
   for (const tool of currentTools) {
     const name = tool.name || tool.function?.name;
-    if (name === PATCH_TOOL_NAME) return currentTools;
+    if (isPatchToolCall(name)) return currentTools;
   }
 
   if (!_patchInjectedOnce) {

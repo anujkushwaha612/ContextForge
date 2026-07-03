@@ -44,9 +44,24 @@ const DOUBLE_QUOTE_PATTERN = /(?<![a-zA-Z])"((?:[^"\\\n]|\\.)*)"/g;
 // process.env.XXX references
 const ENV_PATTERNS = [
   /process\.env\.([A-Z_][A-Z0-9_]*)/g,
-  /process\.env\[['"]([A-Z_][A-Z0-9_]*)['"]\]/g
+  /process\.env\[['"]([A-Z_][A-Z0-9_]*)['"]\]/g,
 ];
 const ENV_DESTRUCT_PATTERN = /const\s*\{\s*([^}]+)\s*\}\s*=\s*process\.env/g;
+
+// LE-7 FIX: keys inside the destructure may carry defaults or renames:
+//   const { PORT = 3000, DB_URL = "x", HOST: host } = process.env;
+// The old filter required the ENTIRE segment to be a bare KEY — any
+// default value or rename made the key silently vanish from config_refs
+// (and "PORT = 3000" is the single most common way Node apps read env).
+function parseEnvDestructureKeys(inner) {
+  const keys = [];
+  for (const segRaw of inner.split(",")) {
+    // strip default:  PORT = 3000 → PORT ; rename: HOST: host → HOST
+    const seg = segRaw.split("=")[0].split(":")[0].trim();
+    if (/^[A-Z_][A-Z0-9_]*$/.test(seg)) keys.push(seg);
+  }
+  return keys;
+}
 
 // Patterns that indicate a string is "interesting" (not just punctuation/noise)
 const INTERESTING_STRING = /[a-z][a-z-]{2,}|[A-Z_]{3,}/;
@@ -107,6 +122,38 @@ const CALL_EXCLUSIONS = new Set([
 // LE-5: Extracted from duplicated inline logic in both summary builders.
 // ─────────────────────────────────────────────
 
+// LE-8 FIX: the exclusion set only matched EXACT names, but the capture
+// pattern allows dots — console.log, Math.max, JSON.stringify sailed
+// straight past the filter and polluted every retrieval document's
+// "Calls:" line (burning embedding signal on universal noise). Exclude
+// by the root segment of dotted names.
+const BUILTIN_ROOTS = new Set([
+  "console",
+  "Math",
+  "JSON",
+  "Object",
+  "Array",
+  "String",
+  "Number",
+  "Boolean",
+  "Promise",
+  "Error",
+  "Date",
+  "Map",
+  "Set",
+  "Symbol",
+  "Reflect",
+  "Proxy",
+  "Intl",
+  "Buffer",
+  "process",
+  "crypto",
+  "performance",
+  "globalThis",
+  "window",
+  "document",
+]);
+
 function extractCallNames(bodyText, selfName, limit = 8) {
   if (!bodyText) return [];
 
@@ -117,7 +164,13 @@ function extractCallNames(bodyText, selfName, limit = 8) {
 
   while ((m = callPattern.exec(bodyText)) !== null) {
     const name = m[1];
-    if (!seen.has(name) && name.length > 2 && !CALL_EXCLUSIONS.has(name)) {
+    const root = name.split(".")[0];
+    if (
+      !seen.has(name) &&
+      name.length > 2 &&
+      !CALL_EXCLUSIONS.has(name) &&
+      !BUILTIN_ROOTS.has(root)
+    ) {
       seen.add(name);
       names.push(name);
       if (names.length >= limit) break;
@@ -232,10 +285,12 @@ export function extractLiterals(source, filePath, nodes = []) {
   const seenConfigs = new Set();
 
   // ── String literals ──
-  const literals = extractStringLiterals(source, lineStarts, nodes, seenLiterals, filePath).map((l) => ({
-    ...l,
-    filePath,
-  }));
+  const literals = extractStringLiterals(source, lineStarts, nodes, seenLiterals, filePath).map(
+    (l) => ({
+      ...l,
+      filePath,
+    })
+  );
 
   // ── Environment variable references ──
   const configRefs = [];
@@ -267,8 +322,8 @@ export function extractLiterals(source, filePath, nodes = []) {
   let match;
   while ((match = ENV_DESTRUCT_PATTERN.exec(source)) !== null) {
     const rawText = match[0];
-    const keys = match[1].split(",").map(k => k.trim()).filter(k => /^[A-Z_][A-Z0-9_]*$/.test(k));
-    
+    const keys = parseEnvDestructureKeys(match[1]); // LE-7
+
     for (const key of keys) {
       if (seenConfigs.has(key)) continue;
       seenConfigs.add(key);

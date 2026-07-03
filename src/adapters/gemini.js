@@ -139,7 +139,11 @@ export class GeminiAdapter {
   _convertContent(content, role, messages) {
     const parts = content.parts || [];
 
-    const textParts = parts.filter((p) => p.text !== undefined);
+    // GA-2 FIX: Gemini 2.5 thinking models emit parts flagged {thought: true}.
+    // These are reasoning traces, NOT user/assistant-visible text. Including
+    // them in textParts leaked thought summaries into the upstream OpenAI
+    // conversation (and back into Gemini CLI's history on the next turn).
+    const textParts = parts.filter((p) => p.text !== undefined && p.thought !== true);
     const imageParts = parts.filter((p) => p.inlineData);
     const functionCalls = parts.filter((p) => p.functionCall);
     const functionResps = parts.filter((p) => p.functionResponse);
@@ -163,6 +167,15 @@ export class GeminiAdapter {
               ? p.functionResponse.response
               : JSON.stringify(p.functionResponse.response || {}),
         });
+      }
+      // GA-1 FIX: a user turn can carry functionResponse parts AND text
+      // (e.g. tool results followed by the user's next instruction).
+      // The old early-return silently DROPPED that text — the model never
+      // saw the user's follow-up. Emit it as a user message after the
+      // tool messages, mirroring the Anthropic translator's behavior.
+      const trailingText = textParts.map((p) => p.text).join("").trim();
+      if (trailingText) {
+        messages.push({ role: "user", content: trailingText });
       }
       return;
     }
@@ -364,6 +377,8 @@ export class GeminiAdapter {
         toolState._geminiPendingToolCalls = null;
 
         const chunk = this._buildStreamChunk(parts, "STOP");
+        // GA-4: attach accumulated usage to the final chunk when known
+        if (toolState._geminiUsage) chunk.usageMetadata = toolState._geminiUsage;
         return [`data: ${JSON.stringify(chunk)}\n\n`];
       }
       return []; // [DONE] is never forwarded to Gemini client
@@ -374,6 +389,17 @@ export class GeminiAdapter {
       parsed = JSON.parse(openAIDataLine);
     } catch {
       return [];
+    }
+
+    // GA-4 FIX: capture usage from OpenAI chunks (Ollama/OpenAI emit it on
+    // the final chunk). Gemini CLI reads usageMetadata from the last SSE
+    // chunk — without this its token accounting showed 0 for every turn.
+    if (parsed.usage) {
+      toolState._geminiUsage = {
+        promptTokenCount: parsed.usage.prompt_tokens || 0,
+        candidatesTokenCount: parsed.usage.completion_tokens || 0,
+        totalTokenCount: parsed.usage.total_tokens || 0,
+      };
     }
 
     const delta = parsed.choices?.[0]?.delta;
@@ -445,6 +471,11 @@ export class GeminiAdapter {
       parts,
       finishReason ? this._mapFinishReason(finishReason) : undefined,
     );
+
+    // GA-4: final chunk (finish_reason set) carries usage when we have it
+    if (finishReason && toolState._geminiUsage) {
+      chunk.usageMetadata = toolState._geminiUsage;
+    }
 
     return [`data: ${JSON.stringify(chunk)}\n\n`];
   }

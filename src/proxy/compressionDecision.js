@@ -26,16 +26,28 @@ import { countTokens } from "../compression/compressionHelper.js";
 // Bypass header detection
 // ─────────────────────────────────────────────
 
-export function isBypassEnabled(headers) {
-  const bypass = headers["x-contextforge-bypass"] || "";
-  if (["true", "1", "yes", "on"].includes(bypass.toLowerCase().trim())) {
-    return true;
-  }
+// CDX-2 FIX: Node may deliver duplicate headers as arrays (and proxies do
+// weird things). String coercion prevents "toLowerCase is not a function"
+// from 500ing the request.
+function headerValue(headers, name) {
+  const v = headers[name];
+  if (v === undefined || v === null) return "";
+  return String(Array.isArray(v) ? v[0] : v).toLowerCase().trim();
+}
 
-  const mode = headers["x-contextforge-mode"] || "";
-  if (mode.toLowerCase().trim() === "passthrough") {
-    return true;
-  }
+const TRUTHY = new Set(["true", "1", "yes", "on"]);
+
+export function isBypassEnabled(headers) {
+  // CDX-1 FIX: the rest of the pipeline speaks x-cf-* (x-cf-dry-run,
+  // x-cf-max-retries, x-cf-mock-port) but this gate ONLY accepted the
+  // x-contextforge-* family — a user following the header convention
+  // they see everywhere else got silently ignored. Both families now
+  // work; x-contextforge-* kept for backward compatibility.
+  if (TRUTHY.has(headerValue(headers, "x-cf-bypass"))) return true;
+  if (TRUTHY.has(headerValue(headers, "x-contextforge-bypass"))) return true;
+
+  if (headerValue(headers, "x-cf-mode") === "passthrough") return true;
+  if (headerValue(headers, "x-contextforge-mode") === "passthrough") return true;
 
   return false;
 }

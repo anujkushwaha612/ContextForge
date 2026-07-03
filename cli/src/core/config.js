@@ -32,7 +32,9 @@ export const SCHEMA = {
   "compression.ccr":           { def: true,        type: "bool",   env: "CF_CCR_ENABLED",
                                  // server.js checks CF_CCR_ENABLED === "false"
                                  envMap: (v) => (v ? undefined : "false") },
-  "compression.nudge_tools":   { def: false,       type: "bool",   env: "CF_NUDGE_TOOLS",
+  "compression.nudge_tools":   { def: true,       type: "bool",   env: "CF_NUDGE_TOOLS",
+                                 envMap: (v) => (v ? "1" : undefined) },
+  "logging.file":              { def: false,      type: "bool",   env: "CF_LOGGING_FILE",
                                  envMap: (v) => (v ? "1" : undefined) },
   // NOTE: CF_DEBUG_* env vars still work (server reads them directly) but are
   // intentionally NOT part of the user-facing config surface.
@@ -230,6 +232,10 @@ ${modelOverride ? `model_override = "${modelOverride}"` : `# model_override = "q
 
 [compression]
 ccr = true
+nudge_tools = true
+
+[logging]
+file = false         # set to true to write detailed terminal logs
 `);
   return { file, created: true };
 }

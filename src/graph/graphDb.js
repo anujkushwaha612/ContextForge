@@ -408,12 +408,23 @@ function stmts() {
     `),
 
     // GB-3: literal search escaped (exact-match ranking uses the RAW value)
+    // GB-8 FIX: JOIN was `n.name = l.containing_fn` — but containing_fn is
+    // stored as the FULL STABLE ID ("filePath:startLine:name", written by
+    // literalExtractor.js's findContainingFunction), while n.name is just
+    // the bare symbol name ("checkAuth"). These can never be equal, so the
+    // JOIN always failed: fn_start_line/fn_end_line/fn_complexity/fn_body
+    // were NULL in every findLiteral result, for every literal, in every
+    // project — semanticResolver.js's runLiteralIndex silently never
+    // populated the containing_function object it builds from these
+    // columns. nodes.node_id is already stored in this exact stable-ID
+    // format (graphDb.js's own writeFileGraph, `${filePath}:${startLine}:
+    // ${name}`) — join on that instead of the bare name.
     findLiteral: db.prepare(`
       SELECT l.value, l.kind, l.file_path, l.start_line, l.containing_fn,
              n.start_line AS fn_start_line, n.end_line AS fn_end_line,
              n.complexity AS fn_complexity, n.body_text AS fn_body
       FROM   literals l
-      LEFT JOIN nodes n ON n.name = l.containing_fn AND n.file_path = l.file_path
+      LEFT JOIN nodes n ON n.node_id = l.containing_fn AND n.file_path = l.file_path
       WHERE  l.value LIKE '%' || ? || '%' ESCAPE '\\'
       ORDER BY
         CASE WHEN l.value = ? THEN 0 ELSE 1 END,
@@ -421,12 +432,13 @@ function stmts() {
       LIMIT 10
     `),
 
+    // GB-8 FIX: same JOIN mismatch as findLiteral above.
     findConfig: db.prepare(`
       SELECT c.key, c.raw_text, c.file_path, c.start_line, c.containing_fn,
              n.start_line AS fn_start_line, n.end_line AS fn_end_line,
              n.complexity AS fn_complexity, n.body_text AS fn_body
       FROM   config_refs c
-      LEFT JOIN nodes n ON n.name = c.containing_fn AND n.file_path = c.file_path
+      LEFT JOIN nodes n ON n.node_id = c.containing_fn AND n.file_path = c.file_path
       WHERE  c.key = ? OR c.key LIKE '%' || ? || '%' ESCAPE '\\'
       ORDER BY
         CASE WHEN c.key = ? THEN 0 ELSE 1 END

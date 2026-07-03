@@ -35,8 +35,11 @@ export class OpenAIAdapter {
   toInternal(clientPayload, requestHeaders) {
     const translationCtx = createTranslationContext();
 
-    // FIX: Deep-clone messages to prevent pipeline mutations from
-    // affecting the caller's object. Shallow clone shares array ref.
+    // FIX: Clone the messages ARRAY so pipeline push/splice can't affect
+    // the caller's array. NOTE: this is a shallow clone — message objects
+    // are still shared. That's fine today (the only caller is server.js,
+    // which owns the freshly-JSON.parsed body), but don't hand this
+    // adapter a payload you plan to reuse.
     const payload = {
       ...clientPayload,
       messages: Array.isArray(clientPayload.messages)
@@ -118,20 +121,27 @@ export class OpenAIAdapter {
    * OpenAI SSE passthrough.
    *
    * FIX: Match signature of other adapters — accept 4 params even though
-   * we don't use them. Server.js calls all adapters with the same signature.
+   * we don't use them.
    *
-   * The chunk is already in OpenAI format. Return null to signal the
-   * caller to write the raw chunk directly with no translation.
+   * OA-2 FIX: Return the raw line re-wrapped as a one-element array, NOT
+   * null. upstreamRequest.js short-circuits openai clients with a raw
+   * res.write(chunk) BEFORE this method is called, so today this is never
+   * reached on the hot path — but its only caller does
+   * `translatedEvents.length > 0` with no null check. Returning null made
+   * any future caller (or a reordering of the openai short-circuit) an
+   * instant TypeError crash mid-stream. An array keeps the contract
+   * identical to AnthropicAdapter/GeminiAdapter: always string[].
    *
    * @param {string}  openAIDataLine  — raw SSE data after "data: " prefix
    * @param {string}  messageId       — unused (OpenAI generates its own IDs)
    * @param {boolean} isFirstChunk    — unused (no special first-chunk handling needed)
    * @param {object}  toolState       — unused (passthrough doesn't accumulate state)
-   * @returns {null}                  — signals raw passthrough
+   * @returns {string[]}              — passthrough: the line re-emitted as SSE
    */
   fromInternalSSE(openAIDataLine, messageId, isFirstChunk, toolState) {
-    // Return null → server.js writes the raw chunk with no translation
-    return null;
+    if (!openAIDataLine) return [];
+    // Already in client format — re-emit verbatim (including [DONE]).
+    return [`data: ${openAIDataLine}\n\n`];
   }
 
   responseHeaders(isStreaming) {

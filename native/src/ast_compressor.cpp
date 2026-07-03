@@ -1043,19 +1043,64 @@ for (const auto& n : all_nodes) {
     name_to_idx[n.name] = deduped.size();
     deduped.push_back(n);
   } else {
+    ASTNode& existing = deduped[it->second];
+
+    // AC-10 FIX: export_statement is a pure wrapper node. Its extractName()
+    // always inherits the name of the declaration it wraps (see the
+    // "export_statement" branch of extractName above), so an
+    // export_statement and its inner declaration (lexical_declaration,
+    // function_declaration, class_declaration, ...) ALWAYS collide here
+    // under the same name for every `export ...` statement.
+    //
+    // Both sides are also typically is_exported=true and complexity=1
+    // (the wrapper carries no body of its own to compute real complexity
+    // from), so the old tie-break ("first seen wins") kept whichever
+    // happened to be pushed first — which is always export_statement,
+    // since walkNode visits a parent before recursing into its children.
+    //
+    // On the JS side, symbolExtractor.js's mapNodeTypeToKind maps
+    // "export_statement" to null UNCONDITIONALLY (by design — it carries
+    // no useful kind of its own) while the inner declaration maps to a
+    // real kind ("const"/"function"/"class"/...). Keeping export_statement
+    // here means the ONLY node symbolExtractor.js ever sees for this
+    // symbol is one it is guaranteed to immediately discard — silently
+    // erasing the symbol from the graph. Reproduced: `export const
+    // BUCKET_NAME = process.env.AWS_BUCKET_NAME;` (and identically for
+    // `export function foo() {}`, `export class Foo {}`, `export default
+    // async function foo() {}`) produced a file with ZERO usable nodes.
+    //
+    // Fix: when exactly one side of a name collision is export_statement,
+    // the OTHER side always wins — it is strictly more useful downstream,
+    // regardless of is_exported/complexity — because export_statement can
+    // never be the more useful node by construction.
+    bool n_is_wrapper        = (n.type == "export_statement");
+    bool existing_is_wrapper = (existing.type == "export_statement");
+
+    if (n_is_wrapper != existing_is_wrapper) {
+      if (existing_is_wrapper) {
+        // existing is the wrapper, n is the real declaration — replace.
+        deduped[it->second] = n;
+      }
+      // else: existing is already the real declaration — keep it,
+      // discard n (the wrapper).
+      continue;
+    }
+
+    // Neither or both are export_statement — original tie-break logic.
     // Keep whichever is exported — if new node is exported and existing is not, replace
-    if (n.is_exported && !deduped[it->second].is_exported) {
+    if (n.is_exported && !existing.is_exported) {
       deduped[it->second] = n;
     }
     // If both exported or both not, keep the one with higher complexity (more informative)
-    else if (n.is_exported == deduped[it->second].is_exported &&
-             n.complexity > deduped[it->second].complexity) {
+    else if (n.is_exported == existing.is_exported &&
+             n.complexity > existing.complexity) {
       deduped[it->second] = n;
     }
   }
 }
 
 all_nodes = deduped;
+
 
     // Sort by start_line so JS receives nodes in source order
     std::sort(all_nodes.begin(), all_nodes.end(),

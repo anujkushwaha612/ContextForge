@@ -80,11 +80,16 @@ export function createCCRToolDefinition(provider = "anthropic") {
 // Marker patterns — compiled once at module load
 // ─────────────────────────────────────────────
 
+// CCR-8 FIX: the 4th pattern captured ANY [a-z0-9_]+ id — text like
+// "[data compressed for transit, vault_id: 12345]" in a tool result made
+// the injector fire for garbage ids that fetchFromVault can never resolve
+// (wasted schema tokens + a guaranteed failed tool call if the LLM bites).
+// All patterns now require the cf_vault_ prefix. Pattern 3 was a strict
+// subset of pattern 1 — removed.
 const MARKER_PATTERNS = [
   /vault_id[=:]\s*["']?(cf_vault_[a-z0-9_]+)["']?/gi,
   /Vault:\s*(cf_vault_[a-z0-9_]+)/gi,
-  /vault_id:\s*'(cf_vault_[a-z0-9_]+)'/gi,
-  /\[.*?compressed.*?vault[_-]?id[=:]\s*([a-z0-9_]+)\]/gi,
+  /\[.*?compressed.*?vault[_-]?id[=:]\s*["']?(cf_vault_[a-z0-9_]+)["']?\]/gi,
 ];
 
 function extractVaultIds(text, resultSet) {

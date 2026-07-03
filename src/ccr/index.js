@@ -29,6 +29,28 @@ const CCR_MIN_TOKENS = 18000;
 // ─────────────────────────────────────────────
 const _scannedMessageIds = new Map();
 
+// CCR-6 FIX: this cache was unbounded — one Set per session, never
+// cleaned. sessionRegistry TTL-evicts ITS map, but this one grew for the
+// life of the daemon (long-running proxy = slow leak; also stale sets
+// survived registry cleanup and silently broke discovery recording).
+const MAX_SCAN_SESSIONS = 500;
+function touchScanCache(sessionId) {
+  if (_scannedMessageIds.has(sessionId)) {
+    // refresh LRU position
+    const v = _scannedMessageIds.get(sessionId);
+    _scannedMessageIds.delete(sessionId);
+    _scannedMessageIds.set(sessionId, v);
+    return v;
+  }
+  const v = new Set();
+  _scannedMessageIds.set(sessionId, v);
+  if (_scannedMessageIds.size > MAX_SCAN_SESSIONS) {
+    // evict oldest (Map preserves insertion order)
+    _scannedMessageIds.delete(_scannedMessageIds.keys().next().value);
+  }
+  return v;
+}
+
 function getFastContentPreview(content, maxLength) {
   if (typeof content === "string") return content.slice(0, maxLength);
   if (Array.isArray(content)) {
@@ -47,11 +69,7 @@ function getFastContentPreview(content, maxLength) {
 }
 
 function scanNewMessagesOnly(sessionId, messages) {
-  if (!_scannedMessageIds.has(sessionId)) {
-    _scannedMessageIds.set(sessionId, new Set());
-  }
-
-  const seen = _scannedMessageIds.get(sessionId);
+  const seen = touchScanCache(sessionId); // CCR-6
   const newMsgs = [];
 
   for (const msg of messages) {
@@ -114,6 +132,19 @@ export function applyCCRPipeline(payload, tokenCount = null) {
   // ── Step 2: Compute UNRETRIEVED vaults in current payload ─────────────
   const allCurrentVaultIds = scanForMarkers(payload.messages);
   const currentTurn = session.turnNumber;
+
+  // CCR-5 FIX: record discovery turn for EVERY vault currently visible,
+  // not only those found by the incremental scan. The old code recorded
+  // discovery only via newVaultIds — if the scan cache had already seen
+  // the message (cache outliving a TTL-evicted session, dedup'd message
+  // ids colliding on identical 64-char previews), the discovery turn was
+  // never set and the staleness filter fell back to `?? currentTurn` →
+  // turnsUnretrieved was ALWAYS 0 → the vault NEVER went stale → the
+  // retrieve schema was re-injected forever. Reproduced: 5 passes, still
+  // injecting. vaultDiscoveredAtTurn is idempotent (first-write-wins).
+  for (const id of allCurrentVaultIds) {
+    session.vaultDiscoveredAtTurn(id);
+  }
 
   // ── Step 3: Filter to vaults that are both unretrieved AND recent ─────
   // If a vault has been unretrieved for more than MAX_UNRETRIEVED_TURNS,

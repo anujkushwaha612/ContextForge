@@ -231,6 +231,7 @@ export const STAGES = {
   SCRUB:           "scrub",
   TAG:             "tag",
   SEMANTIC_DEDUP:  "semantic_dedup",
+  JSON_CRUSH:      "json_crush",
   CODE_COMPRESS:   "code_compress",
   VAULT_INTERCEPT: "vault_intercept",
   STRIP_ANTHROPIC: "strip_anthropic",
@@ -238,4 +239,5 @@ export const STAGES = {
   RETRIEVE:        "retrieve",        // TM-3: CCR internal retrieval stage
   MEMORY_INJECT:   "memory_inject",
   MEMORY_CONTEXT:  "memory_context",
+  CACHE_ALIGN:     "cache_align",
 };

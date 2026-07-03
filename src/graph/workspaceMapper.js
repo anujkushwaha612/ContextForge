@@ -97,9 +97,27 @@ const IGNORE_PATTERNS = [/\.min\.(js|css)$/, /\.bundle\.js$/, /\.d\.ts$/, /\.map
 // silent lookup failures (Map.get returns undefined instead of value).
 // ─────────────────────────────────────────────
 
-function normalizePath(p) {
+// WM-13 FIX: TWO functions with distinct jobs.
+//
+//   normalizeKey(p)    — for Map keys / SQLite keys / comparisons ONLY.
+//                        Lowercase + forward slashes. NEVER give this to fs.
+//   normalizeSlashes(p)— for paths that still hit the filesystem.
+//                        Forward slashes only, CASE PRESERVED.
+//
+// The old single normalizePath() lowercased everything, and walkDirectory
+// fed those lowercased paths straight into fs.statSync/readFileSync.
+// Windows is case-insensitive so it silently worked there — but on
+// Linux/macOS every file under a directory with an uppercase letter
+// (Src/, Controllers/, "NODE JS/") returned ENOENT and was silently
+// dropped from the graph. Reproduced: 2 of 3 files lost.
+function normalizeKey(p) {
   if (!p) return p;
   return p.replace(/\\/g, "/").toLowerCase();
+}
+
+function normalizeSlashes(p) {
+  if (!p) return p;
+  return p.replace(/\\/g, "/");
 }
 
 // ─────────────────────────────────────────────
@@ -182,7 +200,7 @@ function checkAndUpdateHash(filePath) {
 
   const newHash = getFileHash(content);
   // WM-8: normalize key for consistent lookup
-  const key = normalizePath(filePath);
+  const key = normalizeKey(filePath);
   const oldHash = fileHashes.get(key);
 
   if (newHash === oldHash) return { changed: false, content: null };
@@ -324,7 +342,7 @@ function extractRouteEdges(source, relPath, mountPrefix = "") {
     if (["res", "req", "err", "ctx", "next", "response", "request"].includes(routerVar)) continue;
 
     // WM-10: query routePrefixMap with normalized relPath
-    const prefix = mountPrefix || routePrefixMap.get(normalizePath(relPath)) || "";
+    const prefix = mountPrefix || routePrefixMap.get(normalizeKey(relPath)) || "";
     const fullPath = prefix + routePath;
     routeEdges.push({
       sourceSymbol: null,
@@ -388,7 +406,7 @@ function buildRoutePrefixMap(allFiles, workspacePath) {
           // Add .js extension if missing
           const withExt = /\.\w{1,4}$/.test(absResolved) ? absResolved : absResolved + ".js";
           // WM-10: store as normalized relPath so lookup matches
-          const relResolved = normalizePath(path.relative(workspacePath, withExt));
+          const relResolved = normalizeKey(path.relative(workspacePath, withExt));
           importMap.set(varName, relResolved);
         } catch {
           /* skip unresolvable imports */
@@ -441,9 +459,10 @@ function* walkDirectory(rootDir) {
     } else if (entry.isFile()) {
       if (!getLanguageForFile(fullPath)) continue;
       if (IGNORE_PATTERNS.some((p) => p.test(entry.name))) continue;
-      // WM-8: normalize immediately — all downstream consumers get
-      // consistent forward-slash paths regardless of OS
-      yield normalizePath(fullPath);
+      // WM-13: yield the REAL path (slashes normalized, case preserved)
+      // — this path is used for fs operations. Key-normalization happens
+      // at Map/SQLite boundaries only.
+      yield normalizeSlashes(fullPath);
     }
   }
 }
@@ -466,7 +485,7 @@ function buildIndexedFileMap() {
   const map = new Map();
   for (const row of indexed) {
     // Normalize the stored relPath so case/slash differences don't cause misses
-    map.set(normalizePath(row.file_path), row.last_modified);
+    map.set(normalizeKey(row.file_path), row.last_modified);
   }
   return map;
 }
@@ -478,8 +497,9 @@ function buildIndexedFileMap() {
 export async function indexWorkspace(workspacePath, options = {}) {
   // WM-8: normalize workspacePath at entry — used as base for all
   // path.relative() calls throughout this function
-  const normalizedWorkspacePath = normalizePath(path.resolve(workspacePath));
-  setWorkspaceRoot(normalizedWorkspacePath);
+  // WM-13: fs-facing root preserves case; DB/key root is lowercased.
+  const normalizedWorkspacePath = normalizeSlashes(path.resolve(workspacePath));
+  setWorkspaceRoot(normalizeKey(normalizedWorkspacePath));
 
   // WM-12: default force:true — stale SQLite entries from previous sessions
   // cause graph to return outdated symbol locations after patches.
@@ -516,7 +536,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
       // WM-9: compute relPath for SQLite key lookup
       // path.relative needs the original casing for Windows fs operations,
       // then we normalize the result for map lookup
-      const relPath = normalizePath(path.relative(normalizedWorkspacePath, filePath));
+      const relPath = normalizeKey(path.relative(normalizedWorkspacePath, filePath));
 
       if (!force && alreadyIndexed.has(relPath)) {
         if (Math.abs(alreadyIndexed.get(relPath) - mtime) < 1000) {
@@ -553,7 +573,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
       const retrievalDocs = buildRetrievalDocuments(nodes, literals, configRefs, relPath);
 
       // WM-10: routePrefixMap is now keyed by normalized relPath
-      const mountPrefix = routePrefixMap.get(normalizePath(relPath)) || "";
+      const mountPrefix = routePrefixMap.get(normalizeKey(relPath)) || "";
       const routeEdges = extractRouteEdges(source, relPath, mountPrefix);
       const pass1Edges = [...edges, ...routeEdges];
 
@@ -665,7 +685,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
 
   // WM-8: store hashes with normalized absolute path as key
   for (const [fp, { source }] of fileData) {
-    fileHashes.set(normalizePath(fp), getFileHash(source));
+    fileHashes.set(normalizeKey(fp), getFileHash(source));
   }
 
   return stats;
@@ -676,8 +696,8 @@ export async function indexWorkspace(workspacePath, options = {}) {
 // ─────────────────────────────────────────────
 
 export function watchWorkspace(workspacePath) {
-  // WM-8: normalize at entry so all internal operations use consistent paths
-  const normalizedWorkspacePath = normalizePath(path.resolve(workspacePath));
+  // WM-13: fs-facing root preserves case
+  const normalizedWorkspacePath = normalizeSlashes(path.resolve(workspacePath));
 
   const pendingFiles = new Set();
   let debounceTimer = null;
@@ -722,13 +742,13 @@ export function watchWorkspace(workspacePath) {
       }
 
       if (source.length === 0) {
-        fileHashes.delete(normalizePath(filePath));
+        fileHashes.delete(normalizeKey(filePath));
         continue;
       }
 
       try {
         const stat = fs.statSync(filePath);
-        const relPath = normalizePath(path.relative(normalizedWorkspacePath, filePath));
+        const relPath = normalizeKey(path.relative(normalizedWorkspacePath, filePath));
 
         const { nodes, edges } = extractSymbols(source, relPath);
 
@@ -749,7 +769,7 @@ export function watchWorkspace(workspacePath) {
         const callEdges = extractCallEdges(source, relPath, nodes, allKnownSymbols);
 
         // WM-10: query with normalized relPath
-        const watchMountPrefix = routePrefixMap.get(normalizePath(relPath)) || "";
+        const watchMountPrefix = routePrefixMap.get(normalizeKey(relPath)) || "";
         const routeEdges = extractRouteEdges(source, relPath, watchMountPrefix);
         const allEdges = [...edges, ...callEdges, ...routeEdges];
 
@@ -795,7 +815,7 @@ export function watchWorkspace(workspacePath) {
               `${err.code || err.message}`
           );
         }
-        fileHashes.delete(normalizePath(filePath));
+        fileHashes.delete(normalizeKey(filePath));
       }
     }
 
@@ -815,21 +835,18 @@ export function watchWorkspace(workspacePath) {
     }
   };
 
-  // WM-3: Warn on Linux where fs.watch recursive is silently non-recursive
-  if (process.platform === "linux") {
-    console.warn(
-      `[GraphMapper] ⚠️  fs.watch with recursive:true is not supported on Linux. ` +
-        `Only files in the workspace root directory will be watched for changes. ` +
-        `Files in subdirectories (src/, controllers/, etc.) will NOT trigger re-indexing. ` +
-        `Consider adding 'chokidar' as a dependency for cross-platform recursive watching.`
-    );
-  }
-
-  const watcher = fs.watch(normalizedWorkspacePath, { recursive: true }, (event, filename) => {
+  // WM-14 FIX: recursive fs.watch IS supported on Linux since Node 19.1
+  // (libuv inotify-tree). package.json engines is ^20.17 || >=22.9, so the
+  // old blanket warning was wrong for every supported runtime. Verify
+  // empirically instead of asserting by platform — and if it genuinely
+  // throws (old kernel, exotic fs), fall back to non-recursive with an
+  // accurate warning instead of crashing the server.
+  let watcher;
+  const watchHandler = (event, filename) => {
     if (!filename) return;
 
-    // WM-8: normalize immediately — fs.watch emits backslashes on Windows
-    const fullPath = normalizePath(path.join(normalizedWorkspacePath, filename));
+    // WM-13: slashes only — the path must remain fs-valid (case preserved)
+    const fullPath = normalizeSlashes(path.join(normalizedWorkspacePath, filename));
     const pathSegments = fullPath.split("/");
 
     if ([...IGNORE_DIRS].some((d) => pathSegments.includes(d))) return;
@@ -843,9 +860,20 @@ export function watchWorkspace(workspacePath) {
     pendingFiles.add(fullPath);
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(processChanges, 800);
-  });
+  };
 
-  console.log(`[GraphMapper] 👁️  Watching: ${normalizedWorkspacePath}`);
+  try {
+    watcher = fs.watch(normalizedWorkspacePath, { recursive: true }, watchHandler);
+    console.log(`[GraphMapper] 👁️  Watching (recursive): ${normalizedWorkspacePath}`);
+  } catch (err) {
+    // ERR_FEATURE_UNAVAILABLE_ON_PLATFORM or exotic fs — degrade gracefully
+    watcher = fs.watch(normalizedWorkspacePath, { recursive: false }, watchHandler);
+    console.warn(
+      `[GraphMapper] ⚠️  Recursive watch unavailable (${err.code || err.message}) — ` +
+        `watching workspace ROOT only. Subdirectory edits will not auto-reindex; ` +
+        `restart the proxy (or 'cf restart') after structural changes.`
+    );
+  }
 
   return {
     stop: () => {

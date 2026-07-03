@@ -127,8 +127,10 @@ export async function startProxy({ configValues, workspace, onProgress } = {}) {
   }
 
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const logFile = path.join(logsDir(), `proxy-${stamp}.log`);
-  const errFile = path.join(logsDir(), `proxy-${stamp}.err.log`);
+  const loggingEnabled = !!configValues["logging.file"];
+  const logFile = loggingEnabled ? path.join(logsDir(), `proxy-${stamp}.log`) : null;
+  const errFile = loggingEnabled ? path.join(logsDir(), `proxy-${stamp}.err.log`) : null;
+  const portFile = (!loggingEnabled && requestedPort === 0) ? path.join(runDir(), `port-${stamp}.txt`) : null;
 
   const dataDir = workspaceDataDir(workspace);
   const env = {
@@ -144,11 +146,18 @@ export async function startProxy({ configValues, workspace, onProgress } = {}) {
     CF_SAVINGS_PATH: path.join(dataDir, "proxy_savings.json"),
   };
 
+  if (portFile) {
+    env.CF_PORT_FILE = portFile;
+  }
+
+  const outStream = logFile ? openSync(logFile, "a") : "ignore";
+  const errStream = errFile ? openSync(errFile, "a") : "ignore";
+
   const child = spawn(process.execPath, [entry], {
     cwd: path.dirname(entry),
     env,
     detached: true,
-    stdio: ["ignore", openSync(logFile, "a"), openSync(errFile, "a")],
+    stdio: ["ignore", outStream, errStream],
   });
   child.unref();
 
@@ -161,14 +170,18 @@ export async function startProxy({ configValues, workspace, onProgress } = {}) {
   while (Date.now() < deadline) {
     // Died early? Surface stderr instead of timing out silently.
     if (!pidAlive(child.pid)) {
+      const errTail = errFile ? tailFile(errFile) : "(Logging disabled. Set logging.file = true in config to see errors.)";
       throw new CFError("CF_ERR_PROXY_START",
-        `Proxy exited during startup. Last stderr:\n${tailFile(errFile)}`,
-        `Full logs: ${errFile}`);
+        `Proxy exited during startup. Last stderr:\n${errTail}`,
+        errFile ? `Full logs: ${errFile}` : `Enable logs in config to see full output.`);
     }
 
     if (port === 0) {
-      const listening = parseListeningLine(logFile);
-      if (listening) port = listening.port;
+      const sourceFile = logFile || portFile;
+      if (sourceFile && existsSync(sourceFile)) {
+        const listening = parseListeningLine(sourceFile);
+        if (listening) port = listening.port;
+      }
     }
 
     if (port !== 0) {
@@ -183,6 +196,7 @@ export async function startProxy({ configValues, workspace, onProgress } = {}) {
             startedAt: new Date().toISOString(),
             logFile, errFile,
           };
+          if (portFile) try { unlinkSync(portFile); } catch {}
           writeFileSync(runfilePath(port), JSON.stringify(runfile, null, 2));
           onProgress?.({ phase: "ready", port, indexedFiles: health.indexedFiles });
           return runfile;
@@ -195,9 +209,10 @@ export async function startProxy({ configValues, workspace, onProgress } = {}) {
 
   // Timed out — kill the half-started proxy, don't leave an orphan.
   try { process.kill(child.pid, "SIGKILL"); } catch { /* already dead */ }
+  if (portFile) try { unlinkSync(portFile); } catch {}
   throw new CFError("CF_ERR_PROXY_HEALTH",
     `Proxy did not become healthy within ${HEALTH_TIMEOUT_MS / 1000}s`,
-    `Large repos can exceed the indexing window. Check: ${logFile}`);
+    logFile ? `Large repos can exceed the indexing window. Check: ${logFile}` : `Enable logs in config for troubleshooting.`);
 }
 
 // ── Ensure (reuse-or-start) ───────────────────────────────────────────────────

@@ -243,11 +243,66 @@ export function getGraphToolDefinition() {
 }
 
 // ─────────────────────────────────────────────
+// Shared function-body reader
+//
+// GT-12: Both find_symbol (conditionally, for small functions) and
+// read_function (always) need to resolve a symbol row to its source file
+// and slice out the body lines. This was previously duplicated inline
+// inside the read_function case only; extracted here so find_symbol can
+// reuse the EXACT same path-resolution + slicing logic instead of
+// reimplementing it (and risking drift between the two).
+//
+// sym.start_line/end_line follow the codebase-wide convention: 0-indexed,
+// inclusive (see GT-4/symbolExtractor.js/patchEngine.js). Returns
+// { bodyLines: string[] } on success or { error, message } on failure —
+// callers check for `.error` before using `.bodyLines`.
+// ─────────────────────────────────────────────
+
+function readSymbolBody(sym) {
+  let resolvedPath = normalizeTargetPath(sym.file_path);
+  if (!path.isAbsolute(resolvedPath)) {
+    resolvedPath = path.resolve(getWorkspaceRoot(), resolvedPath);
+  }
+
+  try {
+    const content = fs.readFileSync(resolvedPath, "utf-8");
+    const allLines = content.replace(/\r\n/g, "\n").split("\n");
+    const bodyLines = allLines.slice(sym.start_line, sym.end_line + 1);
+    return { bodyLines };
+  } catch (e) {
+    return { error: "Failed to read file", message: e.message };
+  }
+}
+
+// ─────────────────────────────────────────────
 // Query executor
 // ─────────────────────────────────────────────
 
 // GT-10: Maximum routes returned when no filter is applied
 const MAX_UNFILTERED_ROUTES = 50;
+
+// GT-12: find_symbol body-inlining thresholds.
+//
+// Motivation (real session evidence): the "find_symbol → read_function"
+// two-hop pattern is the single most common extra round-trip observed in
+// real proxy logs (e.g. find_symbol("createSession") in one hop, nothing
+// else; a small helper's body could have been returned immediately).
+// Inlining is deliberately conservative — it must never turn find_symbol
+// into a second read_function-sized response:
+//   - MAX_INLINE_BODY_LINES: only inline a definition's body when it is
+//     small. 40 lines covers real small helpers/middleware in the user's
+//     project (checkAuth: 13 lines, validateID default export: 5 lines)
+//     while excluding the actual refactor targets in the reference task
+//     (loginUser: 59 lines, loginWithGoogle: larger) — those still need
+//     an explicit read_function call, which is correct: inlining a large
+//     body into every find_symbol hit (including fuzzy multi-matches)
+//     would bloat responses for no benefit and defeat the point of
+//     find_symbol staying lean for locate-only queries.
+//   - MAX_INLINE_DEFINITIONS: only inline when the query resolved to a
+//     small number of definitions. A fuzzy/ambiguous match against many
+//     rows should not multiply body-sized payloads across all of them.
+const MAX_INLINE_BODY_LINES = 40;
+const MAX_INLINE_DEFINITIONS = 3;
 
 export async function executeGraphQuery(queryType, target, args = {}) {
   if (target === undefined || target === null) {
@@ -340,13 +395,42 @@ export async function executeGraphQuery(queryType, target, args = {}) {
           break;
         }
 
-        const definitions = rows.map((r) => ({
-          file: r.file_path,
-          kind: r.kind,
-          start_line: r.start_line,
-          end_line: r.end_line,
-          complexity: r.complexity,
-        }));
+        // GT-12: Inline the body when this is a small, unambiguous match —
+        // eliminates the find_symbol → read_function follow-up hop for the
+        // common case (locating and reading a small helper/middleware in
+        // one call). Only attempted when there are few enough definitions
+        // that inlining all of them stays cheap; each candidate is checked
+        // individually against MAX_INLINE_BODY_LINES so a mix of small and
+        // large matches doesn't inline the large ones.
+        const attemptInline = !isFuzzy && rows.length <= MAX_INLINE_DEFINITIONS;
+
+        const definitions = rows.map((r) => {
+          const def = {
+            file: r.file_path,
+            kind: r.kind,
+            start_line: r.start_line,
+            end_line: r.end_line,
+            complexity: r.complexity,
+          };
+
+          if (attemptInline) {
+            const lineCount = r.end_line - r.start_line + 1;
+            if (lineCount > 0 && lineCount <= MAX_INLINE_BODY_LINES) {
+              const bodyResult = readSymbolBody(r);
+              if (!bodyResult.error) {
+                def.body = bodyResult.bodyLines.join("\n");
+              }
+              // On read failure, silently omit `body` — find_symbol's
+              // location data is still valid and useful even if the file
+              // couldn't be read for inlining; read_function will
+              // surface the same error explicitly if the model retries.
+            }
+          }
+
+          return def;
+        });
+
+        const anyInlined = definitions.some((d) => d.body !== undefined);
 
         result = JSON.stringify(
           {
@@ -359,10 +443,11 @@ export async function executeGraphQuery(queryType, target, args = {}) {
             }),
             definitions,
             count: rows.length,
-            next_step:
-              "Call read_function('" +
-              cleanTarget +
-              "') to get the full implementation body and line numbers.",
+            next_step: anyInlined
+              ? "Body included above for small definition(s) — no read_function call needed unless you need a definition without an inlined body."
+              : "Call read_function('" +
+                cleanTarget +
+                "') to get the full implementation body and line numbers.",
           },
           null,
           2
@@ -664,32 +749,34 @@ export async function executeGraphQuery(queryType, target, args = {}) {
 
         const sym = rows[0];
 
-        // GT-4 FIX: Use normalizeTargetPath to strip workspace root and drive
-        // letters consistently. This handles cross-platform cases where the
-        // graph DB was built on Windows (storing D:/... absolute paths) but
-        // the server runs on Linux — path.isAbsolute("D:/...") returns false
-        // on Linux, causing path.resolve() to incorrectly prepend the workspace.
-        // normalizeTargetPath handles both cases and always produces a relative path.
-        let resolvedPath = normalizeTargetPath(sym.file_path);
-        if (!path.isAbsolute(resolvedPath)) {
-          resolvedPath = path.resolve(getWorkspaceRoot(), resolvedPath);
-        }
-
-        let bodyLines = [];
-        try {
-          const content = fs.readFileSync(resolvedPath, "utf-8");
-          const allLines = content.replace(/\r\n/g, "\n").split("\n");
-          bodyLines = allLines.slice(sym.start_line, sym.end_line + 1);
-        } catch (e) {
+        // GT-4 FIX (now routed through the shared readSymbolBody helper,
+        // see GT-12): resolves cross-platform paths (graph DB built on
+        // Windows, server running on Linux) via normalizeTargetPath before
+        // falling back to workspace-root resolution, then slices the
+        // 0-indexed, inclusive body range. find_symbol now reuses this
+        // exact same logic when inlining small-function bodies.
+        const bodyReadResult = readSymbolBody(sym);
+        if (bodyReadResult.error) {
           result = JSON.stringify({
-            error: "Failed to read file",
-            message: e.message,
+            error: bodyReadResult.error,
+            message: bodyReadResult.message,
           });
           break;
         }
+        const bodyLines = bodyReadResult.bodyLines;
 
-        const literals = queryFindLiteralsByFn(cleanTarget, sym.file_path);
-        const configs = queryFindConfigByFn(cleanTarget, sym.file_path);
+        // GT-11 FIX: literalExtractor.js's findContainingFunction stores
+        // containing_fn as the FULL stable ID ("filePath:startLine:name") —
+        // the same convention used everywhere else a function is identified
+        // by containing_fn (buildNodeSummaries, buildRetrievalDocument both
+        // compare against nodeId in that exact format). Passing the bare
+        // symbol name here meant `WHERE containing_fn = ?` could never
+        // match — read_function's "Environment Variables:"/"Literals:"
+        // relatedContext section was silently empty for every symbol, in
+        // every project, regardless of what the function actually referenced.
+        const containingFnStableId = `${sym.file_path}:${sym.start_line}:${cleanTarget}`;
+        const literals = queryFindLiteralsByFn(containingFnStableId, sym.file_path);
+        const configs = queryFindConfigByFn(containingFnStableId, sym.file_path);
 
         const relatedContext = [];
         if (configs.length > 0) {
@@ -813,9 +900,17 @@ let _graphInjectedOnce = false;
 export function injectGraphTool(tools) {
   const currentTools = tools || [];
 
+  // RQ-7 FIX: was comparing tool.name/tool.function?.name against the bare
+  // GRAPH_TOOL_NAME only. A request that already carries the MCP-discovered
+  // alias (`mcp__contextforge__contextforge_query_graph`) never matched this
+  // check, so calling injectGraphTool() on an MCP-registered session would
+  // push a SECOND, bare-named "contextforge_query_graph" tool alongside the
+  // one Claude Code already has via MCP — true double-injection. Use
+  // isGraphToolCall(), which already checks GRAPH_TOOL_ALIASES (bare name +
+  // both MCP prefix forms), so any alias already present is recognized.
   for (const tool of currentTools) {
     const name = tool.name || tool.function?.name;
-    if (name === GRAPH_TOOL_NAME) return currentTools;
+    if (isGraphToolCall(name)) return currentTools;
   }
 
   if (!_graphInjectedOnce) {
@@ -973,9 +1068,13 @@ let _readFileChunkInjectedOnce = false;
 export function injectReadFileChunkTool(tools) {
   const currentTools = tools || [];
 
+  // RQ-7 FIX: same class of bug as injectGraphTool — bare-name-only
+  // comparison missed an MCP-discovered alias already present. isReadFileChunkTool()
+  // already checks both the bare name and any name containing it (covers
+  // the mcp__contextforge__read_file_chunk form).
   for (const tool of currentTools) {
     const name = tool.name || tool.function?.name;
-    if (name === READ_FILE_CHUNK_TOOL_NAME) return currentTools;
+    if (isReadFileChunkTool(name)) return currentTools;
   }
 
   if (!_readFileChunkInjectedOnce) {

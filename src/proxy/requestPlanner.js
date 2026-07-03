@@ -331,8 +331,7 @@ function scoreIntents(message) {
   const runnerScore = sorted[1]?.[1] ?? 0;
 
   // BUG-9 FIX: Use winnerScore as denominator, not totalScore
-  const confidence =
-    winnerScore === 0 ? 0 : (winnerScore - runnerScore) / winnerScore;
+  const confidence = winnerScore === 0 ? 0 : (winnerScore - runnerScore) / winnerScore;
 
   const totalScore = Object.values(scores).reduce((a, b) => a + b, 0);
 
@@ -357,11 +356,7 @@ const CAPABILITY_MATRIX = {
   CHAT: new Set(),
 };
 
-const FULL_CAPABILITY_SET = new Set([
-  CAPABILITIES.GRAPH,
-  CAPABILITIES.PATCH,
-  CAPABILITIES.READ,
-]);
+const FULL_CAPABILITY_SET = new Set([CAPABILITIES.GRAPH, CAPABILITIES.PATCH, CAPABILITIES.READ]);
 
 const EMPTY_CAPABILITY_SET = new Set();
 
@@ -515,9 +510,7 @@ async function semanticLookup(message) {
   try {
     const queryVec = await Promise.race([
       _embedder.embed(message),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("embed timeout")), 2000)
-      ),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("embed timeout")), 2000)),
     ]);
 
     const hits = _plannerCache.searchK(queryVec, 5);
@@ -616,9 +609,7 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
       if (semResult) {
         evidence.push(`semantic_score=${semResult.score.toFixed(3)} (below threshold)`);
       } else {
-        evidence.push(
-          `semantic_lookup=null (planner not ready or embed failed)`
-        );
+        evidence.push(`semantic_lookup=null (planner not ready or embed failed)`);
       }
 
       const hasFileRef =
@@ -632,10 +623,7 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
         evidence.push(`context_signal=file_or_symbol_reference`);
         evidence.push(`chat_upgraded_to_search=true`);
       } else {
-        const totalScore = Object.values(regexResult.allScores).reduce(
-          (a, b) => a + b,
-          0
-        );
+        const totalScore = Object.values(regexResult.allScores).reduce((a, b) => a + b, 0);
         if (totalScore < 3 && regexResult.intent === "CHAT") {
           finalIntent = "CHAT";
           method = "safe_fallback";
@@ -643,9 +631,7 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
         } else {
           finalIntent = regexResult.intent;
           method = "regex_fallback";
-          evidence.push(
-            `low_confidence_kept_regex_winner=${regexResult.intent}`
-          );
+          evidence.push(`low_confidence_kept_regex_winner=${regexResult.intent}`);
         }
       }
     }
@@ -653,6 +639,44 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
 
   // ── 3. Resolve capabilities from intent ───────────────────────────────────
   let capabilities = CAPABILITY_MATRIX[finalIntent] ?? EMPTY_CAPABILITY_SET;
+
+  // RQ-6 FIX: CREATE-with-hidden-search-need. "Create a new X, then hunt down
+  // and refactor the duplicated logic elsewhere" scores CREATE as the winner
+  // (strong \bcreate\b / \bnew file\b patterns) but CAPABILITY_MATRIX.CREATE
+  // is {PATCH} only -- no GRAPH. Verified by reproduction: the real-world DRY
+  // task ("create services/session.service.js ... then hunt down where we're
+  // duplicating this logic in our auth and user controllers and refactor
+  // them") scores CREATE=5, PATCH=2, confidence=0.6 -- ABOVE the 0.5 regex
+  // threshold, so the semantic fallback (which might otherwise catch this)
+  // never runs. The agent needs GRAPH to locate the duplicated call sites,
+  // but CREATE's capability set never grants it.
+  //
+  // Same "when unsure, over-provision" philosophy already applied at
+  // tie-break time (RQ-4) and CONTINUATION-promotion time (BUG-11), applied
+  // here at initial capability resolution: if CREATE won but PATCH or
+  // SEARCH also scored >= 2 (a real pattern match, not incidental noise),
+  // the instruction almost certainly also requires locating existing code.
+  if (finalIntent === "CREATE") {
+    // Any SEARCH pattern match implies "find X" — always a real signal.
+    // For PATCH, exclude the bare \badd\b pattern (RQ-5): "create a new
+    // file and add a function to it" is pure creation, not a hint that
+    // existing duplicated code needs to be located. Real refactor language
+    // ("hunt down", "refactor", "duplicating", "change", "extract",
+    // "convert") matches the other PATCH patterns instead.
+    const patchPatterns = regexResult.matchedPatterns.PATCH ?? [];
+    const hasRealPatchSignal = patchPatterns.some((p) => !p.startsWith("\\badd\\b"));
+    const hasSearchSignal = (regexResult.matchedPatterns.SEARCH ?? []).length > 0;
+
+    if (hasRealPatchSignal || hasSearchSignal) {
+      const expanded = new Set(capabilities);
+      expanded.add(CAPABILITIES.GRAPH);
+      expanded.add(CAPABILITIES.READ);
+      capabilities = expanded;
+      evidence.push(
+        `create_with_search_signal_expanded=true (patch_patterns=${patchPatterns.length}, search=${hasSearchSignal})`
+      );
+    }
+  }
 
   // ── 4. Origin and session adjustments ────────────────────────────────────
   //
@@ -682,9 +706,7 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
       // Check if any non-CHAT regex signals scored. If they did, CHAT was
       // likely a misclassification caused by transition phrasing
       // ("ok thanks, now also fix the auth bug").
-      const nonChatEntries = Object.entries(regexResult.allScores).filter(
-        ([k]) => k !== "CHAT"
-      );
+      const nonChatEntries = Object.entries(regexResult.allScores).filter(([k]) => k !== "CHAT");
       const totalNonChat = nonChatEntries.reduce((sum, [, v]) => sum + v, 0);
 
       if (totalNonChat > 0) {
@@ -718,9 +740,7 @@ export async function planPipeline(payload, sessionState, onnxEmbedder) {
 
   evidence.push(`final_intent=${finalIntent}`);
   evidence.push(`method=${method}`);
-  evidence.push(
-    `capabilities=${Array.from(capabilities).join("+") || "none"}`
-  );
+  evidence.push(`capabilities=${Array.from(capabilities).join("+") || "none"}`);
   evidence.push(`bypass=${bypass}`);
 
   return {

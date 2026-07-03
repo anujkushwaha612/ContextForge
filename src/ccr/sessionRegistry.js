@@ -70,12 +70,42 @@ export class SessionRegistry {
     return session;
   }
 
+  // CCR-4 FIX: the session id hashed the RAW first user message. That
+  // content is not stable across turns: Claude Code injects mutable
+  // <system-reminder> blocks into user messages, the memory handler
+  // appends "## Relevant Memories" context, and the gemini extractor
+  // restructures @-mention content. Any of those → different hash →
+  // BRAND-NEW session → retrievedVaultIds lost → the retrieve tool
+  // re-injected for vaults already in context (the exact sticky-injection
+  // bug this module was rewritten to kill, back through the side door).
+  // Fix: strip known injected/mutable spans before hashing.
+  static _stableUserText(content) {
+    let text;
+    if (typeof content === "string") {
+      text = content;
+    } else if (Array.isArray(content)) {
+      text = content
+        .filter((b) => b?.type === "text" && typeof b.text === "string")
+        .map((b) => b.text)
+        .join("\n");
+    } else {
+      text = JSON.stringify(content ?? "");
+    }
+    return text
+      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
+      .replace(/## Relevant Memories[\s\S]*?(?:\n---\n|$)/g, "")
+      .replace(/--- Content from referenced files ---[\s\S]*?--- End of content ---/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   static deriveSessionId(payload) {
     const messages = payload.messages || [];
     for (const msg of messages) {
       if (msg.role === "user") {
-        const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-        return crypto.createHash("sha256").update(content.slice(0, 500)).digest("hex").slice(0, 16);
+        const stable = SessionRegistry._stableUserText(msg.content);
+        if (!stable) continue; // reminder-only message — try next user msg
+        return crypto.createHash("sha256").update(stable.slice(0, 500)).digest("hex").slice(0, 16);
       }
     }
     return crypto.randomBytes(8).toString("hex");

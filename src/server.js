@@ -47,6 +47,8 @@ import { writeFileSync, readFileSync, mkdirSync, existsSync } from "node:fs";
 import crypto from "node:crypto";
 
 // ── ContextForge core ──
+import { crushJsonToolResults } from "./compression/jsonCrusher.js";
+import { alignCachePrefix } from "./compression/cacheAligner.js";
 import { detectAdapter } from "./adapters/index.js";
 import { ProviderFactory } from "./providers/index.js";
 import {
@@ -96,6 +98,8 @@ import { indexWorkspace, watchWorkspace, setSymbolEmbedder } from "./graph/works
 import {
   injectGraphTool,
   injectReadFileChunkTool,
+  isGraphToolCall, // RQ-7: used to detect an already-present MCP alias before injecting
+  isReadFileChunkTool, // RQ-7
   executeGraphQuery, // SV-4: static import replaces dynamic import()
   executeReadFileChunk, // SV-4: static import replaces dynamic import()
   getGraphToolDefinition, // CF-P8: served to the MCP bridge via /v1/mcp/tools
@@ -103,6 +107,7 @@ import {
 } from "./graph/graphTools.js";
 import {
   injectPatchTool,
+  isPatchToolCall, // RQ-7: used to detect an already-present MCP alias before injecting
   executePatchToolCall, // SV-4: static import replaces dynamic import()
   getPatchToolDefinition, // CF-P8
 } from "./graph/patchTools.js";
@@ -244,7 +249,11 @@ const readiness = {
   const PORT = parseInt(process.env.CF_PORT || process.env.PORT || "3000", 10);
   await new Promise((resolve) => {
     server.listen(PORT, () => {
-      console.log(`CF_LISTENING port=${server.address().port} pid=${process.pid}`);
+      const listenMsg = `CF_LISTENING port=${server.address().port} pid=${process.pid}`;
+      console.log(listenMsg);
+      if (process.env.CF_PORT_FILE) {
+        writeFileSync(process.env.CF_PORT_FILE, listenMsg);
+      }
       resolve();
     });
   });
@@ -854,6 +863,45 @@ async function handleRequest(req, res, chunks) {
       { hasPriorTools, trueBaselineTokens, originHint: originResult.origin },
       onnxEmbedder
     );
+
+    // RQ-7 FIX: injectGraphTool/injectPatchTool/injectReadFileChunkTool were
+    // imported but never called — dead code. Non-MCP clients (direct
+    // OpenAI-format callers, or Claude Code with ContextForge's MCP server
+    // NOT registered) had no path to ever receive contextforge_query_graph/
+    // contextforge_patch_ast/read_file_chunk at all; those tools only ever
+    // reached the model via the separate /v1/mcp/tools + /v1/mcp/tool routes
+    // consumed by mcp/bridge.js.
+    //
+    // Guard: skip entirely if the request already carries ANY mcp__-prefixed
+    // ContextForge tool alias. This keeps MCP-registered sessions exactly as
+    // they are today (Ghost Interceptor correctly never touches mcp__ calls,
+    // per isBackgroundTool in upstreamRequest.js) while giving non-MCP
+    // clients the tools they were always supposed to get. injectGraphTool/
+    // injectPatchTool/injectReadFileChunkTool each also carry their own
+    // isGraphToolCall/isPatchToolCall/isReadFileChunkTool-based dedup check
+    // (RQ-7 in graphTools.js/patchTools.js) recognizing bare name AND both
+    // MCP alias forms, so this is not the only safety net — but checking
+    // here too avoids even calling the injector functions on an MCP session.
+    const alreadyHasMcpTools = Array.isArray(payload.tools)
+      ? payload.tools.some((t) => {
+          const name = t.name || t.function?.name;
+          return isGraphToolCall(name) || isPatchToolCall(name) || isReadFileChunkTool(name);
+        })
+      : false;
+
+    if (!alreadyHasMcpTools && plan.capabilities?.size > 0) {
+      let tools = payload.tools || [];
+      if (plan.capabilities.has(CAPABILITIES.GRAPH)) {
+        tools = injectGraphTool(tools);
+      }
+      if (plan.capabilities.has(CAPABILITIES.PATCH)) {
+        tools = injectPatchTool(tools);
+      }
+      if (plan.capabilities.has(CAPABILITIES.READ)) {
+        tools = injectReadFileChunkTool(tools);
+      }
+      payload.tools = tools;
+    }
   });
 
   // ── GATE: Compression decision ──
@@ -941,6 +989,17 @@ async function handleRequest(req, res, chunks) {
     });
   }
 
+  // 4.5 JSON Crush — per-item compression for large JSON tool results
+  if (hasCompressibleContent) {
+    timer.time(STAGES.JSON_CRUSH, () => {
+      payload = crushJsonToolResults(payload);
+      if (payload._cf_jsonCrushTokensSaved) {
+        timer.recordTokenSavings(STAGES.JSON_CRUSH, payload._cf_jsonCrushTokensSaved);
+        delete payload._cf_jsonCrushTokensSaved;
+      }
+    });
+  }
+
   // 5. AST Compress Code
   if (hasCompressibleContent) {
     await timer.timeAsync(STAGES.CODE_COMPRESS, async () => {
@@ -1005,7 +1064,7 @@ async function handleRequest(req, res, chunks) {
     });
 
     if (memDecision.inject) {
-      const userId = req.headers["x-contextforge-user-id"];
+      const userId = memDecision.effectiveUserId;
       const workspace = req.headers["x-contextforge-workspace"] ?? "";
       const ctx = await memoryHandler.searchAndFormatContext(userId, payload.messages, workspace);
       if (ctx) {
@@ -1013,6 +1072,14 @@ async function handleRequest(req, res, chunks) {
         console.log(`[Memory] Injected ${ctx.length} chars for user=${userId}`);
       }
     }
+  });
+
+  // 11. Cache Prefix Alignment — MUST be the LAST stage that reshapes
+  // messages. It merges all system messages into one and emits the final
+  // static-prefix + dynamic-tail layout; any stage running after it that
+  // touches messages would churn the prefix hash and defeat the alignment.
+  timer.time(STAGES.CACHE_ALIGN, () => {
+    payload = alignCachePrefix(payload, clientAdapter.name);
   });
 
   // ── Translation debug capture ──

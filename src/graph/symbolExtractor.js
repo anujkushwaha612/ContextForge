@@ -42,6 +42,7 @@
 
 import { createRequire } from "module";
 import path from "node:path";
+import { getWorkspaceRoot } from "./graphDb.js";
 
 const require = createRequire(import.meta.url);
 
@@ -51,8 +52,26 @@ let _nativeReady = false;
 
 function getNative() {
   if (_native) return _native;
+  // SX-1 FIX: resolution order must match server.js CF-P1 — the npm-shipped
+  // package has ONLY prebuilds/<platform>-<arch>/, no native/build/Release.
+  // The old single path meant the graph extractor silently degraded to
+  // "Native unavailable" on every installed (non-dev) machine.
+  const candidates = [
+    `../../prebuilds/${process.platform}-${process.arch}/contextforge_native.node`,
+    "../../native/build/Release/contextforge_native.node",
+  ];
   try {
-    _native = require("../../native/build/Release/contextforge_native.node");
+    let lastErr = null;
+    for (const cand of candidates) {
+      try {
+        _native = require(cand);
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    if (!_native) throw lastErr ?? new Error("no native addon found");
     _compressor = new _native.ASTCompressor({
       preserveImports: true,
       preserveSignatures: true,
@@ -156,6 +175,14 @@ function mapNodeTypeToKind(nodeType) {
     interface_declaration:          "class",
     enum_declaration:               "class",
     record_declaration:             "class",
+    // SX-5 FIX: constructor_declaration is in the C++ SIGNATURE_TYPES for
+    // java (ast_compressor.cpp) so the native extractor EMITS it — but the
+    // kind map dropped it, so every Java constructor vanished from the graph.
+    constructor_declaration:        "method",
+
+    // TypeScript — same gap: native emits these, map dropped them.
+    type_alias_declaration:         "class",
+    abstract_class_declaration:     "class",
   };
 
   return map[nodeType] ?? null;
@@ -175,13 +202,35 @@ const EXPORT_CONST_PATTERN =
   /^export\s+(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)/gm;
 
 const EXPORT_DEFAULT_PATTERN =
-  /^export\s+default\s+(?:function\s+)?([A-Za-z_$][A-Za-z0-9_$]*)/gm;
+  // SX-8 FIX: `(?:function\s+)?` had no allowance for `async` appearing
+  // between `default` and `function` — `export default async function
+  // checkAuth(...)` (a very common Express middleware pattern) matched
+  // successfully but captured the literal word "async" as group 1 instead
+  // of "checkAuth". The regex never errors or fails to match, so this was
+  // a silent corruption: buildExportedNames() registered a phantom
+  // "async" entry instead of the real exported name. Any node whose
+  // is_exported flag depends on this Set (native extractor misses this
+  // export-wrapping shape too, per SE-5) is then incorrectly marked
+  // not-exported — vanishing from what_does_this_export() results even
+  // though find_symbol() may still surface it by name.
+  /^export\s+default\s+(?:async\s+)?(?:function\s*\*?\s+)?([A-Za-z_$][A-Za-z0-9_$]*)/gm;
 
 const EXPORT_NAMED_PATTERN =
-  /^export\s+(?:async\s+)?(?:function|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)/gm;
+  /^export\s+(?:async\s+)?(?:function\s*\*?\s+|class\s+)([A-Za-z_$][A-Za-z0-9_$]*)/gm;
 
 const EXPORT_LIST_PATTERN =
   /^export\s*\{([^}]+)\}/gm;
+
+// SX-2 FIX: CommonJS export patterns. Express/Node projects (including the
+// benchmark repo used for Run 1-3) are CJS — module.exports.X / exports.X
+// were completely invisible, so EVERY symbol in a CJS project had
+// is_exported=0. whatDoesThisExport() returned nothing for entire codebases.
+const CJS_MEMBER_EXPORT_PATTERN =
+  /^(?:module\.)?exports\.([A-Za-z_$][A-Za-z0-9_$]*)\s*=/gm;
+const CJS_OBJECT_EXPORT_PATTERN =
+  /^module\.exports\s*=\s*\{([^}]*)\}/m;
+const CJS_DIRECT_EXPORT_PATTERN =
+  /^module\.exports\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*;?\s*$/m;
 
 function buildExportedNames(source, language) {
   if (!["javascript", "typescript", "tsx"].includes(language)) {
@@ -215,6 +264,28 @@ function buildExportedNames(source, language) {
     for (const name of names) exported.add(name);
   }
 
+  // SX-2: CommonJS forms
+  CJS_MEMBER_EXPORT_PATTERN.lastIndex = 0;
+  while ((m = CJS_MEMBER_EXPORT_PATTERN.exec(source)) !== null) {
+    exported.add(m[1]);
+  }
+  const objMatch = CJS_OBJECT_EXPORT_PATTERN.exec(source);
+  if (objMatch) {
+    for (const part of objMatch[1].split(",")) {
+      // { listFiles, renameFile: rf } → export the LOCAL name (value side
+      // for shorthand, key side is the public name — both are useful;
+      // the local name is what matches node.name)
+      const seg = part.trim();
+      if (!seg) continue;
+      const [key, val] = seg.split(":").map((x) => x.trim());
+      const local = val || key;
+      if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(local)) exported.add(local);
+      if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)) exported.add(key);
+    }
+  }
+  const directMatch = CJS_DIRECT_EXPORT_PATTERN.exec(source);
+  if (directMatch) exported.add(directMatch[1]);
+
   return exported;
 }
 
@@ -222,9 +293,92 @@ function buildExportedNames(source, language) {
 // Tree-sitter extraction
 // ─────────────────────────────────────────────
 
+// SX-6 FIX: when the native addon is unavailable the old code returned
+// { nodes: [], edges: [] } — the graph went COMPLETELY empty even though
+// import edges and basic symbols are derivable with regex. Now degrades
+// to a regex extraction so cf still has a usable (if shallower) graph.
+let _fallbackWarned = false;
+
+const JS_FALLBACK_PATTERNS = [
+  { re: /^export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm, kind: "function", exported: true },
+  { re: /^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,             kind: "function", exported: false },
+  { re: /^export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/gm, kind: "arrow_function", exported: true },
+  { re: /^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/gm,            kind: "arrow_function", exported: false },
+  { re: /^export\s+(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/gm,   kind: "class",    exported: true },
+  { re: /^class\s+([A-Za-z_$][\w$]*)/gm,                              kind: "class",    exported: false },
+];
+
+const NONJS_FALLBACK_PATTERNS = {
+  python: [
+    { re: /^(?:async\s+)?def\s+([A-Za-z_][\w]*)/gm, kind: "function", exported: true },
+    { re: /^class\s+([A-Za-z_][\w]*)/gm,              kind: "class",    exported: true },
+  ],
+  go: [
+    { re: /^func\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)/gm, kind: "function", exported: true },
+  ],
+  rust: [
+    { re: /^\s*(?:pub\s+)?fn\s+([A-Za-z_][\w]*)/gm,       kind: "function", exported: true },
+    { re: /^\s*(?:pub\s+)?struct\s+([A-Za-z_][\w]*)/gm,   kind: "class",    exported: true },
+  ],
+  java: [
+    { re: /^\s*(?:public|protected|private)?\s*(?:abstract\s+|final\s+)?class\s+([A-Za-z_$][\w$]*)/gm, kind: "class", exported: true },
+  ],
+};
+
+function regexFallbackExtract(source, language, filePath) {
+  if (!_fallbackWarned) {
+    _fallbackWarned = true;
+    console.warn(
+      "[GraphExtractor] ⚠️  Running in REGEX FALLBACK mode (native addon " +
+        "unavailable). Graph will have shallower symbol data — run " +
+        "`cf doctor` to diagnose the native addon."
+    );
+  }
+  const sourceLines = source.split("\n");
+  const lineOf = (offset) => source.slice(0, offset).split("\n").length - 1;
+  const isJs = ["javascript", "typescript", "tsx"].includes(language);
+  const patterns = isJs ? JS_FALLBACK_PATTERNS : (NONJS_FALLBACK_PATTERNS[language] || []);
+  const exportedNames = isJs ? buildExportedNames(source, language) : null;
+
+  const nodes = [];
+  const seen = new Set();
+  for (const { re, kind, exported } of patterns) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(source)) !== null) {
+      const name = m[1];
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const startLine = lineOf(m.index);
+      const endLine = Math.min(startLine + 50, sourceLines.length - 1);
+      nodes.push({
+        name,
+        kind,
+        startLine,
+        endLine,
+        isExported: exported || (exportedNames?.has(name) ?? false),
+        isAsync: /\basync\b/.test(m[0]),
+        complexity: 0,
+        bodyText: sourceLines.slice(startLine, Math.min(endLine + 1, startLine + 100)).join("\n").trimEnd(),
+      });
+    }
+  }
+
+  const edges = [];
+  for (const node of nodes) {
+    if (node.isExported) {
+      edges.push({ targetSymbol: node.name, targetFile: filePath, sourceSymbol: null, relation: "exports" });
+    }
+  }
+  edges.push(...extractImportEdges(source, language, filePath));
+  return { nodes, edges };
+}
+
 function treesitterExtract(source, language, filePath) {
   getNative();
-  if (!_nativeReady || !_compressor) return { nodes: [], edges: [] };
+  if (!_nativeReady || !_compressor) {
+    return regexFallbackExtract(source, language, filePath);
+  }
 
   const sourceLines = source.split("\n");
 
@@ -246,7 +400,29 @@ function treesitterExtract(source, language, filePath) {
   for (const raw of rawNodes) {
     let kind = mapNodeTypeToKind(raw.type, language);
     if (!kind) continue;
-    if (!raw.name || raw.name.trim() === "") continue;
+
+    // SX-9 FIX: Anonymous default exports — `export default function (req,
+    // res, next) {}`, `export default (req, res) => {}`, `export default
+    // class {}` — have NO identifier for tree-sitter to report, so raw.name
+    // arrives empty. The old code silently `continue`d, dropping the node
+    // entirely. This pattern is exactly Express's router.param(name, cb)
+    // callback convention and extremely common in small single-purpose
+    // middleware files. Losing it means BOTH find_symbol AND
+    // what_does_this_export (the documented LLM fallback when find_symbol
+    // misses) return not-found — there is no node in the graph to report
+    // either way, forcing a raw file read the graph should have prevented.
+    //
+    // Fix: synthesize a discoverable name from the file's basename
+    // (mirroring the existing __module_<basename> convention used when a
+    // whole file has zero nodes) instead of dropping the node.
+    let symbolName = raw.name;
+    if (!symbolName || symbolName.trim() === "") {
+      const isAnonymousExportable = ["function", "arrow_function", "class"].includes(kind);
+      if (!isAnonymousExportable) continue;
+
+      const baseName = path.basename(filePath, path.extname(filePath)).replace(/[^A-Za-z0-9_$]/g, "_");
+      symbolName = `default_export_${baseName}`;
+    }
 
     if (kind === "const") {
       const initType = raw.initializer_type || "";
@@ -268,7 +444,7 @@ function treesitterExtract(source, language, filePath) {
             ? "arrow_function"
             : "function";
       } else {
-        if ((raw.depth || Infinity) <= 2) {
+        if ((raw.depth ?? Infinity) <= 2) {
           kind = "const";
         } else {
           continue;
@@ -293,7 +469,7 @@ function treesitterExtract(source, language, filePath) {
     const truncationNote = wasTruncated
       ? [
           `// ... ${actualBodyLines - MAX_BODY_LINES} more lines. ` +
-            `Use read_function('${raw.name}') or read_file_chunk to get the full body.`,
+            `Use read_function('${symbolName}') or read_file_chunk to get the full body.`,
         ]
       : [];
 
@@ -302,12 +478,20 @@ function treesitterExtract(source, language, filePath) {
       .trimEnd();
 
     // SE-5: Correct is_exported — native misses export const arrow functions
+    // SX-9: also check exportedNames under the ORIGINAL raw.name (if any)
+    // before falling back — a synthesized symbolName never appears in the
+    // regex-built exportedNames set, but anonymous `export default ...`
+    // nodes are *always* exported by definition (there is no other reason
+    // an anonymous function would be the direct target of `export default`).
+    const isAnonymousDefaultExport = symbolName !== raw.name;
     const isExported = raw.is_exported
       ? true
-      : (exportedNames?.has(raw.name) ?? false);
+      : isAnonymousDefaultExport
+        ? true
+        : (exportedNames?.has(raw.name) ?? false);
 
     nodes.push({
-      name:       raw.name,
+      name:       symbolName,
       kind,
       startLine,
       endLine,
@@ -319,7 +503,7 @@ function treesitterExtract(source, language, filePath) {
 
     if (isExported) {
       edges.push({
-        targetSymbol: raw.name,
+        targetSymbol: symbolName,
         targetFile:   filePath,
         sourceSymbol: null,
         relation:     "exports",
@@ -367,7 +551,16 @@ function treesitterExtract(source, language, filePath) {
   );
 
   // Synthesize virtual module-scope node for procedural scripts
-  if (dedupedNodes.length === 0 && source.length > 200 && source.includes("(")) {
+  //
+  // SX-9 FIX: threshold lowered 200 -> 20 chars. The 200-char gate meant
+  // any small file that genuinely produced zero real nodes (a short
+  // side-effect script, a tiny re-export shim) got ZERO graph
+  // representation at all — no real node, no synthetic node — leaving it
+  // completely invisible to find_symbol AND what_does_this_export alike.
+  // Small single-purpose files (exactly the kind most likely to slip under
+  // an arbitrary length gate) are common in real codebases; 20 chars still
+  // excludes genuinely empty/whitespace-only files while covering them.
+  if (dedupedNodes.length === 0 && source.trim().length > 20 && source.includes("(")) {
     const baseName = path.basename(filePath, path.extname(filePath));
     dedupedNodes.push({
       name:       `__module_${baseName}`,
@@ -395,29 +588,60 @@ const IMPORT_PATTERNS = {
   javascript: [
     /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g,
     /import\s+(\w+)\s+from\s+['"]([^'"]+)['"]/g,
+    // SX-3 FIX: mixed default+named — `import express, { Router } from "express"`
+    // matched NEITHER pattern above (first requires { immediately, second
+    // requires bare \w+ before from). Express-style imports lost BOTH edges.
+    /import\s+(\w+)\s*,\s*\{[^}]*\}\s+from\s+['"]([^'"]+)['"]/g,
+    /import\s+\w+\s*,\s*\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g,
+    // SX-3 FIX: namespace import — `import * as utils from "./utils.js"`
+    /import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"]/g,
     /(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
     /(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
   ],
   python: [/from\s+([\w.]+)\s+import\s+([^#\n]+)/g, /^import\s+([\w.]+)/gm],
-  go:     [/import\s+"([^"]+)"/g, /"([\w./]+)"/g],
+  // SX-4 FIX: old go entry had TWO bugs — (1) /"([\w./]+)"/g matched EVERY
+  // string literal in the file as an "import" and (2) extractImportEdges had
+  // no go branch at all, so even real imports produced ZERO edges. Go is now
+  // handled explicitly in extractImportEdges (single + parenthesized block).
+  go:     [],
   rust:   [/use\s+([\w:]+)::(\w+)/g, /use\s+([\w:]+)::\{([^}]+)\}/g],
   cpp:    [/#include\s+"([^"]+)"/g, /#include\s+<([^>]+)>/g],
 };
 
+// SX-7 FIX: fromDir is a WORKSPACE-RELATIVE directory (path.dirname of the
+// relPath extractSymbols is called with — e.g. "controllers", not an
+// absolute path). path.resolve(fromDir, ...) with a relative fromDir
+// silently anchors against process.cwd() — the PROXY's own install
+// directory, not the indexed project's workspace root. server.js exists
+// specifically because cwd != workspace in real deployments (CF_WORKSPACE_PATH).
+//
+// Consequence before this fix: every relative import edge's targetFile was
+// written as an absolute path resolved from the wrong root (e.g.
+// "/home/user/contextforge-install/../foo.js" instead of "foo.js"). Every
+// downstream query that compares target_file against a workspace-relative
+// path — queryWhoDependsOnFile, analyze_impact's transitive lookups — could
+// never match, silently returning "no_dependents"/empty results for every
+// file with relative imports, regardless of the indexed project's contents.
+//
+// Fix: resolve against getWorkspaceRoot(), then convert back to a
+// workspace-relative path so it matches the format of every other
+// file_path/target_file value already written to the graph DB.
 function resolveImportPath(fromDir, importPath, importingFileExt = ".js") {
   try {
     const clean  = importPath.split("?")[0].split("#")[0];
     const hasExt = /\.\w{1,4}$/.test(clean);
 
-    if (hasExt) {
-      return path.resolve(fromDir, clean).replace(/\\/g, "/");
-    }
+    const workspaceRoot = getWorkspaceRoot();
+    const absFromDir = path.resolve(workspaceRoot, fromDir);
 
-    const preferredExt = [".ts", ".tsx", ".jsx"].includes(importingFileExt)
-      ? importingFileExt
-      : ".js";
+    const absTarget = hasExt
+      ? path.resolve(absFromDir, clean)
+      : path.resolve(
+          absFromDir,
+          clean + ([".ts", ".tsx", ".jsx"].includes(importingFileExt) ? importingFileExt : ".js")
+        );
 
-    return path.resolve(fromDir, clean + preferredExt).replace(/\\/g, "/");
+    return path.relative(workspaceRoot, absTarget).replace(/\\/g, "/");
   } catch {
     return null;
   }
@@ -426,6 +650,38 @@ function resolveImportPath(fromDir, importPath, importingFileExt = ".js") {
 function extractImportEdges(source, language, filePath) {
   const edges    = [];
   const lang     = language === "typescript" || language === "tsx" ? "javascript" : language;
+
+  // SX-4: Go handled explicitly — single imports (optionally aliased) and
+  // parenthesized import blocks. No generic-string noise.
+  if (lang === "go") {
+    const single = /import\s+(?:(\w+)\s+)?"([^"]+)"/g;
+    let gm;
+    while ((gm = single.exec(source)) !== null) {
+      const alias = gm[1];
+      const pkg = gm[2];
+      edges.push({
+        targetSymbol: alias || pkg.split("/").pop(),
+        targetFile:   null,
+        sourceSymbol: null,
+        relation:     "imports",
+      });
+    }
+    const block = /import\s*\(([\s\S]*?)\)/g;
+    while ((gm = block.exec(source)) !== null) {
+      const inner = /(?:(\w+)\s+)?"([^"]+)"/g;
+      let im;
+      while ((im = inner.exec(gm[1])) !== null) {
+        edges.push({
+          targetSymbol: im[1] || im[2].split("/").pop(),
+          targetFile:   null,
+          sourceSymbol: null,
+          relation:     "imports",
+        });
+      }
+    }
+    return edges;
+  }
+
   const patterns = IMPORT_PATTERNS[lang] || IMPORT_PATTERNS.javascript;
   const fileDir  = path.dirname(filePath);
   const fileExt  = path.extname(filePath).toLowerCase();

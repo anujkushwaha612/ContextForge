@@ -53,9 +53,7 @@ class RecencyBoostRanker {
 
     // Stable sort descending
     boosted.sort((a, b) =>
-      b.boostedScore !== a.boostedScore
-        ? b.boostedScore - a.boostedScore
-        : a.idx - b.idx,
+      b.boostedScore !== a.boostedScore ? b.boostedScore - a.boostedScore : a.idx - b.idx
     );
 
     return boosted.map(({ candidate, boostedScore }) => ({
@@ -103,14 +101,14 @@ export class MemoryHandler {
   constructor(
     memoryStore,
     hybridRetriever,
-    { maxTokens = 1024, maxEntries = 10, minScore = 0.3, decayDays = 30 } = {},
+    { maxTokens = 1024, maxEntries = 10, minScore = 0.3, decayDays = 30 } = {}
   ) {
-    this._store       = memoryStore;
-    this._retriever   = hybridRetriever;
-    this._ranker      = new RecencyBoostRanker(decayDays);
-    this._maxTokens   = maxTokens;
-    this._maxEntries  = maxEntries;
-    this._minScore    = minScore;
+    this._store = memoryStore;
+    this._retriever = hybridRetriever;
+    this._ranker = new RecencyBoostRanker(decayDays);
+    this._maxTokens = maxTokens;
+    this._maxEntries = maxEntries;
+    this._minScore = minScore;
   }
 
   _embed(text) {
@@ -127,9 +125,9 @@ export class MemoryHandler {
       return null;
     }
 
-    const id        = "mem_" + crypto.randomBytes(8).toString("hex");
+    const id = "mem_" + crypto.randomBytes(8).toString("hex");
     const embedding = await this._embed(content);
-    const now       = Date.now();
+    const now = Date.now();
 
     const savedId = this._store.save({
       id,
@@ -168,7 +166,7 @@ export class MemoryHandler {
       return [];
     }
 
-    const floor     = minScore ?? this._minScore;
+    const floor = minScore ?? this._minScore;
     const embedding = await this._embed(query);
 
     let results = [];
@@ -188,19 +186,28 @@ export class MemoryHandler {
       if (typeof this._retriever.sparseSearch !== "function") {
         console.warn(
           "[Memory] BM25 fallback unavailable — sparseSearch not found on retriever. " +
-          "Returning empty results."
+            "Returning empty results."
         );
         return [];
       }
 
       try {
-        const bm25 = this._retriever.sparseSearch(query, topK, 1.0);
-        return (Array.isArray(bm25) ? bm25 : []).map((r) => ({
-          id:        r.id,
-          content:   r.breadcrumb || "",
-          score:     r.sparseScore,
+        // MH-9 FIX: the HybridRetriever is SHARED — it also indexes
+        // workspace files and assistant responses (IDX_* ids from
+        // upstreamRequest.js). The old code returned ALL of them as
+        // "memories", leaking indexed file content into memory_search
+        // results. Only mem_* documents are memories. Over-fetch (×5)
+        // because the filter discards non-memory hits.
+        const bm25Raw = this._retriever.sparseSearch(query, topK * 5, 1.0);
+        const bm25 = (Array.isArray(bm25Raw) ? bm25Raw : [])
+          .filter((r) => typeof r.id === "string" && r.id.startsWith("mem_"))
+          .slice(0, topK);
+        return bm25.map((r) => ({
+          id: r.id,
+          content: r.breadcrumb || "",
+          score: r.sparseScore,
           createdAt: null,
-          metadata:  "{}",
+          metadata: "{}",
         }));
       } catch (e2) {
         console.warn("[Memory] BM25 fallback also failed:", e2.message);
@@ -208,10 +215,19 @@ export class MemoryHandler {
       }
     }
 
-    return this._ranker
-      .rank(Array.isArray(results) ? results : [])
-      .filter((r) => r.score >= floor)
-      .slice(0, this._maxEntries);
+    // MH-7 FIX: do NOT re-apply the minScore floor AFTER recency decay.
+    // The native store already filtered by raw cosine >= floor. Decay
+    // multiplies by e^(-age/30d), so a 60-day-old memory with cosine 0.95
+    // became 0.95×e^(-2)=0.13 and was DROPPED by the old post-filter —
+    // exactly the "remember this preference" long-term memories the
+    // feature exists for. Decay is for RANKING (fresh beats stale at
+    // equal relevance), never for eligibility.
+    //
+    // MH-8 FIX: honor the caller's topK. The old slice used
+    // this._maxEntries unconditionally — memory_search with top_k=3
+    // returned up to 10 results.
+    const limit = Math.min(topK, this._maxEntries);
+    return this._ranker.rank(Array.isArray(results) ? results : []).slice(0, limit);
   }
 
   // ─────────────────────────────────────────────
@@ -237,11 +253,13 @@ export class MemoryHandler {
       return false;
     }
     const embedding = await this._embed(content);
-    const ok        = this._store.update({ id, content, embedding });
+    const ok = this._store.update({ id, content, embedding });
     if (ok) {
       try {
         this._retriever.addDocument(id, content);
-      } catch (_) { /* non-fatal */ }
+      } catch (_) {
+        /* non-fatal */
+      }
     }
     return ok;
   }
@@ -259,8 +277,8 @@ export class MemoryHandler {
     const results = await this.search({
       userId,
       workspace,
-      query:    queryText,
-      topK:     this._maxEntries,
+      query: queryText,
+      topK: this._maxEntries,
       minScore: this._minScore,
     });
 
@@ -275,10 +293,8 @@ export class MemoryHandler {
     ];
 
     for (let i = 0; i < results.length; i++) {
-      const r       = results[i];
-      const preview = r.content.length > 200
-        ? r.content.slice(0, 200) + "..."
-        : r.content;
+      const r = results[i];
+      const preview = r.content.length > 200 ? r.content.slice(0, 200) + "..." : r.content;
       lines.push(`${i + 1}. [${r.id}] ${preview}`);
     }
 
@@ -292,7 +308,18 @@ export class MemoryHandler {
   // ─────────────────────────────────────────────
 
   delete(id) {
-    return this._store.remove(id);
+    const ok = this._store.remove(id);
+    // MH-10 FIX: evict from the BM25 index too. The old code left a
+    // ghost document behind — after a vector-search failure, the BM25
+    // fallback could resurrect a memory the user explicitly deleted.
+    if (ok) {
+      try {
+        this._retriever.removeDocument(id);
+      } catch (_) {
+        /* non-fatal — vector store is source of truth */
+      }
+    }
+    return ok;
   }
 
   // ─────────────────────────────────────────────
@@ -328,7 +355,8 @@ export class MemoryHandler {
         Array.isArray(msg.content) &&
         msg.content.length > 0 &&
         msg.content.every((b) => b.type === "tool_result")
-      ) continue;
+      )
+        continue;
 
       const updated = [...messages];
 
@@ -344,10 +372,7 @@ export class MemoryHandler {
         // that the workspace state injector and other stages depend on.
         updated[i] = {
           ...msg,
-          content: [
-            { type: "text", text: contextText },
-            ...msg.content,
-          ],
+          content: [{ type: "text", text: contextText }, ...msg.content],
         };
       } else {
         // Null/undefined content — set as string
@@ -378,17 +403,14 @@ export class MemoryHandler {
   //       context (file listings, cwd, shell) that pollutes the embedding.
   // ─────────────────────────────────────────────
 
-  _buildQueryFromMessages(
-    messages,
-    { lookbackAssistant = 2, lookbackTools = 3 } = {},
-  ) {
-    let latestUser       = "";
+  _buildQueryFromMessages(messages, { lookbackAssistant = 2, lookbackTools = 3 } = {}) {
+    let latestUser = "";
     const assistantParts = [];
-    const toolParts      = [];
+    const toolParts = [];
 
     for (let i = messages.length - 1; i >= 0; i--) {
-      const msg     = messages[i];
-      const role    = msg.role;
+      const msg = messages[i];
+      const role = msg.role;
       const content = msg.content;
 
       // MH-3: Skip system messages — they pollute the embedding query
@@ -399,7 +421,6 @@ export class MemoryHandler {
         if (typeof content === "string" && !latestUser) {
           // Plain string user message — this is the primary query signal
           latestUser = content;
-
         } else if (Array.isArray(content) && !latestUser) {
           // MH-2: Array-content user message — extract text blocks.
           // After workspace state injection, the last user message may be
@@ -416,7 +437,6 @@ export class MemoryHandler {
             latestUser = textParts[textParts.length - 1];
           }
         }
-
       } else if (role === "assistant" && assistantParts.length < lookbackAssistant) {
         const t =
           typeof content === "string"
@@ -428,7 +448,6 @@ export class MemoryHandler {
                   .join("\n")
               : "";
         if (t) assistantParts.push(t);
-
       } else if (role === "tool" && toolParts.length < lookbackTools) {
         // OpenAI format tool results — role:"tool" with string content
         if (typeof content === "string" && content) {
@@ -437,12 +456,20 @@ export class MemoryHandler {
       }
     }
 
+    // MH-11 FIX: the user query goes FIRST and tool output is capped.
+    // all-MiniLM-L6-v2 truncates input at 512 tokens (~2000 chars). The
+    // old order (assistant → tools → user) let a single 100KB file read
+    // push the user's actual question past the truncation point — the
+    // memory query embedded 2KB of file content and ZERO of the question.
+    const TOOL_PART_CAP = 300; // chars per tool result
+    const TOTAL_CAP = 2000; // ≈ model's 512-token window
+
     const parts = [
-      ...assistantParts.reverse(),
-      ...toolParts.reverse(),
       latestUser,
+      ...assistantParts.reverse(),
+      ...toolParts.reverse().map((p) => p.slice(0, TOOL_PART_CAP)),
     ].filter(Boolean);
 
-    return parts.join("\n\n");
+    return parts.join("\n\n").slice(0, TOTAL_CAP);
   }
 }
