@@ -1,7 +1,28 @@
 // src/workers/embeddingWorker.js
+//
+// Fixes applied (this pass — pipeline sync audit):
+//   EW-1 (critical): DB path hardcoded ../data/contextforge.db while the
+//        main thread (cacheDb.js CD-1) resolves CF_DATA_DIR first. Under
+//        the CLI daemon (which sets CF_DATA_DIR to the per-workspace dir)
+//        the worker wrote chunks into a DIFFERENT database file than the
+//        one vaultRetriever reads — every hybrid retrieval of worker-
+//        indexed content silently missed. Now uses the identical
+//        resolution rule as cacheDb.
+//   EW-2: vault_chunks CREATE was schema-drifted from cacheDb's (missing
+//        created_at and the FK to prune_vault). Whichever thread ran first
+//        decided the real schema. Worker now uses the identical DDL, and
+//        enables foreign_keys like the main thread.
+//   EW-3: INSERT OR IGNORE → INSERT OR REPLACE, matching cacheDb CD-4 —
+//        re-indexing a vault after content change must update chunks, not
+//        silently keep stale ones.
+//   EW-4: requestEmbeddings promise leaked forever if the main-thread
+//        bridge died mid-request (worker kept a pending entry and the
+//        vault was never saved, without vectors OR text). 30s timeout →
+//        resolve(null) → chunks saved text-only (BM25 still works).
 import { parentPort } from "node:worker_threads";
 import Database from "better-sqlite3";
 import path from "node:path";
+import { mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -10,24 +31,43 @@ const __dirname = path.dirname(__filename);
 // ==========================================
 // WORKER-OWNED DATABASE CONNECTION
 // WAL mode allows concurrent access with main thread
+// EW-1: MUST resolve identically to cacheDb.js (CD-1) or the worker
+// writes to a different database than the retriever reads.
 // ==========================================
-const db = new Database(path.join(__dirname,  "../data/contextforge.db"));
+const DATA_DIR = process.env.CF_DATA_DIR || path.join(__dirname, "../data");
+mkdirSync(DATA_DIR, { recursive: true });
+const db = new Database(path.join(DATA_DIR, "contextforge.db"));
 db.exec("PRAGMA journal_mode = WAL");
 db.exec("PRAGMA synchronous = NORMAL");
+db.exec("PRAGMA foreign_keys = ON"); // EW-2: match main thread
 
+// EW-2: identical DDL to cacheDb.js — prune_vault first (FK target), then
+// vault_chunks. Normally cacheDb created these before the worker spawns;
+// this is defensive for cold starts, and MUST NOT drift from the real schema.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS prune_vault (
+    vault_id TEXT PRIMARY KEY,
+    dropped_text TEXT,
+    content_hash TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
 db.exec(`
   CREATE TABLE IF NOT EXISTS vault_chunks (
-    chunk_id       TEXT PRIMARY KEY,
-    vault_id       TEXT NOT NULL,
-    chunk_text     TEXT NOT NULL,
-    chunk_index    INTEGER NOT NULL,
+    chunk_id TEXT PRIMARY KEY,
+    vault_id TEXT NOT NULL,
+    chunk_text TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
     token_estimate INTEGER NOT NULL,
-    vector         BLOB
+    vector BLOB,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (vault_id) REFERENCES prune_vault(vault_id) ON DELETE CASCADE
   )
 `);
 
+// EW-3: OR REPLACE matches cacheDb CD-4 — re-indexed vaults update chunks
 const insertChunk = db.prepare(`
-  INSERT OR IGNORE INTO vault_chunks
+  INSERT OR REPLACE INTO vault_chunks
   (chunk_id, vault_id, chunk_text, chunk_index, token_estimate, vector)
   VALUES (?, ?, ?, ?, ?, ?)
 `);
@@ -196,10 +236,34 @@ function chunkText(text) {
 const pendingRequests = new Map();
 let   requestCounter  = 0;
 
+const EMBED_TIMEOUT_MS = 30_000;
+
 function requestEmbeddings(vaultId, chunks) {
   return new Promise((resolve) => {
     const requestId = `emb_${++requestCounter}`;
-    pendingRequests.set(requestId, { vaultId, resolve });
+
+    // EW-4: if the main-thread bridge dies (worker error handler removed it,
+    // embedder crashed, etc.) this promise previously hung FOREVER — the
+    // vault was never saved at all, not even text-only. Timeout → null →
+    // caller saves chunks without vectors (BM25/sparse retrieval still works).
+    const timer = setTimeout(() => {
+      if (pendingRequests.has(requestId)) {
+        pendingRequests.delete(requestId);
+        parentPort.postMessage(
+          `⚠️  Vault ${vaultId}: embed request timed out after ${EMBED_TIMEOUT_MS / 1000}s — saving text-only`,
+        );
+        resolve(null);
+      }
+    }, EMBED_TIMEOUT_MS);
+    timer.unref?.();
+
+    pendingRequests.set(requestId, {
+      vaultId,
+      resolve: (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+    });
 
     // Ask main thread to embed these chunks
     parentPort.postMessage({

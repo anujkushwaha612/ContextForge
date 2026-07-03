@@ -51,6 +51,7 @@ import { createRequire } from "module";
 import path from "path";
 import { saveToVault, fetchFromVault } from "../logging/cacheDb.js";
 import { statsEmitter } from "../proxy/statsEmitter.js";
+import { isRecentToolResult, looksLikeStub } from "./compressionPolicy.js";
 
 const require = createRequire(import.meta.url);
 const native = require("../../native/build/Release/contextforge_native.node");
@@ -424,6 +425,10 @@ function getDynamicThreshold({ contentLength }) {
 const MIN_EXACT_DEDUP_CHARS = 100;
 const MIN_NEARDUP_DEDUP_CHARS = 500;
 
+// F2 NOTE: legacy cross-request dedup path. Superseded by dedupKeepNewest()
+// inside applySemanticDedup (keep-newest invariant). Retained (unused) for
+// reference during the transition; safe to delete after v1 ships.
+// eslint-disable-next-line no-unused-vars
 async function deduplicateMessage(msg, key) {
   const content = msg.content;
 
@@ -601,8 +606,31 @@ async function deduplicateMessage(msg, key) {
 // Main export
 // ─────────────────────────────────────────────
 
+/**
+ * F2 REWRITE — "keep newest, stub oldest".
+ *
+ * The client (Claude Code) resends the FULL conversation every request;
+ * our transformations are per-request and never persist into the client's
+ * history. Under the old design ("register first occurrence, stub later
+ * ones"), on any request after the first, EVERY occurrence of a file
+ * matched the registry and got stubbed — leaving the model with zero full
+ * copies in context. Combined with AST compression, this produced the
+ * observed pointer-chains: "[CF_VAULT:...] identical to turn 3" where turn
+ * 3 itself was "[CF_COMPRESSED_FILE ...]".
+ *
+ * New invariant: for each dedup key, the NEWEST occurrence in the current
+ * payload always passes through full; OLDER occurrences that are exact or
+ * near duplicates of it are stubbed. Exactly one full copy per file per
+ * request, and it's always the most current one.
+ *
+ * The session registry is kept for vault reuse + stats, but correctness no
+ * longer depends on cross-request state.
+ */
 export async function applySemanticDedup(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
+
+  const policy = payload.__policy ?? null;
+  if (policy && policy.dedupEnabled === false) return payload;
 
   sessionRegistry.incrementTurn();
 
@@ -616,9 +644,135 @@ export async function applySemanticDedup(payload) {
     charsSaved: 0,
   };
 
+  // ── F2 pre-pass: locate the NEWEST occurrence of each dedup key ────────
+  // (iterating forward and overwriting leaves the last occurrence in the map)
+  const DEDUPABLE = ["code", "text", "markdown"];
+  const newestByKey = new Map();
+  for (let mi = 0; mi < payload.messages.length; mi++) {
+    const m = payload.messages[mi];
+    if (m.role === "tool" && typeof m.content === "string" && DEDUPABLE.includes(m._cf_type)) {
+      const k = buildMessageKey(m);
+      if (k) newestByKey.set(k, { mi, bi: -1, content: m.content });
+    } else if (m.role === "user" && Array.isArray(m.content)) {
+      for (let bi = 0; bi < m.content.length; bi++) {
+        const b = m.content[bi];
+        if (b?.type === "tool_result" && typeof b.content === "string" && DEDUPABLE.includes(b._cf_type)) {
+          const k = buildMessageKey(b);
+          if (k) newestByKey.set(k, { mi, bi, content: b.content });
+        }
+      }
+    }
+  }
+
+  /**
+   * F2 core: dedup an occurrence AGAINST THE NEWEST occurrence in this
+   * payload (not against cross-request registry state).
+   *   - the newest occurrence itself always passes through full
+   *   - recent messages (age gate) always pass through
+   *   - F3: if the newest copy is itself a stub, nothing dedups against it
+   *   - older occurrences stub only on exact/near match with the newest
+   */
+  async function dedupKeepNewest(msg, key, msgIndex, blockIndex = -1) {
+    const newest = newestByKey.get(key);
+    const isNewest = newest && newest.mi === msgIndex && newest.bi === blockIndex;
+
+    // Register the newest copy in the session registry (vault reuse + stats).
+    if (isNewest) {
+      const existing = sessionRegistry.get(key);
+      const contentHash = fnv1a64(msg.content);
+      if (!existing || existing.contentHash !== contentHash) {
+        const vaultId = saveToVault(msg.content); // content-hash dedup inside
+        sessionRegistry.set(key, {
+          fingerprint:
+            msg.content.length >= MIN_NEARDUP_DEDUP_CHARS ? computeFingerprint(msg.content) : null,
+          contentHash,
+          vaultId,
+          contentLength: msg.content.length,
+        });
+        console.log(
+          `[SemanticDedup] 📝 Registered: ${key} ` +
+            `(${Math.round(msg.content.length / 4)} tokens → vault ${sessionRegistry.get(key).vaultId})`
+        );
+      }
+      return { deduplicated: false, msg };
+    }
+
+    // F1: age gate — content the model hasn't acted on yet stays readable.
+    if (isRecentToolResult(payload.messages, msgIndex, policy)) {
+      return { deduplicated: false, msg };
+    }
+
+    // F3: never dedup toward a stub — the pointer would dangle.
+    if (!newest || looksLikeStub(newest.content)) {
+      return { deduplicated: false, msg };
+    }
+
+    const content = msg.content;
+    if (!content || content.length < MIN_EXACT_DEDUP_CHARS) {
+      return { deduplicated: false, msg };
+    }
+
+    // Exact match with the newest copy → stub this older one.
+    if (fnv1a64(content) === fnv1a64(newest.content)) {
+      const vaultId = saveToVault(content);
+      statsEmitter.recordCacheHit("semanticDedup", true);
+      return {
+        deduplicated: true,
+        msg: {
+          ...msg,
+          _cf_deduped: true,
+          content:
+            `[CF_VAULT:${vaultId}] (identical to the current copy of this file ` +
+            `shown later in this conversation, ~${Math.round(content.length / 4)} tokens)`,
+          _dedupVaultId: vaultId,
+          _dedupSimilarity: 100,
+        },
+      };
+    }
+
+    // Near-dup with the newest copy → stub; the newest (still full) is the
+    // authoritative version, so pointing at it is always safe.
+    if (content.length >= MIN_NEARDUP_DEDUP_CHARS && newest.content.length >= MIN_NEARDUP_DEDUP_CHARS) {
+      const fp = computeFingerprint(content);
+      const newestFp = computeFingerprint(newest.content);
+      if (fp !== null && newestFp !== null) {
+        const distance = fingerprintDistance(fp, newestFp);
+        const threshold = getDynamicThreshold({ contentLength: content.length });
+        // NOTE: distance === 0 with differing FNV is a SimHash blind spot
+        // (legacy BUG-1). Under keep-newest it is SAFE to stub the older
+        // copy anyway: the authoritative full version is present later in
+        // this same payload, so no stale-retrieval risk exists.
+        if (distance <= threshold) {
+          const similarityPct = Math.round(((64 - distance) / 64) * 100);
+          const vaultId = saveToVault(content);
+          console.log(
+            `[SemanticDedup] 🎯 Superseded: ${key} ` +
+              `(older copy, ${similarityPct}% similar to the current version below)`
+          );
+          statsEmitter.recordCacheHit("semanticDedup", true);
+          return {
+            deduplicated: true,
+            msg: {
+              ...msg,
+              _cf_deduped: true,
+              content:
+                `[CF_VAULT:${vaultId}] (outdated copy — ${similarityPct}% similar to the ` +
+                `current version of this file shown later in this conversation)`,
+              _dedupVaultId: vaultId,
+              _dedupSimilarity: similarityPct,
+            },
+          };
+        }
+      }
+    }
+
+    return { deduplicated: false, msg };
+  }
+
   const newMessages = [];
 
-  for (const msg of payload.messages) {
+  for (let msgIndex = 0; msgIndex < payload.messages.length; msgIndex++) {
+    const msg = payload.messages[msgIndex];
     // ── OpenAI format: role:"tool" ────────────────────────────────────────
     if (msg.role === "tool" && typeof msg.content === "string") {
       if (msg._cf_vaulted) {
@@ -653,7 +807,7 @@ export async function applySemanticDedup(payload) {
         continue;
       }
       stats.checked++;
-      const { deduplicated, msg: updatedMsg } = await deduplicateMessage(msg, key);
+      const { deduplicated, msg: updatedMsg } = await dedupKeepNewest(msg, key, msgIndex);
       if (deduplicated) {
         stats.deduplicated++;
         stats.charsSaved += msg.content.length - updatedMsg.content.length;
@@ -668,7 +822,8 @@ export async function applySemanticDedup(payload) {
     if (msg.role === "user" && Array.isArray(msg.content)) {
       let modified = false;
       const newBlocks = [];
-      for (const block of msg.content) {
+      for (let m_bi = 0; m_bi < msg.content.length; m_bi++) {
+        const block = msg.content[m_bi];
         if (block.type === "tool_result" && typeof block.content === "string") {
           if (block._cf_vaulted) {
             newBlocks.push(block);
@@ -690,7 +845,7 @@ export async function applySemanticDedup(payload) {
             continue;
           }
           stats.checked++;
-          const { deduplicated, msg: updatedBlock } = await deduplicateMessage(block, key);
+          const { deduplicated, msg: updatedBlock } = await dedupKeepNewest(block, key, msgIndex, m_bi);
           if (deduplicated) {
             stats.deduplicated++;
             stats.charsSaved += block.content.length - updatedBlock.content.length;

@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────
+# .npmignore — defense-in-depth for the npm tarball.
+#
+# NOTE: package.json "files" is the PRIMARY control (a whitelist —
+# only listed paths ship). This file exists as a second layer that
+# excludes junk INSIDE whitelisted directories (src/, cli/, scripts/)
+# so a stray database or log can never ship even if it appears there.
+#
+# Verify what actually ships with:  npm pack --dry-run
+# ─────────────────────────────────────────────
+
+# Runtime state that could appear inside src/
+src/data/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite3
+CF-savings/
+debug_translation/
+debug_payload.json
+**/*.log
+
+# Secrets — never ship, even if whitelisted by accident
+.env
+.env.*
+!.env.example
+
+# Tests & fixtures inside shipped dirs
+**/*.test.js
+**/__tests__/
+tests/
+test-*
+
+# Native sources & build (users get prebuilds/; builders use git)
+native/
+!prebuilds/
+
+# Models (lazy-downloaded to ~/.contextforge by cf setup)
+contextforge_models/
+**/*.onnx
+
+# Dev-only
+.github/
+.vscode/
+.idea/
+.claude/
+.devcontainer/
+docker-compose.yml
+Dockerfile
+.dockerignore
+benchmarks/
+coverage/

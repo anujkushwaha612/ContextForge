@@ -63,7 +63,11 @@ export function getPatchToolDefinition() {
         "For changing one line INSIDE a function, use replace_string — no full read needed. " +
         "For anonymous handlers (SSE routes, http.createServer blocks) where find_route returns a line number, " +
         "use insert_at_line with the line number — no symbol or read needed. " +
-        "Never call replace_body without the complete current body confirmed in hand.",
+        "Never call replace_body without the complete current body confirmed in hand. " +
+        "\n\nRESULTS ARE SELF-VERIFYING: every successful patch returns a `diff` field " +
+        "showing the exact change applied to disk. Trust the diff — do NOT re-read " +
+        "the file just to confirm a patch worked. Only read again if you need " +
+        "surrounding context for a further edit.",
       parameters: {
         type: "object",
         properties: {
@@ -155,6 +159,62 @@ export function normalizePatchToolName(name) {
   return match ? match[1] : name;
 }
 
+// ─────────────────────────────────────────────
+// F5: self-verifying patch results.
+//
+// Session evidence (S3-refactor runs): the model spent 3-6 requests
+// re-reading files after every successful patch because the result was an
+// assertion ("3 line(s) changed") with no evidence. A ~60-token unified
+// diff in the result replaces a 500-2000 token read_file_chunk round-trip.
+// ─────────────────────────────────────────────
+
+const MAX_DIFF_LINES = 40;
+
+/**
+ * Compact unified diff between the old and new text of the patched region.
+ * Trims common prefix/suffix lines so only the true change (plus one line
+ * of context each side) is shown. Exact for contiguous patch regions
+ * (replace_string / replace_body / insert), which is all we produce.
+ */
+function buildUnifiedDiff(oldText, newText, { filePath, startLine }) {
+  if (typeof oldText !== "string" || typeof newText !== "string") return null;
+  // "" means "nothing" (pure insert/delete) — not a single empty line
+  const oldLines = oldText === "" ? [] : oldText.replace(/\r\n/g, "\n").split("\n");
+  const newLines = newText === "" ? [] : newText.replace(/\r\n/g, "\n").split("\n");
+
+  let pre = 0;
+  while (pre < oldLines.length && pre < newLines.length && oldLines[pre] === newLines[pre]) pre++;
+  let sufOld = oldLines.length - 1;
+  let sufNew = newLines.length - 1;
+  while (sufOld >= pre && sufNew >= pre && oldLines[sufOld] === newLines[sufNew]) {
+    sufOld--;
+    sufNew--;
+  }
+
+  const removed = oldLines.slice(pre, sufOld + 1);
+  const added = newLines.slice(pre, sufNew + 1);
+  if (removed.length === 0 && added.length === 0) return null; // no-op
+
+  const ctxBefore = pre > 0 ? [` ${oldLines[pre - 1]}`] : [];
+  const ctxAfter = sufOld + 1 < oldLines.length ? [` ${oldLines[sufOld + 1]}`] : [];
+
+  const hunkStart = (startLine ?? 0) + pre;
+  const lines = [
+    `@@ ${filePath} line ~${hunkStart + 1} @@`,
+    ...ctxBefore,
+    ...removed.map((l) => `-${l}`),
+    ...added.map((l) => `+${l}`),
+    ...ctxAfter,
+  ];
+
+  if (lines.length > MAX_DIFF_LINES) {
+    const kept = lines.slice(0, MAX_DIFF_LINES);
+    kept.push(`… diff truncated (${lines.length - MAX_DIFF_LINES} more lines)`);
+    return kept.join("\n");
+  }
+  return lines.join("\n");
+}
+
 export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
   let args;
   try {
@@ -211,14 +271,73 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
           `failed: ${result.error?.slice(0, 120)}`
   );
 
-  // ── Automatic verification snapshot ──────────────────────────────────────
+  // ── F5: embed a unified diff — the evidence that makes re-reads redundant ─
   if (result.success) {
-    const verifyLine = result.patch_start_line ?? result.insert_line ?? result.lines_before ?? null;
+    let oldText = null;
+    let newText = null;
+    if (args.operation === "replace_string") {
+      oldText = args.search_string ?? "";
+      newText = args.replacement_string ?? "";
+    } else if (
+      args.operation === "insert_after" ||
+      args.operation === "insert_before" ||
+      args.operation === "insert_at_line" ||
+      args.operation === "create_file"
+    ) {
+      oldText = "";
+      newText = args.new_body ?? "";
+    } else if (args.operation === "delete_symbol" || args.operation === "delete_string") {
+      oldText = args.search_string ?? args.new_body ?? "";
+      newText = "";
+    }
+    // replace_body intentionally skipped: old body unknown here; the
+    // verified_state snippet below already shows the resulting file state.
+
+    if (oldText !== null) {
+      const diff = buildUnifiedDiff(oldText, newText, {
+        filePath: result.file ?? args.file_path,
+        startLine: result.patch_start_line ?? null,
+      });
+      if (diff) {
+        result.diff = diff;
+        result.diff_note =
+          "This diff is what was applied to the file on disk. " +
+          "It is authoritative — no re-read is needed to verify this change.";
+      }
+    }
+  }
+
+  // ── Automatic verification snapshot ──────────────────────────────────────
+  // F5: when a diff is present it already proves the change — the snippet
+  // would repeat the same lines and double the token cost. Snapshot only
+  // runs for operations without a diff (e.g. replace_body).
+  if (result.success && result.diff) {
+    result.verified_state = {
+      message: "Patch applied. See `diff` above for the exact change.",
+      WARNING:
+        "PATCH ALREADY APPLIED — do NOT retry this patch and do NOT re-read " +
+        "the file to verify; the diff is authoritative. Only read again if " +
+        "you need context beyond the changed lines.",
+    };
+  } else if (result.success) {
+    let verifyLine = null;
+    let patchEnd = null;
+
+    if (result.patch_start_line != null) {
+      verifyLine = result.patch_start_line + 1;
+      patchEnd = (result.patch_end_line ?? result.patch_start_line) + 1;
+    } else if (result.lines_before != null) {
+      verifyLine = result.lines_before + 1;
+      patchEnd = (result.lines_after ?? result.lines_before) + 1;
+    } else if (result.insert_line != null) {
+      verifyLine = result.insert_line;
+      patchEnd = result.insert_line;
+    }
 
     if (verifyLine != null) {
       try {
         const verifyStart = Math.max(1, verifyLine - 2);
-        const rawVerifyEnd = (result.patch_end_line ?? result.lines_after ?? verifyLine) + 4;
+        const rawVerifyEnd = patchEnd + 4;
 
         // PT-3 FIX: Cap verification snippet at MAX_VERIFY_LINES (30).
         // Previously unbounded — replace_body on a 100-line function embedded

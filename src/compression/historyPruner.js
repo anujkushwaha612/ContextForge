@@ -45,6 +45,18 @@ const PRUNE_STUB =
   "Call contextforge_retrieve again if you need the current file state.]";
 
 /**
+ * HP-1 FIX: Match retrieve tool names in ALL their wire forms.
+ * Through Claude Code MCP the name arrives as
+ * "mcp__contextforge__contextforge_retrieve"; direct API clients send
+ * "contextforge_retrieve". The old exact-equality check matched only the
+ * bare form — the pruner NEVER fired in real MCP sessions (0 log lines in
+ * the S3-refactor session despite 4+ retrieves).
+ */
+function isRetrieveToolName(name) {
+  return typeof name === "string" && name.endsWith("contextforge_retrieve");
+}
+
+/**
  * Extract vault ID from a retrieve result message content.
  * Returns null if not a vault retrieve result.
  */
@@ -91,14 +103,59 @@ export function pruneStaleToolResults(payload) {
       Array.isArray(msg.content) &&
       msg.content.length > 0 &&
       msg.content.every((b) => b.type === "tool_result")
-    ) continue;
+    )
+      continue;
 
     lastUserIdx = i;
     break;
   }
 
-  // Nothing to prune if no user message found or it is the first message
-  if (lastUserIdx <= 0) return payload;
+  // HP-3 FIX: was `lastUserIdx <= 0`, which disabled the WHOLE pruner —
+  // including post-patch invalidation — for single-user-message sessions
+  // (i.e. every single-task agentic run). Only bail when there is no user
+  // message at all; with lastUserIdx === 0 the historical trigger simply
+  // never fires (nothing precedes the first message) but post-patch
+  // invalidation still works.
+  if (lastUserIdx < 0) return payload;
+
+  // ── Build maps for exact vault tracking ────────────────────────────────
+  const toolCallToFilePath = new Map();
+  const retrieveToolCallToVaultId = new Map();
+  const vaultToFilePath = new Map();
+  // HP-2 FIX: identify retrieve RESULTS via tool_call_id, not msg.name —
+  // some translation paths drop `name` on tool results entirely.
+  const retrieveCallIds = new Set();
+
+  for (const msg of payload.messages) {
+    if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        if (isRetrieveToolName(tc.function?.name)) retrieveCallIds.add(tc.id);
+        if (!tc.function?.arguments) continue;
+        try {
+          const args = JSON.parse(tc.function.arguments);
+          if (args.file_path) {
+            toolCallToFilePath.set(tc.id, args.file_path.replace(/\\/g, "/").toLowerCase());
+          }
+          if (isRetrieveToolName(tc.function.name) && args.vault_id) {
+            retrieveToolCallToVaultId.set(tc.id, args.vault_id);
+          }
+        } catch {}
+      }
+    } else if (msg.role === "tool" && msg.tool_call_id) {
+      const vaultId = extractVaultIdFromContent(typeof msg.content === "string" ? msg.content : "");
+      if (vaultId && toolCallToFilePath.has(msg.tool_call_id)) {
+        vaultToFilePath.set(vaultId, toolCallToFilePath.get(msg.tool_call_id));
+      }
+    }
+  }
+
+  /** A tool message is a retrieve result if its name matches OR its
+   *  tool_call_id maps back to a retrieve tool_call (HP-1 + HP-2). */
+  function isRetrieveResult(msg) {
+    if (msg.role !== "tool") return false;
+    if (isRetrieveToolName(msg.name)) return true;
+    return msg.tool_call_id ? retrieveCallIds.has(msg.tool_call_id) : false;
+  }
 
   // ── Build set of vault IDs that have been successfully patched ─────────
   // Used for post-patch invalidation within the current turn (after lastUserIdx).
@@ -123,28 +180,22 @@ export function pruneStaleToolResults(payload) {
   // actively using that content in the current hop.
   let mostRecentRetrieveIdx = -1;
   for (let i = payload.messages.length - 1; i >= 0; i--) {
-    if (
-      payload.messages[i].role === "tool" &&
-      payload.messages[i].name === "contextforge_retrieve"
-    ) {
+    if (isRetrieveResult(payload.messages[i])) {
       mostRecentRetrieveIdx = i;
       break;
     }
   }
 
   // ── Prune pass ────────────────────────────────────────────────────────
-  let prunedCount  = 0;
-  let charsSaved   = 0;
+  let prunedCount = 0;
+  let charsSaved = 0;
   const newMessages = [];
 
   for (let i = 0; i < payload.messages.length; i++) {
     const msg = payload.messages[i];
 
-    // Only target tool messages from contextforge_retrieve
-    if (
-      msg.role !== "tool" ||
-      msg.name !== "contextforge_retrieve"
-    ) {
+    // Only target tool messages from contextforge_retrieve (any wire form)
+    if (!isRetrieveResult(msg)) {
       newMessages.push(msg);
       continue;
     }
@@ -176,13 +227,10 @@ export function pruneStaleToolResults(payload) {
     // and the retrieve content mentions that file path, it is stale.
     let isPatchInvalidated = false;
     if (!isHistorical && patchedFiles.size > 0) {
-      const contentLower = msg.content.toLowerCase();
-      for (const filePath of patchedFiles) {
-        const basename = filePath.split("/").pop();
-        if (basename && contentLower.includes(basename)) {
-          isPatchInvalidated = true;
-          break;
-        }
+      const vaultId = retrieveToolCallToVaultId.get(msg.tool_call_id);
+      const vaultFilePath = vaultId ? vaultToFilePath.get(vaultId) : null;
+      if (vaultFilePath && patchedFiles.has(vaultFilePath)) {
+        isPatchInvalidated = true;
       }
     }
 
@@ -199,7 +247,7 @@ export function pruneStaleToolResults(payload) {
 
     newMessages.push({
       ...msg,
-      content:    PRUNE_STUB,
+      content: PRUNE_STUB,
       _cf_pruned: true,
     });
   }
@@ -207,7 +255,7 @@ export function pruneStaleToolResults(payload) {
   if (prunedCount > 0) {
     console.log(
       `[HistoryPruner] ✂️  Pruned ${prunedCount} stale retrieve result(s) — ` +
-      `saved ~${Math.floor(charsSaved / 4)} tokens`
+        `saved ~${Math.floor(charsSaved / 4)} tokens`
     );
     payload._cf_historyPrunedTokens = Math.floor(charsSaved / 4);
   }

@@ -41,6 +41,13 @@ const SKILLS_PHRASE = "The following skills are available for use with the Skill
 // SM-6 FIX: Removed "You may use native Read for initial file discovery."
 // SM-7 FIX: Added explicit 3-step mandatory workflow.
 // SM-8 FIX: Added Glob node_modules exclusion guidance.
+// SM-11 FIX (this pass): Guidance no longer claims Write is unavailable —
+//          server.js strips only Edit/Read/Update/NotebookEdit. Lying about
+//          tool availability teaches the model to distrust the guidance.
+// SM-12 FIX (this pass): F5 alignment — patch results carry an authoritative
+//          `diff`; the workflow now says NOT to re-read to verify. This is
+//          what converts the observed 3-6 verification round-trips per
+//          session into zero.
 const TOOL_GUIDANCE =
   process.env.CF_NUDGE_TOOLS === "1"
     ? `\n\n## ContextForge Mandatory Workflow
@@ -60,8 +67,14 @@ Do NOT use native Read — it is not available.
 
 **Step 3 — Surgical Edit**
 Call \`mcp__contextforge__contextforge_patch_ast\` to apply the change.
-- For CREATING new files → use \`mcp__contextforge__contextforge_patch_ast\` with operation='create_file' and new_body set to the full file content.
-Do NOT use native Edit or Write — they are not available.
+- For CREATING new files → use operation='create_file' with new_body set to the full file content.
+Do NOT use native Edit — it is not available.
+
+**Step 4 — Trust the result (do NOT re-read)**
+Every successful patch returns a \`diff\` field showing the exact change 
+applied to disk. The diff is authoritative. Do NOT call read_file_chunk 
+just to verify a patch — only read again if you need surrounding context 
+for a DIFFERENT edit.
 
 ## ContextForge Tool Reference
 
@@ -70,8 +83,10 @@ Do NOT use native Edit or Write — they are not available.
 | Find a function/class | \`mcp__contextforge__contextforge_query_graph\` (find_symbol) |
 | Find all callers | \`mcp__contextforge__contextforge_query_graph\` (analyze_impact) |
 | List file exports | \`mcp__contextforge__contextforge_query_graph\` (what_does_this_export) |
+| Find text/literals/env vars | \`mcp__contextforge__contextforge_query_graph\` (find) — results include the matching source line |
 | Read specific lines | \`mcp__contextforge__read_file_chunk\` |
 | Edit any file | \`mcp__contextforge__contextforge_patch_ast\` |
+| Create a new file | \`mcp__contextforge__contextforge_patch_ast\` (create_file) |
 | Retrieve compressed content | \`mcp__contextforge__contextforge_retrieve\` |
 
 ## Glob Rules (when you must use Glob)
@@ -82,20 +97,23 @@ Do NOT use native Edit or Write — they are not available.
     : "";
 
 // SM-9 FIX: Rewritten to teach correct workflow, not just warn.
+// SM-11: softened — in non-nudge mode native Edit IS available; the advice
+// is preference (CF patching survives compressed content), not a ban.
 const PATCH_GUIDANCE =
   process.env.CF_NUDGE_TOOLS !== "1"
-    ? `\n\n## ContextForge Edit Workflow (CRITICAL)
+    ? `\n\n## ContextForge Edit Workflow (recommended)
 
 The native Edit tool uses strict whitespace matching and will fail on 
-compressed file content. Always use this workflow instead:
+compressed file content ([CF_COMPRESSED_FILE] or [CF_VAULT:...]). 
+Preferred workflow:
 
 1. Find the symbol: \`mcp__contextforge__contextforge_query_graph\` (find_symbol)
 2. Read exact lines: \`mcp__contextforge__read_file_chunk\`  
-3. Apply the patch: \`mcp__contextforge__contextforge_patch_ast\`
+3. Apply the patch: \`mcp__contextforge__contextforge_patch_ast\` — its result 
+   includes an authoritative \`diff\`; no re-read needed to verify.
 
-Never call the native Edit tool. If you see compressed content 
-([CF_COMPRESSED_FILE] or [CF_VAULT:...]), retrieve the full source 
-first with \`mcp__contextforge__contextforge_retrieve\` before patching.`
+If you see compressed content, retrieve the full source first with 
+\`mcp__contextforge__contextforge_retrieve\` before using native Edit on it.`
     : "";
 
 const CF_RULE = CF_NOTICE + TOOL_GUIDANCE + PATCH_GUIDANCE;

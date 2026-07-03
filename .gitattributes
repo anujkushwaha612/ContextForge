@@ -1,0 +1,46 @@
+# ─────────────────────────────────────────────
+# Line-ending policy.
+#
+# CRITICAL for this repo: you develop on Windows (CRLF), but CI runs
+# scripts/*.sh on Linux runners — a shell script committed with CRLF
+# fails there with "\r: command not found". This file makes git
+# normalize endings so that can never happen.
+# ─────────────────────────────────────────────
+
+# Default: normalize to LF in the repo, checkout per-platform default
+* text=auto
+
+# Shell scripts MUST be LF everywhere (Linux CI + Git Bash)
+*.sh text eol=lf
+
+# Windows scripts stay CRLF
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Source & config: normalized (LF in repo)
+*.js text
+*.mjs text
+*.cjs text
+*.ts text
+*.json text
+*.toml text
+*.yml text
+*.yaml text
+*.md text
+*.cpp text
+*.h text
+*.c text
+*.gyp text
+
+# Binaries: never touch
+*.node binary
+*.onnx binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.lib binary
+*.pdb binary
+*.db binary
+*.png binary
+*.jpg binary

@@ -55,6 +55,32 @@
  *           where CHAT was a likely misclassification of a transition message
  *           in an active tool session. If any non-CHAT signals scored > 0,
  *           the highest non-CHAT intent is promoted rather than staying bypassed.
+ *
+ * Fixes applied (this pass — each verified by reproduction):
+ *   RQ-1: CHAT acknowledgment patterns ("thanks", "done", "ok") fired inside
+ *         REAL tasks: "now fix the broken auth, thanks" scored CHAT+1,
+ *         diluting confidence on an obvious DEBUG task. Ack patterns now
+ *         only score when the message is short (≤ 80 chars) — real
+ *         acknowledgments are short; embedded courtesy words in task
+ *         sentences are not acknowledgments.
+ *   RQ-2: DEBUG /\bnull\b|\bundefined\b/ fired on TARGETED EDITS:
+ *         "add a null check before this line" scored DEBUG=1, PATCH=0 →
+ *         classified DEBUG with confidence 1.0 (verified). Bare null/
+ *         undefined now require error context ("is null", "returns
+ *         undefined", "null pointer") — mention of the WORD isn't evidence
+ *         of a bug hunt.
+ *   RQ-3: SEARCH /\bwhere\b/ fired on relative clauses ("create a new file
+ *         where we store config"). Now requires interrogative form
+ *         ("where is/are/does/do/can/should").
+ *   RQ-4: Ties broke by Object-insertion order (PATCH before DEBUG) —
+ *         arbitrary. Ties now break toward the intent with the LARGER
+ *         capability set (DEBUG ⊃ SEARCH ⊃ PATCH ⊃ CHAT): when unsure,
+ *         over-provision tools rather than under-provision — a wrong
+ *         bypass costs a failed turn; a wrong extra tool costs a few
+ *         schema tokens.
+ *   RQ-5: "add ..." had NO pattern in any intent — "add a retry limit to
+ *         the upload route" scored zero everywhere → CHAT → bypassed with
+ *         no tools. \badd\b now scores PATCH (weight 2).
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +135,10 @@ const INTENT_PATTERNS = [
   { intent: "PATCH", weight: 2, regex: /\bwrap\b|\bsurround\b|\benclose\b/i },
   { intent: "PATCH", weight: 1, regex: /\bremove\b|\bdelete\b/i },
   { intent: "PATCH", weight: 1, regex: /\bclean up\b|\bimprove\b/i },
+  // RQ-5: "add X to Y" is the single most common edit instruction and had
+  // NO pattern anywhere — "add a retry limit to the upload route" scored 0
+  // in every intent → CHAT → bypassed with zero capabilities (verified).
+  { intent: "PATCH", weight: 2, regex: /\badd\b/i },
 
   // ── DEBUG signals (exploratory fixes — scope unknown) ────────────────────
   {
@@ -146,12 +176,22 @@ const INTENT_PATTERNS = [
   {
     intent: "DEBUG",
     weight: 1,
-    regex: /\bundefined\b|\bnull\b|\bintermittent\b/i,
+    // RQ-2: bare \bnull\b fired on "add a null check before this line" —
+    // a targeted PATCH — classifying it DEBUG at confidence 1.0. The WORD
+    // is not evidence of a bug; error CONTEXT is.
+    regex:
+      /\b(is|was|returns?|being|comes? back)\s+(null|undefined)\b|\bnull pointer\b|\bundefined is not\b|\bintermittent\b/i,
   },
   { intent: "DEBUG", weight: 1, regex: /make it better|make this better/i },
 
   // ── SEARCH signals ────────────────────────────────────────────────────────
-  { intent: "SEARCH", weight: 2, regex: /\bfind\b|\blocate\b|\bwhere\b/i },
+  // RQ-3: \bwhere\b alone fired on relative clauses ("create a file where we
+  // store config"). Interrogative form required.
+  {
+    intent: "SEARCH",
+    weight: 2,
+    regex: /\bfind\b|\blocate\b|\bwhere\s+(is|are|does|do|can|should|did)\b/i,
+  },
   { intent: "SEARCH", weight: 2, regex: /which file|show me|list all/i },
   { intent: "SEARCH", weight: 2, regex: /\bcall\b|\bdepend\b|\binternally\b/i },
   { intent: "SEARCH", weight: 1, regex: /\bsymbol\b|\broute\b|\bendpoint\b/i },
@@ -216,11 +256,15 @@ const INTENT_PATTERNS = [
     intent: "CHAT",
     weight: 1,
     regex: /\bok\b|\bthanks\b|\bthank you\b|\bgood job\b|\bdone\b|\bperfect\b/i,
+    // RQ-1: only score acknowledgments on SHORT messages — "now fix the
+    // broken auth, thanks" is a task with a courtesy word, not an ack.
+    maxLen: 80,
   },
   {
     intent: "CHAT",
     weight: 1,
     regex: /looks good|that works|exactly right|got it|never mind|try again|not quite/i,
+    maxLen: 80, // RQ-1: same reasoning
   },
 ];
 
@@ -264,14 +308,25 @@ function scoreIntents(message) {
     CHAT: [],
   };
 
-  for (const { intent, weight, regex } of INTENT_PATTERNS) {
+  for (const { intent, weight, regex, maxLen } of INTENT_PATTERNS) {
+    // RQ-1: patterns can declare a max message length — acknowledgment
+    // phrases only count on short messages.
+    if (maxLen && message.length > maxLen) continue;
     if (regex.test(message)) {
       scores[intent] += weight;
       matchedPatterns[intent].push(regex.source.slice(0, 60));
     }
   }
 
-  const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  // RQ-4: deterministic tie-break toward the BROADER capability set.
+  // Object-insertion order made PATCH beat DEBUG on equal scores — the
+  // narrow toolset won exactly when the classifier was least sure. When
+  // unsure, over-provision: a wrong bypass costs a failed turn; an extra
+  // tool schema costs a few tokens.
+  const TIE_PRIORITY = { DEBUG: 4, SEARCH: 3, CREATE: 2, PATCH: 1, CHAT: 0 };
+  const sorted = Object.entries(scores).sort(
+    (a, b) => b[1] - a[1] || TIE_PRIORITY[b[0]] - TIE_PRIORITY[a[0]]
+  );
   const [winnerIntent, winnerScore] = sorted[0];
   const runnerScore = sorted[1]?.[1] ?? 0;
 

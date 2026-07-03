@@ -36,13 +36,17 @@
 // ─────────────────────────────────────────────
 
 // Single-quoted string literals — same-quote open/close
-const SINGLE_QUOTE_PATTERN = /(?<![a-zA-Z])'([^'\n]{3,80})'/g;
+const SINGLE_QUOTE_PATTERN = /(?<![a-zA-Z])'((?:[^'\\\n]|\\.)*)'/g;
 
 // Double-quoted string literals — same-quote open/close
-const DOUBLE_QUOTE_PATTERN = /(?<![a-zA-Z])"([^"\n]{3,80})"/g;
+const DOUBLE_QUOTE_PATTERN = /(?<![a-zA-Z])"((?:[^"\\\n]|\\.)*)"/g;
 
 // process.env.XXX references
-const ENV_PATTERN = /process\.env\.([A-Z_][A-Z0-9_]*)/g;
+const ENV_PATTERNS = [
+  /process\.env\.([A-Z_][A-Z0-9_]*)/g,
+  /process\.env\[['"]([A-Z_][A-Z0-9_]*)['"]\]/g
+];
+const ENV_DESTRUCT_PATTERN = /const\s*\{\s*([^}]+)\s*\}\s*=\s*process\.env/g;
 
 // Patterns that indicate a string is "interesting" (not just punctuation/noise)
 const INTERESTING_STRING = /[a-z][a-z-]{2,}|[A-Z_]{3,}/;
@@ -131,7 +135,7 @@ function extractCallNames(bodyText, selfName, limit = 8) {
 // with fewer lines that still contains the target line is more specific.
 // ─────────────────────────────────────────────
 
-function findContainingFunction(line, nodes) {
+function findContainingFunction(line, nodes, filePath) {
   let best = null;
   let bestRange = Infinity;
 
@@ -141,7 +145,7 @@ function findContainingFunction(line, nodes) {
       const range = node.endLine - node.startLine;
       if (range < bestRange) {
         bestRange = range;
-        best = node.name;
+        best = `${filePath}:${node.startLine}:${node.name}`;
       }
     }
   }
@@ -176,7 +180,7 @@ function offsetToLine(offset, lineStarts) {
 // String literal extraction helper
 // ─────────────────────────────────────────────
 
-function extractStringLiterals(source, lineStarts, nodes, seenLiterals) {
+function extractStringLiterals(source, lineStarts, nodes, seenLiterals, filePath) {
   const literals = [];
 
   for (const pattern of [SINGLE_QUOTE_PATTERN, DOUBLE_QUOTE_PATTERN]) {
@@ -186,16 +190,17 @@ function extractStringLiterals(source, lineStarts, nodes, seenLiterals) {
     while ((match = pattern.exec(source)) !== null) {
       const value = match[1].trim();
 
+      if (value.length < 3 || value.length > 80) continue;
       if (!INTERESTING_STRING.test(value)) continue;
       if (SKIP_STRINGS.has(value)) continue;
       if (seenLiterals.has(value)) continue;
       if (value.includes("{") || value.includes("}")) continue;
-      if (value.startsWith("//") || value.startsWith("/*")) continue;
+      if (value.startsWith("/*")) continue;
 
       seenLiterals.add(value);
 
       const line = offsetToLine(match.index, lineStarts);
-      const containingFn = findContainingFunction(line, nodes);
+      const containingFn = findContainingFunction(line, nodes, filePath);
 
       literals.push({
         value,
@@ -227,33 +232,58 @@ export function extractLiterals(source, filePath, nodes = []) {
   const seenConfigs = new Set();
 
   // ── String literals ──
-  const literals = extractStringLiterals(source, lineStarts, nodes, seenLiterals).map((l) => ({
+  const literals = extractStringLiterals(source, lineStarts, nodes, seenLiterals, filePath).map((l) => ({
     ...l,
     filePath,
   }));
 
   // ── Environment variable references ──
   const configRefs = [];
-  ENV_PATTERN.lastIndex = 0;
+
+  for (const pattern of ENV_PATTERNS) {
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(source)) !== null) {
+      const key = match[1];
+      const rawText = match[0];
+
+      if (seenConfigs.has(key)) continue;
+      seenConfigs.add(key);
+
+      const line = offsetToLine(match.index, lineStarts);
+      const containingFn = findContainingFunction(line, nodes, filePath);
+
+      configRefs.push({
+        key,
+        rawText,
+        containingFn,
+        startLine: line,
+        filePath,
+      });
+    }
+  }
+
+  ENV_DESTRUCT_PATTERN.lastIndex = 0;
   let match;
-
-  while ((match = ENV_PATTERN.exec(source)) !== null) {
-    const key = match[1];
+  while ((match = ENV_DESTRUCT_PATTERN.exec(source)) !== null) {
     const rawText = match[0];
+    const keys = match[1].split(",").map(k => k.trim()).filter(k => /^[A-Z_][A-Z0-9_]*$/.test(k));
+    
+    for (const key of keys) {
+      if (seenConfigs.has(key)) continue;
+      seenConfigs.add(key);
 
-    if (seenConfigs.has(key)) continue;
-    seenConfigs.add(key);
+      const line = offsetToLine(match.index, lineStarts);
+      const containingFn = findContainingFunction(line, nodes, filePath);
 
-    const line = offsetToLine(match.index, lineStarts);
-    const containingFn = findContainingFunction(line, nodes);
-
-    configRefs.push({
-      key,
-      rawText,
-      containingFn,
-      startLine: line,
-      filePath,
-    });
+      configRefs.push({
+        key,
+        rawText,
+        containingFn,
+        startLine: line,
+        filePath,
+      });
+    }
   }
 
   return { literals, configRefs };
@@ -286,15 +316,17 @@ export function buildNodeSummaries(nodes, literals, configRefs, filePath) {
       continue;
     }
 
+    const nodeId = `${filePath}:${node.startLine}:${node.name}`;
+
     // Literals used inside this function
     const fnLiterals = literals
-      .filter((l) => l.containingFn === node.name)
+      .filter((l) => l.containingFn === nodeId)
       .map((l) => l.value)
       .slice(0, 10);
 
     // Env vars used inside this function
     const fnEnvRefs = configRefs
-      .filter((c) => c.containingFn === node.name)
+      .filter((c) => c.containingFn === nodeId)
       .map((c) => c.key)
       .slice(0, 10);
 
@@ -310,7 +342,7 @@ export function buildNodeSummaries(nodes, literals, configRefs, filePath) {
 
     summaries.push({
       // LE-4: stable ID matching buildRetrievalDocuments and queryNodeByStableId
-      nodeId: `${filePath}:${node.startLine}:${node.name}`,
+      nodeId,
       filePath,
       name: node.name,
       signature,
@@ -359,8 +391,10 @@ export function buildRetrievalDocument(node, literals, configRefs, filePath) {
     if (sig) lines.push(`Signature: ${sig.slice(0, 120)}`);
   }
 
+  const nodeId = `${filePath}:${node.startLine}:${node.name}`;
+
   // Env vars used in this function
-  const fnEnvRefs = configRefs.filter((c) => c.containingFn === node.name).map((c) => c.key);
+  const fnEnvRefs = configRefs.filter((c) => c.containingFn === nodeId).map((c) => c.key);
 
   if (fnEnvRefs.length > 0) {
     lines.push(`Environment: ${fnEnvRefs.join(", ")}`);
@@ -368,7 +402,7 @@ export function buildRetrievalDocument(node, literals, configRefs, filePath) {
 
   // String literals used in this function
   const fnLiterals = literals
-    .filter((l) => l.containingFn === node.name && l.kind !== "magic_number")
+    .filter((l) => l.containingFn === nodeId && l.kind !== "magic_number")
     .map((l) => l.value)
     .slice(0, 8);
 

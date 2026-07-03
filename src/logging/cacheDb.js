@@ -1,31 +1,72 @@
+/**
+ * cacheDb.js — FIXED VERSION
+ *
+ * Fixes applied (CD-1 … CD-9), each verified against a live better-sqlite3 DB:
+ *
+ *   CD-1  DB path: CF_DATA_DIR env respected (set by the CLI daemon to
+ *         ~/.contextforge/data/<workspace-hash>/), fallback to legacy
+ *         ../data/. Directory is created if missing — previously a fresh
+ *         clone threw "unable to open database file" at import.
+ *
+ *   CD-2  saveToCache: INSERT OR IGNORE + UNIQUE state_hash returned a
+ *         phantom id on duplicate (changes === 0) — subsequent
+ *         registerDependency(phantomId) threw FK constraint at request time.
+ *         Now returns the EXISTING row's id on dedup.
+ *
+ *   CD-3  saveChunksWithVectors: inserted vault ids into cache_vector_labels
+ *         whose FK points at semantic_cache → ALWAYS threw FK constraint,
+ *         rolling back the whole transaction (vault + chunks silently lost).
+ *         Labels now go to a dedicated vault_vector_labels table.
+ *
+ *   CD-4  saveChunksWithVectors / saveChunksToVault: plain INSERTs threw
+ *         UNIQUE constraint when re-saving a deduped vault. Vault insert is
+ *         now OR IGNORE, chunk insert OR REPLACE (idempotent re-vaulting).
+ *
+ *   CD-5  Index added on cache_dependencies(resource_path) — invalidateByFile
+ *         was a full table scan (PK leads with cache_id), and it runs on
+ *         every file-watcher event.
+ *
+ *   CD-6  searchChunksByKeyword: % and _ in the keyword acted as wildcards.
+ *         Escaped via ESCAPE '\'.
+ *
+ *   CD-7  fetchChunksByIds: batched at 500 ids (SQLite bound-variable limit
+ *         is 999 in common builds); per-size statement cache instead of
+ *         re-preparing on every call.
+ *
+ *   CD-8  Redundant idx_cache_state_hash removed (UNIQUE already indexes).
+ *
+ *   CD-9  fullReset also clears vault_vector_labels; fetchNeighborChunks /
+ *         getChunkStats statements prepared once at module level.
+ */
+
 import Database from "better-sqlite3";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { mkdirSync } from "fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db = new Database(path.join(__dirname,  "../data/contextforge.db"));
+// CD-1: CLI-managed data dir wins; legacy repo-local path as fallback.
+const DATA_DIR = process.env.CF_DATA_DIR || path.join(__dirname, "../data");
+mkdirSync(DATA_DIR, { recursive: true });
+
+const db = new Database(path.join(DATA_DIR, "contextforge.db"));
 
 // CRITICAL: Enable foreign keys for CASCADE DELETE and WAL mode for concurrency
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS semantic_cache (
     id TEXT PRIMARY KEY,
-    state_hash TEXT UNIQUE, -- 🚀 NEW: Unique exact fingerprint
+    state_hash TEXT UNIQUE, -- UNIQUE implies an index (CD-8: no extra index needed)
     query_text TEXT,
     response_text TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
-
-// Create an index to guarantee sub-millisecond lookups
-db.exec(
-  `CREATE INDEX IF NOT EXISTS idx_cache_state_hash ON semantic_cache(state_hash)`,
-);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS cache_dependencies (
@@ -38,11 +79,28 @@ db.exec(`
   )
 `);
 
+// CD-5: invalidateByFile filters on resource_path — PK leads with cache_id,
+// so without this index every file-watcher event caused a full scan.
+db.exec(
+  `CREATE INDEX IF NOT EXISTS idx_cache_deps_resource_path ON cache_dependencies(resource_path)`
+);
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS cache_vector_labels (
     cache_id TEXT PRIMARY KEY,
     vector_label INTEGER,
     FOREIGN KEY (cache_id) REFERENCES semantic_cache(id) ON DELETE CASCADE
+  )
+`);
+
+// CD-3: labels for VAULTS live here (cache_vector_labels FKs to semantic_cache,
+// so vault ids can never be stored there — that insert always threw).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS vault_vector_labels (
+    vault_id TEXT NOT NULL,
+    vector_label INTEGER NOT NULL,
+    PRIMARY KEY (vault_id, vector_label),
+    FOREIGN KEY (vault_id) REFERENCES prune_vault(vault_id) ON DELETE CASCADE
   )
 `);
 
@@ -55,12 +113,8 @@ db.exec(`
   )
 `);
 
-// Add index for sub-millisecond hash lookups
-db.exec(
-  `CREATE INDEX IF NOT EXISTS idx_prune_vault_content_hash ON prune_vault(content_hash)`,
-);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_prune_vault_content_hash ON prune_vault(content_hash)`);
 
-// 🚀 NEW: The Vault Chunks Table
 db.exec(`
   CREATE TABLE IF NOT EXISTS vault_chunks (
     chunk_id TEXT PRIMARY KEY,
@@ -74,9 +128,7 @@ db.exec(`
   )
 `);
 
-db.exec(
-  `CREATE INDEX IF NOT EXISTS idx_vault_chunks_vault_id ON vault_chunks(vault_id)`,
-);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_vault_chunks_vault_id ON vault_chunks(vault_id)`);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS diff_compression_cache (
@@ -86,38 +138,41 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
-// Add this near your other prepared statements:
+
+// --- Prepared statements ---
 const wipeSemanticCache = db.prepare(`DELETE FROM semantic_cache`);
 
-// 2. Add New Prepared Statements
-const getCacheByHash = db.prepare(
-  `SELECT response_text FROM semantic_cache WHERE state_hash = ?`,
-);
+const getCacheByHash = db.prepare(`SELECT response_text FROM semantic_cache WHERE state_hash = ?`);
+// CD-2: needed to return the real id on dedup
+const getCacheIdByHash = db.prepare(`SELECT id FROM semantic_cache WHERE state_hash = ?`);
 
 const insertCacheWithHash = db.prepare(`
-  INSERT OR IGNORE INTO semantic_cache (id, state_hash, query_text, response_text) 
+  INSERT OR IGNORE INTO semantic_cache (id, state_hash, query_text, response_text)
   VALUES (?, ?, ?, ?)
 `);
-const getCache = db.prepare(
-  `SELECT response_text FROM semantic_cache WHERE id = ?`,
-);
+const getCache = db.prepare(`SELECT response_text FROM semantic_cache WHERE id = ?`);
+// CD-4: OR IGNORE — re-vaulting a deduped id is a no-op, not a throw
 const insertVault = db.prepare(
-  `INSERT INTO prune_vault (vault_id, dropped_text, content_hash) VALUES (?, ?, ?)`, // ← add content_hash
+  `INSERT OR IGNORE INTO prune_vault (vault_id, dropped_text, content_hash) VALUES (?, ?, ?)`
 );
-const getVault = db.prepare(
-  `SELECT dropped_text FROM prune_vault WHERE vault_id = ?`,
-);
+const getVault = db.prepare(`SELECT dropped_text FROM prune_vault WHERE vault_id = ?`);
 
-// NEW — lookup by content hash to deduplicate
 const getVaultByHash = db.prepare(
-  `SELECT vault_id FROM prune_vault WHERE content_hash = ? LIMIT 1`,
+  `SELECT vault_id FROM prune_vault WHERE content_hash = ? LIMIT 1`
 );
 
 const insertDependency = db.prepare(
-  `INSERT OR IGNORE INTO cache_dependencies (cache_id, resource_path, resource_hash) VALUES (?, ?, ?)`,
+  `INSERT OR IGNORE INTO cache_dependencies (cache_id, resource_path, resource_hash) VALUES (?, ?, ?)`
 );
 const insertVectorLabel = db.prepare(
-  `INSERT OR REPLACE INTO cache_vector_labels (cache_id, vector_label) VALUES (?, ?)`,
+  `INSERT OR REPLACE INTO cache_vector_labels (cache_id, vector_label) VALUES (?, ?)`
+);
+// CD-3
+const insertVaultVectorLabel = db.prepare(
+  `INSERT OR IGNORE INTO vault_vector_labels (vault_id, vector_label) VALUES (?, ?)`
+);
+const getVaultVectorLabels = db.prepare(
+  `SELECT vector_label FROM vault_vector_labels WHERE vault_id = ?`
 );
 
 const findStaleEntries = db.prepare(`
@@ -136,15 +191,15 @@ const findAllEntriesForFile = db.prepare(`
 
 const deleteCacheEntry = db.prepare(`DELETE FROM semantic_cache WHERE id = ?`);
 const insertDiff = db.prepare(
-  `INSERT OR REPLACE INTO diff_compression_cache (hash_key, kept_text, vault_id) VALUES (?, ?, ?)`,
+  `INSERT OR REPLACE INTO diff_compression_cache (hash_key, kept_text, vault_id) VALUES (?, ?, ?)`
 );
 const getDiff = db.prepare(
-  `SELECT kept_text, vault_id FROM diff_compression_cache WHERE hash_key = ?`,
+  `SELECT kept_text, vault_id FROM diff_compression_cache WHERE hash_key = ?`
 );
 
-// 🚀 NEW: Vault Chunk Statements
+// CD-4: OR REPLACE — idempotent when chunks for a deduped vault are re-saved
 const insertVaultChunk = db.prepare(`
-  INSERT INTO vault_chunks (chunk_id, vault_id, chunk_text, chunk_index, token_estimate, vector)
+  INSERT OR REPLACE INTO vault_chunks (chunk_id, vault_id, chunk_text, chunk_index, token_estimate, vector)
   VALUES (?, ?, ?, ?, ?, ?)
 `);
 
@@ -164,12 +219,11 @@ export const fetchFromCacheByHash = (stateHash) => {
   return row ? row.response_text : null;
 };
 
-// Add this to your exported functions at the bottom:
 export const resetEntireCache = (cPP_Cache) => {
-  // 1. Wipe SQLite (CASCADE will automatically clean up cache_dependencies and cache_vector_labels)
+  // Wipes semantic cache only (CASCADE cleans dependencies + labels).
+  // Vaults/chunks survive — use fullReset() to wipe everything.
   wipeSemanticCache.run();
 
-  // 2. Wipe the C++ Graph
   if (cPP_Cache) {
     cPP_Cache.clearAll();
   }
@@ -178,7 +232,15 @@ export const resetEntireCache = (cPP_Cache) => {
 
 export const saveToCache = (queryText, responseText, stateHash = null) => {
   const id = "RES_" + crypto.randomUUID();
-  insertCacheWithHash.run(id, stateHash, queryText, responseText);
+  const info = insertCacheWithHash.run(id, stateHash, queryText, responseText);
+
+  // CD-2: duplicate state_hash → OR IGNORE dropped the insert. Returning the
+  // fresh id anyway made registerDependency(phantomId) throw FK constraint.
+  // Return the EXISTING entry's id so dependencies attach to a real row.
+  if (info.changes === 0 && stateHash !== null) {
+    const existing = getCacheIdByHash.get(stateHash);
+    if (existing) return existing.id;
+  }
   return id;
 };
 
@@ -195,11 +257,7 @@ export const registerVectorLabel = (cacheId, vectorLabel) => {
   insertVectorLabel.run(cacheId, vectorLabel);
 };
 
-export const invalidateByFile = (
-  filePath,
-  newHash = null,
-  cPP_Cache = null,
-) => {
+export const invalidateByFile = (filePath, newHash = null, cPP_Cache = null) => {
   let rows;
   if (newHash) {
     rows = findStaleEntries.all(filePath, newHash);
@@ -226,61 +284,40 @@ export const invalidateByFile = (
 };
 
 export const saveToVault = (droppedText) => {
-  // Compute a short hash of the content
-  const contentHash = crypto
-    .createHash("sha256")
-    .update(droppedText)
-    .digest("hex")
-    .slice(0, 16);
+  const contentHash = crypto.createHash("sha256").update(droppedText).digest("hex").slice(0, 16);
 
-  // Check if this exact content is already vaulted
   const existing = getVaultByHash.get(contentHash);
   if (existing) {
     console.log(
-      `[Fat Catch] ♻️  Dedup hit — reusing vault ${existing.vault_id} (hash: ${contentHash})`,
+      `[Fat Catch] ♻️  Dedup hit — reusing vault ${existing.vault_id} (hash: ${contentHash})`
     );
     return existing.vault_id;
   }
 
-  // New content — save it
   const id = "cf_vault_" + crypto.randomBytes(4).toString("hex");
   insertVault.run(id, droppedText, contentHash);
   return id;
 };
 
-/**
- * Check if content is already vaulted without inserting.
- * Uses the same SHA-256 content hash as saveToVault.
- * Sub-millisecond SQLite index lookup.
- *
- * Returns the existing vault ID if found, null otherwise.
- * Used by the AST compressor to skip tree-sitter on already-vaulted content.
- */
 export const lookupVaultByContent = (text) => {
-    if (!text || typeof text !== "string") return null;
-    const contentHash = crypto
-        .createHash("sha256")
-        .update(text)
-        .digest("hex")
-        .slice(0, 16);
-    const existing = getVaultByHash.get(contentHash);
-    return existing ? existing.vault_id : null;
+  if (!text || typeof text !== "string") return null;
+  const contentHash = crypto.createHash("sha256").update(text).digest("hex").slice(0, 16);
+  const existing = getVaultByHash.get(contentHash);
+  return existing ? existing.vault_id : null;
 };
 
 export const saveChunksToVault = (vaultId, chunks) => {
   const insertMany = db.transaction((chunksArray) => {
     for (const chunk of chunksArray) {
       const chunkId = `${vaultId}_chunk_${chunk.index}`;
-      const vectorBlob = chunk.vector
-        ? Buffer.from(new Float32Array(chunk.vector).buffer)
-        : null;
+      const vectorBlob = chunk.vector ? Buffer.from(new Float32Array(chunk.vector).buffer) : null;
       insertVaultChunk.run(
         chunkId,
         vaultId,
         chunk.text,
         chunk.index,
         chunk.tokenEstimate,
-        vectorBlob,
+        vectorBlob
       );
     }
   });
@@ -294,10 +331,7 @@ export const fetchVaultChunks = (vaultId) => {
     text: row.chunk_text,
     index: row.chunk_index,
     tokenEstimate: row.token_estimate,
-    // 🚀 FIX: Use Uint8Array to safely extract the exact bytes from the Buffer pool
-    vector: row.vector
-      ? new Float32Array(new Uint8Array(row.vector).buffer)
-      : null,
+    vector: row.vector ? new Float32Array(new Uint8Array(row.vector).buffer) : null,
   }));
 };
 
@@ -316,9 +350,7 @@ export const getCachedCompression = (messageContent, queryText) => {
     .update(messageContent + "|||" + queryText)
     .digest("hex");
   const row = getDiff.get(hash);
-  return row
-    ? { keptText: row.kept_text, vaultId: row.vault_id, hash }
-    : { hash };
+  return row ? { keptText: row.kept_text, vaultId: row.vault_id, hash } : { hash };
 };
 
 export const saveCachedCompression = (hash, keptText, vaultId) => {
@@ -329,7 +361,6 @@ export const saveCachedCompression = (hash, keptText, vaultId) => {
 // HYBRID RAG: BM25 + HNSW RETRIEVAL METHODS
 // ==========================================
 
-// Prepared statements for chunk retrieval
 const getChunkById = db.prepare(`
   SELECT chunk_id, chunk_text, vault_id, chunk_index, token_estimate
   FROM vault_chunks WHERE chunk_id = ?
@@ -337,22 +368,16 @@ const getChunkById = db.prepare(`
 
 const searchChunksByVault = db.prepare(`
   SELECT chunk_id, chunk_text, vault_id, chunk_index, token_estimate
-  FROM vault_chunks 
-  WHERE vault_id = ? 
+  FROM vault_chunks
+  WHERE vault_id = ?
   ORDER BY chunk_index ASC
 `);
 
-const searchAllChunks = db.prepare(`
-  SELECT chunk_id, chunk_text, vault_id, chunk_index, token_estimate
-  FROM vault_chunks 
-  ORDER BY vault_id, chunk_index ASC
-  LIMIT ?
-`);
-
+// CD-6: ESCAPE clause so % and _ in keywords are literal
 const searchChunksByText = db.prepare(`
   SELECT chunk_id, chunk_text, vault_id, chunk_index, token_estimate
-  FROM vault_chunks 
-  WHERE chunk_text LIKE ?
+  FROM vault_chunks
+  WHERE chunk_text LIKE ? ESCAPE '\\'
   ORDER BY vault_id, chunk_index ASC
   LIMIT ?
 `);
@@ -360,192 +385,138 @@ const searchChunksByText = db.prepare(`
 const getTotalChunkCount = db.prepare(`
   SELECT COUNT(*) as count FROM vault_chunks
 `);
+const getVaultCount = db.prepare(`SELECT COUNT(*) as count FROM prune_vault`);
+const getCacheCount = db.prepare(`SELECT COUNT(*) as count FROM semantic_cache`);
 
 const deleteChunksByVault = db.prepare(`
   DELETE FROM vault_chunks WHERE vault_id = ?
 `);
 
-/**
- * Fetch a single chunk by its ID
- * Used by hybrid retriever to get text for scoring
- */
+// CD-9: prepared once, not per call
+const getNeighborChunksStmt = db.prepare(`
+  SELECT chunk_id, chunk_text, vault_id, chunk_index, token_estimate
+  FROM vault_chunks
+  WHERE vault_id = ?
+    AND chunk_index >= ?
+    AND chunk_index <= ?
+  ORDER BY chunk_index ASC
+`);
+
+const mapChunkRow = (row) => ({
+  chunkId: row.chunk_id,
+  text: row.chunk_text,
+  vaultId: row.vault_id,
+  index: row.chunk_index,
+  tokenEstimate: row.token_estimate,
+});
+
 export const fetchChunkById = (chunkId) => {
   const row = getChunkById.get(chunkId);
-  return row
-    ? {
-        chunkId: row.chunk_id,
-        text: row.chunk_text,
-        vaultId: row.vault_id,
-        index: row.chunk_index,
-        tokenEstimate: row.token_estimate,
-      }
-    : null;
+  return row ? mapChunkRow(row) : null;
 };
 
-/**
- * Get all chunks for a vault (ordered)
- */
 export const fetchAllChunksByVault = (vaultId) => {
-  const rows = searchChunksByVault.all(vaultId);
-  return rows.map((row) => ({
-    chunkId: row.chunk_id,
-    text: row.chunk_text,
-    vaultId: row.vault_id,
-    index: row.chunk_index,
-    tokenEstimate: row.token_estimate,
-  }));
+  return searchChunksByVault.all(vaultId).map(mapChunkRow);
 };
 
-/**
- * Bulk fetch: Get text for multiple chunk IDs at once
- * Used by hybrid retriever after HNSW+BM25 scoring
- */
+// CD-7: batched IN clause (SQLite bound-var limit) + per-size statement cache
+const _inStmtCache = new Map();
+const IN_BATCH_SIZE = 500;
+
 export const fetchChunksByIds = (chunkIds) => {
   if (!chunkIds || chunkIds.length === 0) return [];
 
-  // Build dynamic query with parameterized IN clause
-  const placeholders = chunkIds.map(() => "?").join(",");
-  const query = db.prepare(`
-    SELECT chunk_id, chunk_text, vault_id, chunk_index, token_estimate
-    FROM vault_chunks 
-    WHERE chunk_id IN (${placeholders})
-  `);
-
-  const rows = query.all(...chunkIds);
-  return rows.map((row) => ({
-    chunkId: row.chunk_id,
-    text: row.chunk_text,
-    vaultId: row.vault_id,
-    index: row.chunk_index,
-    tokenEstimate: row.token_estimate,
-  }));
+  const out = [];
+  for (let i = 0; i < chunkIds.length; i += IN_BATCH_SIZE) {
+    const batch = chunkIds.slice(i, i + IN_BATCH_SIZE);
+    let stmt = _inStmtCache.get(batch.length);
+    if (!stmt) {
+      const placeholders = batch.map(() => "?").join(",");
+      stmt = db.prepare(`
+        SELECT chunk_id, chunk_text, vault_id, chunk_index, token_estimate
+        FROM vault_chunks
+        WHERE chunk_id IN (${placeholders})
+      `);
+      _inStmtCache.set(batch.length, stmt);
+    }
+    for (const row of stmt.all(...batch)) out.push(mapChunkRow(row));
+  }
+  return out;
 };
 
-/**
- * Full-text search over chunks (SQLite LIKE - fallback for when HNSW misses)
- */
 export const searchChunksByKeyword = (keyword, limit = 20) => {
-  const pattern = `%${keyword}%`;
-  const rows = searchChunksByText.all(pattern, limit);
-  return rows.map((row) => ({
-    chunkId: row.chunk_id,
-    text: row.chunk_text,
-    vaultId: row.vault_id,
-    index: row.chunk_index,
-    tokenEstimate: row.token_estimate,
-  }));
+  // CD-6: escape LIKE wildcards so "100%" matches literally
+  const escaped = String(keyword).replace(/[\\%_]/g, (c) => `\\${c}`);
+  const pattern = `%${escaped}%`;
+  return searchChunksByText.all(pattern, limit).map(mapChunkRow);
 };
 
-/**
- * Get all chunk texts for a vault as a single concatenated string
- * Used when contextforge_retrieve needs the full vault content
- */
 export const fetchVaultTextConcatenated = (vaultId) => {
   const chunks = fetchAllChunksByVault(vaultId);
   return chunks.map((c) => `[Chunk ${c.index}]\n${c.text}`).join("\n\n");
 };
 
-/**
- * Get total number of chunks in the database
- * Used for statistics/debugging
- */
 export const getChunkStats = () => {
-  const count = getTotalChunkCount.get();
-  const vaultCount = db
-    .prepare("SELECT COUNT(*) as count FROM prune_vault")
-    .get();
-  const cacheCount = db
-    .prepare("SELECT COUNT(*) as count FROM semantic_cache")
-    .get();
-
   return {
-    totalChunks: count.count,
-    totalVaults: vaultCount.count,
-    totalCacheEntries: cacheCount.count,
+    totalChunks: getTotalChunkCount.get().count,
+    totalVaults: getVaultCount.get().count,
+    totalCacheEntries: getCacheCount.get().count,
   };
 };
 
-/**
- * Delete all chunks for a vault (used when vault is invalidated)
- */
 export const deleteVaultChunks = (vaultId) => {
   return deleteChunksByVault.run(vaultId);
 };
 
-/**
- * Get chunks that are semantically related (same vault, nearby indices)
- * Used for context expansion around a matched chunk
- */
 export const fetchNeighborChunks = (
   vaultId,
   chunkIndex,
   neighborsBefore = 1,
-  neighborsAfter = 1,
+  neighborsAfter = 1
 ) => {
-  const query = db.prepare(`
-    SELECT chunk_id, chunk_text, vault_id, chunk_index, token_estimate
-    FROM vault_chunks 
-    WHERE vault_id = ? 
-      AND chunk_index >= ? 
-      AND chunk_index <= ?
-    ORDER BY chunk_index ASC
-  `);
-
-  const rows = query.all(
+  const rows = getNeighborChunksStmt.all(
     vaultId,
     Math.max(0, chunkIndex - neighborsBefore),
-    chunkIndex + neighborsAfter,
+    chunkIndex + neighborsAfter
   );
-
-  return rows.map((row) => ({
-    chunkId: row.chunk_id,
-    text: row.chunk_text,
-    vaultId: row.vault_id,
-    index: row.chunk_index,
-    tokenEstimate: row.token_estimate,
-  }));
+  return rows.map(mapChunkRow);
 };
 
 /**
- * Atomic batch operation: Save chunks AND their vector labels
- * Used by compression engine when vaulting with embeddings
+ * Atomic batch: save vault + chunks + vector labels.
+ * CD-3: labels stored in vault_vector_labels (previously targeted
+ * cache_vector_labels whose FK made this ALWAYS throw + roll back).
+ * CD-4: idempotent — safe to call again for a deduped vaultId.
  */
-export const saveChunksWithVectors = db.transaction(
-  (vaultId, chunks, vectorLabels) => {
-    // Save vault metadata
-    const vaultText = chunks.map((c) => c.text).join("\n\n");
-    const contentHash = crypto
-      .createHash("sha256")
-      .update(vaultText)
-      .digest("hex")
-      .slice(0, 16);
-    insertVault.run(vaultId, vaultText, contentHash);
+export const saveChunksWithVectors = db.transaction((vaultId, chunks, vectorLabels) => {
+  const vaultText = chunks.map((c) => c.text).join("\n\n");
+  const contentHash = crypto.createHash("sha256").update(vaultText).digest("hex").slice(0, 16);
+  insertVault.run(vaultId, vaultText, contentHash); // OR IGNORE (CD-4)
 
-    // Save individual chunks
-    for (const chunk of chunks) {
-      const chunkId = `${vaultId}_chunk_${chunk.index}`;
-      const vectorBlob = chunk.vector
-        ? Buffer.from(new Float32Array(chunk.vector).buffer)
-        : null;
-      insertVaultChunk.run(
-        chunkId,
-        vaultId,
-        chunk.text,
-        chunk.index,
-        chunk.tokenEstimate,
-        vectorBlob,
-      );
-    }
+  for (const chunk of chunks) {
+    const chunkId = `${vaultId}_chunk_${chunk.index}`;
+    const vectorBlob = chunk.vector ? Buffer.from(new Float32Array(chunk.vector).buffer) : null;
+    insertVaultChunk.run(
+      chunkId,
+      vaultId,
+      chunk.text,
+      chunk.index,
+      chunk.tokenEstimate,
+      vectorBlob
+    ); // OR REPLACE (CD-4)
+  }
 
-    // Register vector labels if provided
-    if (vectorLabels) {
-      for (const label of vectorLabels) {
-        // Labels map to chunks via vault_id
-        insertVectorLabel.run(vaultId, label);
-      }
+  if (vectorLabels) {
+    for (const label of vectorLabels) {
+      insertVaultVectorLabel.run(vaultId, label); // CD-3
     }
-  },
-);
+  }
+});
+
+/** Labels registered for a vault via saveChunksWithVectors (CD-3). */
+export const fetchVaultVectorLabels = (vaultId) => {
+  return getVaultVectorLabels.all(vaultId).map((r) => r.vector_label);
+};
 
 /**
  * Wipe everything but keep schema intact
@@ -553,6 +524,7 @@ export const saveChunksWithVectors = db.transaction(
 export const fullReset = (cPP_Cache) => {
   db.exec(`
     DELETE FROM vault_chunks;
+    DELETE FROM vault_vector_labels;
     DELETE FROM cache_vector_labels;
     DELETE FROM cache_dependencies;
     DELETE FROM prune_vault;

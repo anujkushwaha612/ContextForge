@@ -23,6 +23,21 @@
  *         destructures. Previously both were undefined causing null in LLM response.
  *
  *   RP-7: Removed misleading "parallel" comment — execution is sequential by design.
+ *
+ * Fixes applied (this pass):
+ *   RP-8: buildAnswer picked allItems[0] — INSERTION order (graph tier
+ *         first), not best score. A weak fuzzy graph hit (score 0.35)
+ *         outranked a strong semantic hit (0.9) purely because the graph
+ *         tier ran first. Primary is now selected by per-item score
+ *         (_score from resolver / _semanticScore from embeddings),
+ *         falling back to tier confidence.
+ *   RP-9: context_chunk items had no `type` field — buildAnswer's
+ *         next_step produced null and extractSymbols/extractFiles saw
+ *         malformed items. Now typed "context_chunk" with a next_step.
+ *   RP-10: gatherFunctionBodies read bodies for the first 3 symbols in
+ *         INSERTION order — now prefers symbols whose name matches the
+ *         query (exact, then prefix/substring) so the body budget goes to
+ *         what was actually asked about.
  */
 
 import fs from "node:fs";
@@ -124,14 +139,23 @@ function buildAnswer(evidence, confidence) {
   const allItems = [];
   for (const e of evidence) {
     for (const item of e.items) {
-      allItems.push({ ...item, _source: e.source });
+      // RP-8: carry a comparable score — per-item where available
+      // (_score from resolver sort survives? no — resolver strips it;
+      // _semanticScore survives), else the tier's confidence.
+      const itemScore =
+        item._semanticScore ?? item._score ?? e.confidence ?? 0;
+      allItems.push({ ...item, _source: e.source, _rankScore: itemScore });
     }
   }
 
   if (allItems.length === 0) return null;
 
-  // Primary result: highest-scored item (first after resolver's sort)
-  const primary = allItems[0];
+  // RP-8: pick primary by score, not insertion order. Stable for ties
+  // (earlier tiers win ties, preserving graph-first preference).
+  let primary = allItems[0];
+  for (const item of allItems) {
+    if (item._rankScore > primary._rankScore) primary = item;
+  }
 
   return {
     primary,
@@ -142,7 +166,9 @@ function buildAnswer(evidence, confidence) {
       ? `Call read_function('${primary.name}') to get the full implementation.`
       : primary.type === "route"
         ? `Use find_route('${primary.route}') for more detail or read_file_chunk on '${primary.file}'.`
-        : null,
+        : primary.type === "context_chunk"
+          ? `Context from '${primary.file}' starting line ${primary.startLine} is included above.`
+          : null,
   };
 }
 
@@ -177,8 +203,21 @@ async function gatherFunctionBodies(query, existingEvidence) {
   const symbols = extractSymbols(existingEvidence);
   if (symbols.length === 0) return null;
 
+  // RP-10: spend the 3-body budget on symbols matching the QUERY first,
+  // not on whichever happened to be inserted earliest. Exact name match
+  // ranks above prefix/substring, which ranks above unrelated.
+  const q = String(query).toLowerCase();
+  const rank = (s) => {
+    const n = (s.name || "").toLowerCase();
+    if (n === q) return 0;
+    if (n.startsWith(q) || q.startsWith(n)) return 1;
+    if (n.includes(q) || q.includes(n)) return 2;
+    return 3;
+  };
+  const ordered = [...symbols].sort((a, b) => rank(a) - rank(b));
+
   const bodies = [];
-  for (const sym of symbols.slice(0, 3)) {
+  for (const sym of ordered.slice(0, 3)) {
     const body = readFunctionBody(sym);
     if (body) bodies.push(body);
   }
@@ -272,12 +311,14 @@ async function gatherContextChunks(query, existingEvidence) {
       const start = Math.max(0, targetSym.startLine - 20);
       const end   = Math.min(lines.length, targetSym.startLine + 40);
       chunks.push({
+        type:      "context_chunk", // RP-9: was untyped — broke buildAnswer/next_step
         file:      targetFile,
         content:   lines.slice(start, end).join("\n"),
         startLine: start + 1,
       });
     } else {
       chunks.push({
+        type:      "context_chunk", // RP-9
         file:      targetFile,
         content:   lines.slice(0, 80).join("\n"),
         startLine: 1,

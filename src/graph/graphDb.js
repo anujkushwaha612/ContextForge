@@ -1,48 +1,112 @@
 /**
- * graphDb.js
+ * graphDb.js — FIXED VERSION
  *
- * SQLite graph database for the ContextForge workspace index.
+ * Previous fixes kept: GD-1 (migrations), GD-3 (nodeId format),
+ * GD-4 (edgeId includes source_line), GD-5 (no body_text in find_symbol).
  *
- * Fixes applied:
- *   GD-1: Migrations array cleaned up — removed tables already in main schema.
- *         Only the ALTER TABLE for source_line remains as a true migration.
+ * New fixes (GB-1 … GB-7), each reproduced against a live DB first:
  *
- *   GD-3: nodeId format unified to "filePath:startLine:name" everywhere.
- *         Was using "fileId:name:startLine" (SHA-256 hash) in writeFileGraph
- *         but "filePath:startLine:name" in buildNodeSummaries and stableIds.
- *         Foreign key constraint on summaries.node_id was violated on every
- *         summary insert because the formats did not match.
+ *   GB-1  WRITE/READ PATH ASYMMETRY (critical). Read queries normalize paths
+ *         (backslashes→/, lowercase) but writeFileGraph stored them RAW.
+ *         Any path containing an uppercase character made these return
+ *         nothing: whatDoesThisExport, whatDoesThisImport, whoDependsOnFile,
+ *         getFileRecord, queryNodeByStableId (→ HNSW stableId resolution
+ *         dead), findLiteralsByFn/findConfigByFn. Verified: indexed
+ *         "src/Controllers/UserAuth.js" → export query returned 0 rows,
+ *         stableId lookup NOT FOUND. Fix: one canonicalPath() applied at
+ *         EVERY write and EVERY read.
+ *         ⚠ nodeIds/stableIds are derived from the normalized path now —
+ *         existing graph.db + HNSW symbol embeddings must be reindexed once
+ *         (cf graph reindex / indexWorkspace force:true).
  *
- *   GD-4: edgeId hash now includes source_line so two route edges at
- *         different line numbers in the same file are not collapsed into one.
+ *   GB-2  FK ROLLBACK LOSES WHOLE FILE (critical). literals/config_refs FK
+ *         on files(file_path) used lit.filePath as passed by the extractor —
+ *         any mismatch with the file row (case, slashes) threw FK constraint
+ *         inside the transaction, rolling back nodes+edges+everything for
+ *         that file. Verified. Fix: literals/config always use the file's
+ *         own canonical path; extractor-provided per-row paths ignored.
  *
- *   GD-5: findSymbol and findSymbolFuzzy no longer fetch body_text —
- *         find_symbol responses no longer include body (graphTools.js fix).
- *         body_text still fetched by getNodeByFileAndLine for stableId lookup.
+ *   GB-3  LIKE WILDCARD INJECTION. findSymbolFuzzy("do_work") matched
+ *         "doXwork" ('_' = any char); findLiteral("100_") matched "100%".
+ *         Model-generated queries contain _ and % constantly. Fix: escape
+ *         % _ \ and add ESCAPE '\' in fuzzy/literal/config/route LIKEs.
+ *
+ *   GB-4  MISSING INDEXES on hot paths (verified via EXPLAIN QUERY PLAN):
+ *         - nodes(file_path, start_line)  → getNodeByFileAndLine was SCAN
+ *           (runs on every stableId resolution during retrieval)
+ *         - summaries(file_path), config_refs(file_path) → per-file deletes
+ *           were SCANs (run on every reindex of every file)
+ *         - edges(target_file) → whoDependsOnFile was SCAN
+ *
+ *   GB-5  upsertFile OR REPLACE → ON CONFLICT DO UPDATE. REPLACE is
+ *         DELETE+INSERT: the delete CASCADE-dropped the file's nodes and
+ *         edges mid-transaction before they were re-inserted — harmless
+ *         today only because everything is re-inserted afterwards, but a
+ *         needless full churn of every row on every file save, and a trap
+ *         if insert order ever changes.
+ *
+ *   GB-6  DB path: CF_DATA_DIR respected (CLI sets it per-workspace),
+ *         directory created if missing (fresh clone previously threw
+ *         "unable to open database file"). Matches cacheDb CD-1.
+ *
+ *   GB-7  getGraphDb(dbPath) silently ignored dbPath when a connection
+ *         already existed — now throws if a DIFFERENT path is requested,
+ *         instead of silently returning the wrong database.
  */
 
 import Database from "better-sqlite3";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { mkdirSync } from "node:fs";
 
-let _db    = null;
+let _db = null;
+let _dbPath = null;
 let _stmts = null;
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
+const __dirname = path.dirname(__filename);
 
 let _workspaceRoot = null;
-export function setWorkspaceRoot(root) { _workspaceRoot = root; }
+export function setWorkspaceRoot(root) {
+  _workspaceRoot = root;
+}
 export function getWorkspaceRoot() {
   return _workspaceRoot || process.env.CF_WORKSPACE_PATH || process.cwd();
 }
 
-export function getGraphDb(dbPath = null) {
-  if (_db) return _db;
+// GB-1: THE canonical path form. Applied at every write and every read.
+// Lowercase matches normalizePathForCache in upstreamRequest.js.
+// (Trade-off: on case-sensitive filesystems two files differing only by case
+// would collide — vanishingly rare in real repos and consistent with the
+// rest of the pipeline.)
+function canonicalPath(p) {
+  if (!p || typeof p !== "string") return p;
+  return p.replace(/\\/g, "/").toLowerCase();
+}
 
-  const resolvedPath = dbPath || path.join(__dirname, "../data/graph.db");
+// GB-3: escape LIKE metacharacters; pair with ESCAPE '\' in the SQL.
+function escapeLike(s) {
+  return String(s).replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+export function getGraphDb(dbPath = null) {
+  if (_db) {
+    // GB-7: don't silently hand back a different database than requested
+    if (dbPath && path.resolve(dbPath) !== _dbPath) {
+      throw new Error(
+        `[graphDb] Already open at ${_dbPath}; requested ${dbPath}. Call closeGraphDb() first.`
+      );
+    }
+    return _db;
+  }
+
+  // GB-6: CLI-managed per-workspace dir wins; legacy repo-local fallback.
+  const dataDir = process.env.CF_DATA_DIR || path.join(__dirname, "../data");
+  mkdirSync(dataDir, { recursive: true });
+  const resolvedPath = dbPath || path.join(dataDir, "graph.db");
   _db = new Database(resolvedPath);
+  _dbPath = path.resolve(resolvedPath);
 
   _db.exec("PRAGMA journal_mode = WAL");
   _db.exec("PRAGMA synchronous  = NORMAL");
@@ -131,15 +195,16 @@ export function getGraphDb(dbPath = null) {
     CREATE INDEX IF NOT EXISTS idx_config_key      ON config_refs(key);
     CREATE INDEX IF NOT EXISTS idx_config_fn       ON config_refs(containing_fn);
     CREATE INDEX IF NOT EXISTS idx_summaries_name  ON summaries(name);
+
+    -- GB-4: hot-path indexes (previously full scans, verified via EXPLAIN)
+    CREATE INDEX IF NOT EXISTS idx_nodes_path_line  ON nodes(file_path, start_line);
+    CREATE INDEX IF NOT EXISTS idx_summaries_file   ON summaries(file_path);
+    CREATE INDEX IF NOT EXISTS idx_config_file      ON config_refs(file_path);
+    CREATE INDEX IF NOT EXISTS idx_edges_targetfile ON edges(target_file);
   `);
 
   // ── GD-1: Migrations — only TRUE migrations here (schema additions) ────────
-  // CREATE TABLE IF NOT EXISTS is already in the schema above.
-  // Only include ALTER TABLE statements for columns added after initial release.
-  const migrations = [
-    // source_line was added after initial release — safe to re-run (try/catch)
-    `ALTER TABLE edges ADD COLUMN source_line INTEGER`,
-  ];
+  const migrations = [`ALTER TABLE edges ADD COLUMN source_line INTEGER`];
 
   for (const sql of migrations) {
     try {
@@ -161,17 +226,22 @@ function stmts() {
   const db = getGraphDb();
 
   _stmts = {
+    // GB-5: true upsert — no DELETE+INSERT, no CASCADE churn mid-transaction
     upsertFile: db.prepare(`
-      INSERT OR REPLACE INTO files
+      INSERT INTO files
         (file_id, file_path, language, last_modified, indexed_at, node_count)
       VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(file_path) DO UPDATE SET
+        language      = excluded.language,
+        last_modified = excluded.last_modified,
+        indexed_at    = excluded.indexed_at,
+        node_count    = excluded.node_count
     `),
 
     getFile: db.prepare(`
       SELECT * FROM files WHERE file_path = ?
     `),
 
-    // body_text included here — used by queryNodeByStableId for stableId lookup
     getNodeByFileAndLine: db.prepare(`
       SELECT n.file_path, n.name, n.kind, n.start_line, n.end_line,
              n.complexity, n.body_text, n.is_exported,
@@ -194,7 +264,7 @@ function stmts() {
 
     deleteFileNodes: db.prepare(`DELETE FROM nodes WHERE file_id = ?`),
     deleteFileEdges: db.prepare(`DELETE FROM edges WHERE source_file = ?`),
-    deleteLiterals:  db.prepare(`DELETE FROM literals WHERE file_path = ?`),
+    deleteLiterals: db.prepare(`DELETE FROM literals WHERE file_path = ?`),
     deleteConfigRefs: db.prepare(`DELETE FROM config_refs WHERE file_path = ?`),
     deleteSummariesByFile: db.prepare(`DELETE FROM summaries WHERE file_path = ?`),
 
@@ -228,8 +298,6 @@ function stmts() {
       ORDER BY start_line
     `),
 
-    // GD-5: body_text removed — find_symbol responses no longer include body.
-    // read_function reads body from disk, not from this query.
     findSymbol: db.prepare(`
       SELECT n.file_path, n.name, n.kind, n.start_line, n.end_line,
              n.complexity, n.is_exported,
@@ -240,14 +308,14 @@ function stmts() {
       ORDER BY n.is_exported DESC, n.complexity DESC
     `),
 
-    // GD-5: body_text removed from fuzzy search too
+    // GB-3: ESCAPE '\' so _ and % in symbol names match literally
     findSymbolFuzzy: db.prepare(`
       SELECT n.file_path, n.name, n.kind, n.start_line, n.end_line,
              n.complexity, n.is_exported,
              s.literal_refs, s.env_refs, s.call_summary
       FROM   nodes n
       LEFT JOIN summaries s ON n.node_id = s.node_id
-      WHERE  n.name LIKE '%' || ? || '%'
+      WHERE  n.name LIKE '%' || ? || '%' ESCAPE '\\'
         AND  n.name != ?
       ORDER BY n.is_exported DESC, n.complexity DESC
       LIMIT 10
@@ -314,15 +382,16 @@ function stmts() {
       ORDER BY e.target_symbol
     `),
 
+    // GB-3: route filter escaped too
     findRoutes: db.prepare(`
       SELECT source_file, target_symbol AS route_path,
              source_symbol AS handler, source_line
       FROM   edges
       WHERE  relation = 'defines_route'
         AND  (? IS NULL
-              OR target_symbol LIKE '%' || ? || '%'
-              OR target_symbol LIKE '% '  || ?
-              OR target_symbol LIKE '%/'  || ? || '%')
+              OR target_symbol LIKE '%' || ? || '%' ESCAPE '\\'
+              OR target_symbol LIKE '% '  || ? ESCAPE '\\'
+              OR target_symbol LIKE '%/'  || ? || '%' ESCAPE '\\')
       ORDER BY source_file, target_symbol
     `),
 
@@ -338,13 +407,14 @@ function stmts() {
         (SELECT COUNT(*) FROM edges WHERE relation = 'defines_route') AS routes_count
     `),
 
+    // GB-3: literal search escaped (exact-match ranking uses the RAW value)
     findLiteral: db.prepare(`
       SELECT l.value, l.kind, l.file_path, l.start_line, l.containing_fn,
              n.start_line AS fn_start_line, n.end_line AS fn_end_line,
              n.complexity AS fn_complexity, n.body_text AS fn_body
       FROM   literals l
       LEFT JOIN nodes n ON n.name = l.containing_fn AND n.file_path = l.file_path
-      WHERE  l.value LIKE '%' || ? || '%'
+      WHERE  l.value LIKE '%' || ? || '%' ESCAPE '\\'
       ORDER BY
         CASE WHEN l.value = ? THEN 0 ELSE 1 END,
         length(l.value)
@@ -357,7 +427,7 @@ function stmts() {
              n.complexity AS fn_complexity, n.body_text AS fn_body
       FROM   config_refs c
       LEFT JOIN nodes n ON n.name = c.containing_fn AND n.file_path = c.file_path
-      WHERE  c.key = ? OR c.key LIKE '%' || ? || '%'
+      WHERE  c.key = ? OR c.key LIKE '%' || ? || '%' ESCAPE '\\'
       ORDER BY
         CASE WHEN c.key = ? THEN 0 ELSE 1 END
       LIMIT 10
@@ -406,18 +476,17 @@ function stmts() {
 
 export function writeFileGraph(fileData) {
   const db = getGraphDb();
-  const s  = stmts();
+  const s = stmts();
 
-  const fileId = crypto
-    .createHash("sha256")
-    .update(fileData.filePath)
-    .digest("hex")
-    .slice(0, 16);
+  // GB-1: canonicalize ONCE; every row and every derived id uses this form.
+  const filePath = canonicalPath(fileData.filePath);
+
+  const fileId = crypto.createHash("sha256").update(filePath).digest("hex").slice(0, 16);
 
   const writeTransaction = db.transaction(() => {
     s.upsertFile.run(
       fileId,
-      fileData.filePath,
+      filePath,
       fileData.language,
       fileData.lastModified,
       Date.now(),
@@ -425,68 +494,69 @@ export function writeFileGraph(fileData) {
     );
 
     s.deleteFileNodes.run(fileId);
-    s.deleteFileEdges.run(fileData.filePath);
-    s.deleteLiterals.run(fileData.filePath);
-    s.deleteConfigRefs.run(fileData.filePath);
-    s.deleteSummariesByFile.run(fileData.filePath);
+    s.deleteFileEdges.run(filePath);
+    s.deleteLiterals.run(filePath);
+    s.deleteConfigRefs.run(filePath);
+    s.deleteSummariesByFile.run(filePath);
 
     for (const node of fileData.nodes) {
-      // GD-3: nodeId unified to "filePath:startLine:name" format.
-      // Previously used "fileId:name:startLine" (hash-based) which did not
-      // match the stableId format used in buildNodeSummaries and HNSW embeddings.
-      // The foreign key constraint on summaries.node_id was violated on every
-      // summary insert because the formats did not match.
-      const nodeId = `${fileData.filePath}:${node.startLine}:${node.name}`;
+      // GD-3 + GB-1: nodeId "filePath:startLine:name", canonical path form.
+      const nodeId = `${filePath}:${node.startLine}:${node.name}`;
 
       s.insertNode.run(
         nodeId,
         fileId,
-        fileData.filePath,
+        filePath,
         node.name,
         node.kind,
         node.startLine,
         node.endLine,
         node.isExported ? 1 : 0,
-        node.isAsync    ? 1 : 0,
+        node.isAsync ? 1 : 0,
         node.complexity || 0,
-        node.bodyText   || null
+        node.bodyText || null
       );
     }
 
     for (const edge of fileData.edges) {
-      // GD-4: Include source_line in edge hash so two edges with the same
-      // source/target but at different line numbers are not collapsed into one.
-      // Critical for routes — two definitions of the same route path at
-      // different lines were previously deduplicated into one entry.
+      // GD-4: source_line in hash; GB-1: canonical target_file
+      const targetFile = edge.targetFile ? canonicalPath(edge.targetFile) : null;
       const edgeId = crypto
         .createHash("sha256")
         .update(
-          fileData.filePath         +
-          "|" + (edge.sourceSymbol || "") +
-          "|" + edge.targetSymbol   +
-          "|" + edge.relation       +
-          "|" + (edge.sourceLine ?? "")
+          filePath +
+            "|" +
+            (edge.sourceSymbol || "") +
+            "|" +
+            edge.targetSymbol +
+            "|" +
+            edge.relation +
+            "|" +
+            (edge.sourceLine ?? "")
         )
         .digest("hex")
         .slice(0, 16);
 
       s.insertEdge.run(
         edgeId,
-        fileData.filePath,
-        edge.targetFile   || null,
+        filePath,
+        targetFile,
         edge.sourceSymbol || null,
         edge.targetSymbol,
         edge.relation,
-        edge.sourceLine   ?? null
+        edge.sourceLine ?? null
       );
     }
 
     if (fileData.literals) {
       let i = 0;
       for (const lit of fileData.literals) {
+        // GB-2: ALWAYS the file's canonical path — extractor-provided
+        // lit.filePath variants (case/slash) previously threw FK constraint
+        // and rolled back the entire file write.
         s.insertLiteral.run(
           `${fileId}:lit:${i++}`,
-          lit.filePath,
+          filePath,
           lit.value,
           lit.kind,
           lit.containingFn,
@@ -498,9 +568,10 @@ export function writeFileGraph(fileData) {
     if (fileData.configRefs) {
       let i = 0;
       for (const ref of fileData.configRefs) {
+        // GB-2: same as literals
         s.insertConfigRef.run(
           `${fileId}:cfg:${i++}`,
-          ref.filePath,
+          filePath,
           ref.key,
           ref.rawText,
           ref.containingFn,
@@ -511,9 +582,16 @@ export function writeFileGraph(fileData) {
 
     if (fileData.summaries) {
       for (const sum of fileData.summaries) {
+        // GB-1: recompute node_id in canonical form rather than trusting the
+        // caller's casing (must match nodes.node_id or FK throws).
+        const canonicalNodeId =
+          sum.startLine !== undefined && sum.name
+            ? `${filePath}:${sum.startLine}:${sum.name}`
+            : canonicalPathNodeId(sum.nodeId);
+
         s.upsertSummary.run(
-          sum.nodeId,       // now "filePath:startLine:name" — matches nodes.node_id
-          sum.filePath,
+          canonicalNodeId,
+          filePath,
           sum.name,
           sum.signature,
           sum.dependencies,
@@ -529,6 +607,17 @@ export function writeFileGraph(fileData) {
   return fileId;
 }
 
+// GB-1 helper: canonicalize the path portion of a "filePath:line:name" id.
+function canonicalPathNodeId(stableId) {
+  if (!stableId || typeof stableId !== "string") return stableId;
+  const parts = stableId.split(":");
+  if (parts.length < 3) return stableId;
+  const name = parts[parts.length - 1];
+  const line = parts[parts.length - 2];
+  const filePath = canonicalPath(parts.slice(0, parts.length - 2).join(":"));
+  return `${filePath}:${line}:${name}`;
+}
+
 // ─────────────────────────────────────────────
 // Read operations
 // ─────────────────────────────────────────────
@@ -538,7 +627,7 @@ export function queryWhoImportsThis(symbolName) {
 }
 
 export function queryWhatDoesThisExport(filePath) {
-  return stmts().whatDoesThisExport.all(normalizeFilePath(filePath));
+  return stmts().whatDoesThisExport.all(canonicalPath(filePath));
 }
 
 export function queryFindSymbol(symbolName) {
@@ -546,15 +635,16 @@ export function queryFindSymbol(symbolName) {
 }
 
 export function queryFindSymbolFuzzy(symbolName) {
-  return stmts().findSymbolFuzzy.all(symbolName, symbolName);
+  // GB-3: escaped pattern, raw value for the != exclusion
+  return stmts().findSymbolFuzzy.all(escapeLike(symbolName), symbolName);
 }
 
 export function queryWhatDoesThisImport(filePath) {
-  return stmts().whatDoesThisImport.all(normalizeFilePath(filePath));
+  return stmts().whatDoesThisImport.all(canonicalPath(filePath));
 }
 
 export function queryWhoDependsOnFile(filePath) {
-  return stmts().whoDependsOnFile.all(normalizeFilePath(filePath));
+  return stmts().whoDependsOnFile.all(canonicalPath(filePath));
 }
 
 export function queryWhoCallsThis(symbolName) {
@@ -574,36 +664,32 @@ export function querySymbolDependencies(symbolName) {
 }
 
 export function queryFindRoutes(routeFilter = null) {
-  return stmts().findRoutes.all(routeFilter, routeFilter, routeFilter, routeFilter);
+  // GB-3: escape the filter (may legitimately contain _ in route names)
+  const f = routeFilter === null ? null : escapeLike(routeFilter);
+  return stmts().findRoutes.all(f, f, f, f);
 }
 
 export function queryFindLiteral(value) {
-  return stmts().findLiteral.all(value, value);
+  // GB-3: escaped pattern for LIKE, raw value for exact-match ranking
+  return stmts().findLiteral.all(escapeLike(value), value);
 }
 
 export function queryFindConfig(key) {
-  return stmts().findConfig.all(key, key, key);
+  return stmts().findConfig.all(key, escapeLike(key), key);
 }
 
 export function queryFindLiteralsByFn(fnName, filePath) {
-  return stmts().findLiteralsByFn.all(fnName, filePath);
+  return stmts().findLiteralsByFn.all(fnName, canonicalPath(filePath));
 }
 
 export function queryFindConfigByFn(fnName, filePath) {
-  return stmts().findConfigByFn.all(fnName, filePath);
+  return stmts().findConfigByFn.all(fnName, canonicalPath(filePath));
 }
 
 /**
  * Resolve a stable embedding ID back to a node record.
- *
- * Stable ID format: "filePath:startLine:name"
- * e.g. "controllers/s3-upload.controller.js:9:getS3SignedUrl"
- *
- * Handles Windows paths with drive letters correctly:
- *   "D:/NODE JS/server/controllers/s3-upload.controller.js:9:getS3SignedUrl"
- *   → filePath = "D:/NODE JS/server/controllers/s3-upload.controller.js"
- *   → line     = 9
- *   → name     = "getS3SignedUrl"
+ * Stable ID format: "filePath:startLine:name" (canonical path form).
+ * Windows drive letters ("d:/...") handled by rightmost-two-colons split.
  */
 export function queryNodeByStableId(stableId) {
   if (!stableId || typeof stableId !== "string") return null;
@@ -611,22 +697,24 @@ export function queryNodeByStableId(stableId) {
   const parts = stableId.split(":");
   if (parts.length < 3) return null;
 
-  const name     = parts[parts.length - 1];
-  const line     = parseInt(parts[parts.length - 2], 10);
+  const name = parts[parts.length - 1];
+  const line = parseInt(parts[parts.length - 2], 10);
   const filePath = parts.slice(0, parts.length - 2).join(":");
 
   if (isNaN(line) || !name || !filePath) return null;
 
-  return stmts().getNodeByFileAndLine.get(normalizeFilePath(filePath), line);
+  return stmts().getNodeByFileAndLine.get(canonicalPath(filePath), line);
 }
 
 export function queryRetrievalDocument(nodeId) {
-  return stmts().getRetrievalDocument.get(nodeId);
+  // GB-1: ids may arrive from older embeddings with raw casing — canonicalize
+  return stmts().getRetrievalDocument.get(canonicalPathNodeId(nodeId));
 }
 
 export function queryAllEmbeddableNodes() {
   return getGraphDb()
-    .prepare(`
+    .prepare(
+      `
       SELECT n.node_id, n.file_path, n.name, n.kind, n.start_line,
              n.is_async, n.complexity, n.body_text,
              s.signature, s.env_refs, s.literal_refs, s.call_summary
@@ -635,7 +723,8 @@ export function queryAllEmbeddableNodes() {
       WHERE  n.kind IN ('function', 'method', 'arrow_function', 'class')
         AND  n.name NOT LIKE '__module_%'
       ORDER BY n.file_path, n.start_line
-    `)
+    `
+    )
     .all();
 }
 
@@ -648,22 +737,20 @@ export function getAllIndexedFiles() {
 }
 
 export function getAllNodeNames() {
-  return stmts().allNodeNames.all().map((r) => r.name);
+  return stmts()
+    .allNodeNames.all()
+    .map((r) => r.name);
 }
 
 export function getFileRecord(filePath) {
-  return stmts().getFile.get(normalizeFilePath(filePath));
-}
-
-function normalizeFilePath(filePath) {
-  if (!filePath) return filePath;
-  return filePath.replace(/\\/g, "/").toLowerCase();
+  return stmts().getFile.get(canonicalPath(filePath));
 }
 
 export function closeGraphDb() {
   if (_db) {
     _db.close();
-    _db    = null;
+    _db = null;
+    _dbPath = null;
     _stmts = null;
   }
 }

@@ -12,6 +12,8 @@
                 "src/onnx_embedder.cpp",
                 "src/embed_cache.cpp",
 
+                "vendor/sqlite3/sqlite3.c",
+
                 "tree-sitter-src/tree-sitter/lib/src/lib.c",
 
                 "tree-sitter-src/tree-sitter-javascript/src/parser.c",
@@ -38,6 +40,7 @@
                 "src",
                 "vendor/onnxruntime/include",
                 "vendor/nlohmann",
+                "vendor/sqlite3",
                 "tree-sitter-src/tree-sitter/lib/include",
                 "tree-sitter-src/tree-sitter-javascript/src",
                 "tree-sitter-src/tree-sitter-typescript/typescript/src",
@@ -52,7 +55,9 @@
             ],
             "defines": [
                 "NAPI_DISABLE_CPP_EXCEPTIONS",
-                "NODE_ADDON_API_DISABLE_DEPRECATED"
+                "NODE_ADDON_API_DISABLE_DEPRECATED",
+                "SQLITE_THREADSAFE=1",
+                "SQLITE_OMIT_LOAD_EXTENSION"
             ],
             "cflags!":    ["-fno-exceptions"],
             "cflags_cc!": ["-fno-exceptions"],
@@ -61,19 +66,7 @@
                 "VCCLCompilerTool": {"ExceptionHandling": 1}
             },
             "conditions": [
-                ["OS=='linux' or OS=='mac'", {
-                    "libraries": [
-                        "-lsqlite3"
-                    ]
-                }],
-
                 ["OS=='win'", {
-                    "sources": [
-                        "vendor/sqlite3/sqlite3.c"
-                    ],
-                    "include_dirs": [
-                        "vendor/sqlite3"
-                    ],
                     "libraries": [
                         "<(module_root_dir)/vendor/onnxruntime/lib/onnxruntime.lib"
                     ]
@@ -82,12 +75,23 @@
                 ["OS=='mac'", {
                     "libraries": [
                         "<(module_root_dir)/vendor/onnxruntime/lib/libonnxruntime.dylib"
-                    ]
+                    ],
+                    "xcode_settings": {
+                        "OTHER_LDFLAGS": [
+                            "-Wl,-rpath,@loader_path",
+                            "-Wl,-rpath,<(module_root_dir)/vendor/onnxruntime/lib"
+                        ],
+                        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+                    }
                 }],
 
                 ["OS=='linux'", {
                     "libraries": [
                         "<(module_root_dir)/vendor/onnxruntime/lib/libonnxruntime.so"
+                    ],
+                    "ldflags": [
+                        "-Wl,-rpath,'$$ORIGIN'",
+                        "-Wl,-rpath,<(module_root_dir)/vendor/onnxruntime/lib"
                     ]
                 }]
             ]

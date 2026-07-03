@@ -116,6 +116,35 @@ const AGENT_STATUS_PATTERNS = [
   /\bno (further|other) changes (needed|required)\b/i,
 ];
 
+// MO-1 FIX: task-verb detector for the CURRENT user message. The old Rule 3
+// classified AGENT_STATUS whenever the previous assistant message was a
+// status report AND the user's reply was short (<150 chars). But short
+// replies are often NEW TASKS: after "Done, the patch was applied", the user
+// says "now fix the login bug too" (26 chars) → old code returned
+// AGENT_STATUS → requiresRepositoryWork() false → the new task ran with
+// ZERO capabilities. Verified by reproduction. A short reply is only an
+// acknowledgment if it contains no task signals.
+const TASK_SIGNAL = new RegExp(
+  [
+    // action verbs that start work
+    "\\b(fix|add|remove|delete|rename|change|update|refactor|create|build",
+    "|implement|write|extract|convert|move|split|inline|wrap|patch|debug",
+    "|investigate|check|test|run|deploy|install|optimi[sz]e|migrate)\\b",
+    // question openers that need repo work
+    "|\\bwhy\\s+(is|does|isn't|doesn't)\\b|\\bwhere\\s+(is|are|does)\\b",
+    // continuation markers introducing new work
+    "|\\bnow\\b.*\\b(also|next|then)\\b|\\balso\\b",
+    // file/symbol references
+    "|\\.(js|ts|py|go|rs|jsx|tsx|java|rb|cpp)\\b",
+  ].join(""),
+  "i"
+);
+
+function isPureAcknowledgment(text) {
+  if (!text) return true;
+  return !TASK_SIGNAL.test(text);
+}
+
 /**
  * Check if a message content string looks like an agent status update.
  * Only checks the first 200 chars of the extracted text.
@@ -197,11 +226,19 @@ export function detectMessageOrigin(messages) {
   }
 
   // ── Rule 3: Agent status exchange ───────────────────────────────────────
+  // MO-1 FIX: short length alone no longer classifies AGENT_STATUS — the
+  // user's reply must ALSO be free of task signals. "now fix the login bug
+  // too" is 26 chars but is a NEW TASK; the old rule stripped all
+  // capabilities from it (requiresRepositoryWork(AGENT_STATUS) === false).
   if (lastAssistantMsg && !assistantCalledTools(lastAssistantMsg)) {
     const lastAssistantText = extractText(lastAssistantMsg.content);
     const currentUserText = extractText(currentMsg.content);
 
-    if (isAgentStatusMessage(lastAssistantText) && currentUserText.trim().length < 150) {
+    if (
+      isAgentStatusMessage(lastAssistantText) &&
+      currentUserText.trim().length < 150 &&
+      isPureAcknowledgment(currentUserText)
+    ) {
       return {
         origin: "AGENT_STATUS",
         reason: `last_assistant_was_status: "${lastAssistantText.slice(0, 60)}"`,

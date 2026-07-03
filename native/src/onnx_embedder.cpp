@@ -458,8 +458,10 @@ void OnnxEmbedder::inferenceLoop()
             {
                 auto cached = cache_.get(text);
                 if (!cached.empty()) {
+                    // OE-9: removed vestigial stats_mutex_ lock-and-drop —
+                    // it guarded nothing (cache hit counters live inside
+                    // cache_.stats()) and serialized the hot path for free.
                     results.push_back(std::move(cached));
-                    std::lock_guard<std::mutex> lock(stats_mutex_);
                     continue;
                 }
 
@@ -468,11 +470,21 @@ void OnnxEmbedder::inferenceLoop()
                     auto embedding = runInference(tokens);
                     cache_.put(text, embedding);
                     results.push_back(std::move(embedding));
-
-                    // OE-7: stat_cache_misses_ accurately named
-                    std::lock_guard<std::mutex> lock(stats_mutex_);
                 } catch (const std::exception &e) {
-                    fprintf(stderr, "[OnnxEmbedder] Error: %s\n", e.what());
+                    // OE-10: do NOT cache the zero vector, and log loudly.
+                    // A zero vector has zero norm — HNSW inner-product
+                    // similarity against it is 0 for everything, so the
+                    // consumer (hybridRetriever/memory search) silently
+                    // gets no results for this text. Previously the zero
+                    // vector could ALSO poison downstream stores because
+                    // callers can't distinguish it from a real embedding.
+                    // Keeping the failure out of cache_ means a transient
+                    // ORT error (OOM, thread) retries on next request
+                    // instead of being permanent for the session.
+                    fprintf(stderr,
+                        "[OnnxEmbedder] ❌ Inference failed for text (%zu chars): %s "
+                        "— returning zero vector (not cached)\n",
+                        text.size(), e.what());
                     results.push_back(std::vector<float>(dim_, 0.0f));
                 }
             }

@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <sstream>
+#include <queue>   // SC-12: explicit priority_queue declaration in search guards
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Init
@@ -126,6 +127,18 @@ Napi::Value SemanticCache::Add(const Napi::CallbackInfo& info) {
     Napi::Float32Array arr = info[0].As<Napi::Float32Array>();
     std::string db_id      = info[1].As<Napi::String>().Utf8Value();
 
+    // SC-10 FIX: dimension guard. addPoint reads dim_ floats from the
+    // buffer unconditionally — a shorter Float32Array meant reading past
+    // the end (UB). hybrid_retriever guards this at its boundary; the
+    // cache must too (it shares the SAME underlying HNSW index).
+    if (arr.ElementLength() != (size_t)dim_) {
+        Napi::TypeError::New(env,
+            "[SemanticCache] add: embedding dim " +
+            std::to_string(arr.ElementLength()) + " != " + std::to_string(dim_))
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
     // SC-2: Remove existing entry for this ID to prevent orphaned HNSW entries
     removeByIdIfExists(db_id);
 
@@ -177,6 +190,15 @@ Napi::Value SemanticCache::AddWithMeta(const Napi::CallbackInfo& info) {
 
     Napi::Float32Array arr = info[0].As<Napi::Float32Array>();
 
+    // SC-10: same dimension guard as Add()
+    if (arr.ElementLength() != (size_t)dim_) {
+        Napi::TypeError::New(env,
+            "[SemanticCache] addWithMeta: embedding dim " +
+            std::to_string(arr.ElementLength()) + " != " + std::to_string(dim_))
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
     VectorMetadata meta;
     meta.id            = info[1].As<Napi::String>().Utf8Value();
     meta.namespaceName = info[2].As<Napi::String>().Utf8Value();
@@ -226,10 +248,26 @@ Napi::Value SemanticCache::SearchK(const Napi::CallbackInfo& info) {
     if (active_count_ == 0 || k == 0)
         return Napi::Array::New(env, 0);
 
+    // SC-11 FIX: dimension guard — searchKnn reads dim_ floats from the
+    // query buffer; a short query vector was an out-of-bounds read (UB).
+    if (query.ElementLength() != (size_t)dim_)
+        return Napi::Array::New(env, 0);
+
     // SC-1: Clamp to active_count_ — current_label_ includes deleted entries
     size_t actual_k = std::min(k, active_count_);
 
-    auto result = alg_hnsw_->searchKnn(query.Data(), actual_k);
+    // SC-12 FIX: searchKnn can throw (e.g. "Cannot return the results in a
+    // contiguous 2D array" edge cases, allocation failures). The binding is
+    // compiled with NAPI_DISABLE_CPP_EXCEPTIONS — an uncaught C++ exception
+    // at this boundary is std::terminate: the ENTIRE proxy process dies on
+    // one bad query. addPoint got this guard in SC-6; searches never did.
+    std::priority_queue<std::pair<float, hnswlib::labeltype>> result;
+    try {
+        result = alg_hnsw_->searchKnn(query.Data(), actual_k);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[SemanticCache] searchKnn failed: %s\n", e.what());
+        return Napi::Array::New(env, 0);
+    }
 
     // Collect from max-heap (largest distance at top) then reverse for
     // descending similarity order (best match first)
@@ -265,7 +303,17 @@ Napi::Value SemanticCache::Search(const Napi::CallbackInfo& info) {
 
     if (active_count_ == 0) return env.Null();
 
-    auto result = alg_hnsw_->searchKnn(query.Data(), 1);
+    // SC-11: dimension guard (same as SearchK)
+    if (query.ElementLength() != (size_t)dim_) return env.Null();
+
+    // SC-12: crash guard (same as SearchK)
+    std::priority_queue<std::pair<float, hnswlib::labeltype>> result;
+    try {
+        result = alg_hnsw_->searchKnn(query.Data(), 1);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[SemanticCache] searchKnn failed: %s\n", e.what());
+        return env.Null();
+    }
     if (result.empty()) return env.Null();
 
     float              distance = result.top().first;

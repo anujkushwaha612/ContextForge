@@ -1,0 +1,140 @@
+name: prebuild
+
+# Builds N-API prebuilds for all supported platforms.
+# Triggered on version tags (v1.0.0) or manually.
+#
+# Output layout per platform (bundled into the npm tarball by the release job):
+#   prebuilds/<platform>-<arch>/
+#     ├── contextforge_native.node
+#     └── libonnxruntime.*        (found via rpath $ORIGIN / @loader_path)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  ORT_VERSION: "1.20.1"   # onnxruntime release to vendor
+
+jobs:
+  prebuild:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,     platform: linux,  arch: x64,
+              ort: onnxruntime-linux-x64-1.20.1.tgz }
+          - { os: ubuntu-22.04-arm, platform: linux,  arch: arm64,
+              ort: onnxruntime-linux-aarch64-1.20.1.tgz }
+          - { os: macos-13,         platform: darwin, arch: x64,
+              ort: onnxruntime-osx-x86_64-1.20.1.tgz }
+          - { os: macos-14,         platform: darwin, arch: arm64,
+              ort: onnxruntime-osx-arm64-1.20.1.tgz }
+          - { os: windows-2022,     platform: win32,  arch: x64,
+              ort: onnxruntime-win-x64-1.20.1.zip }
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20   # N-API: one LTS is enough, binary works on 18/20/22+
+
+      # ── Vendor onnxruntime for this platform ──
+      - name: Download onnxruntime (unix)
+        if: matrix.platform != 'win32'
+        run: |
+          curl -fsSL -o ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${{ matrix.ort }}"
+          mkdir -p native/vendor/onnxruntime
+          tar xzf ort.tgz --strip-components=1 -C native/vendor/onnxruntime
+
+      - name: Download onnxruntime (windows)
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        run: |
+          curl.exe -fsSL -o ort.zip "https://github.com/microsoft/onnxruntime/releases/download/v$env:ORT_VERSION/${{ matrix.ort }}"
+          Expand-Archive ort.zip -DestinationPath ort-tmp
+          New-Item -ItemType Directory -Force native/vendor/onnxruntime | Out-Null
+          Move-Item ort-tmp/*/* native/vendor/onnxruntime/
+
+      # ── Vendor tree-sitter grammars (same script devs use locally) ──
+      - name: Vendor grammars
+        shell: bash
+        run: bash scripts/vendor-grammars.sh
+
+      - name: Install deps (skip lifecycle scripts — we build explicitly)
+        run: npm ci --ignore-scripts
+
+      - name: Build addon
+        shell: bash
+        working-directory: native
+        run: npx node-gyp rebuild --release
+
+      # ── Assemble prebuild folder: .node + its shared libs side by side ──
+      - name: Package prebuild
+        shell: bash
+        run: |
+          DEST="prebuilds/${{ matrix.platform }}-${{ matrix.arch }}"
+          mkdir -p "$DEST"
+          cp native/build/Release/contextforge_native.node "$DEST/"
+          case "${{ matrix.platform }}" in
+            linux)  cp native/vendor/onnxruntime/lib/libonnxruntime.so* "$DEST/" ;;
+            darwin) cp native/vendor/onnxruntime/lib/libonnxruntime*.dylib "$DEST/" ;;
+            win32)  cp native/vendor/onnxruntime/lib/onnxruntime.dll "$DEST/" ;;
+          esac
+          ls -la "$DEST"
+
+      # ── Smoke test: load the addon exactly like the server does ──
+      - name: Smoke test
+        shell: bash
+        run: |
+          node -e "
+            const m = require('./prebuilds/${{ matrix.platform }}-${{ matrix.arch }}/contextforge_native.node');
+            const expected = ['SemanticCache','HybridRetriever','PersistentMemoryStore','OnnxEmbedder'];
+            const missing = expected.filter(k => !(k in m));
+            if (missing.length) { console.error('MISSING:', missing); process.exit(1); }
+            console.log('addon OK:', Object.keys(m).join(', '));
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-${{ matrix.platform }}-${{ matrix.arch }}
+          path: prebuilds/
+          retention-days: 7
+
+  # ── Merge all platforms and publish ──
+  release:
+    needs: prebuild
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: prebuild-*
+          merge-multiple: true
+          path: prebuilds/
+
+      - name: Verify all platforms present
+        run: |
+          for p in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            test -f "prebuilds/$p/contextforge_native.node" || { echo "MISSING $p"; exit 1; }
+          done
+          du -sh prebuilds/*
+
+      - name: Attach prebuilds to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: prebuilds/**
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

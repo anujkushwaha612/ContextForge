@@ -242,6 +242,37 @@ void HybridRetriever::rebuildInvertedIndex()
 //       document instead of clearing the entire cache. Terms not
 //       affected by the change keep their cached IDF values.
 // ==========================================
+// HY-1: shared HNSW removal — marks the old vector deleted so dense search
+// stops returning it. hnswlib's markDelete keeps the point out of results
+// while reusing its slot memory lazily; meta/id maps are cleaned eagerly.
+void HybridRetriever::removeFromHnsw(const std::string &id)
+{
+    if (!hnswIndex_ || !hnswIndex_->alg_hnsw_)
+        return;
+
+    auto labelIt = hnswIndex_->id_to_label_.find(id);
+    if (labelIt == hnswIndex_->id_to_label_.end())
+        return;
+
+    size_t label = labelIt->second;
+    try
+    {
+        hnswIndex_->alg_hnsw_->markDelete(label);
+    }
+    catch (const std::exception &e)
+    {
+        // Already deleted or label unknown — maps are cleaned below anyway
+        fprintf(stderr,
+            "[HybridRetriever] HNSW markDelete(%zu) for %s: %s\n",
+            label, id.c_str(), e.what());
+    }
+
+    hnswIndex_->meta_map_.erase(label);
+    hnswIndex_->id_to_label_.erase(labelIt);
+    if (hnswIndex_->active_count_ > 0)
+        hnswIndex_->active_count_--;
+}
+
 void HybridRetriever::addDocumentInternal(const std::string &id,
                                            const std::string &text)
 {
@@ -378,6 +409,14 @@ Napi::Value HybridRetriever::AddDocumentWithEmbedding(const Napi::CallbackInfo &
     }
 
     addDocumentInternal(id, text);
+
+    // HY-2: re-adding an existing id must replace its vector, not add a
+    // duplicate. Previously each re-index cycle added a NEW HNSW point for
+    // the same id while the old one stayed searchable — meta_map_ still
+    // resolved it, so dense search could return the same id twice with two
+    // different (one stale) similarity scores, and the index leaked one
+    // point per document per reindex.
+    removeFromHnsw(id);
 
     if (hnswIndex_ && hnswIndex_->alg_hnsw_)
     {
@@ -714,6 +753,15 @@ Napi::Value HybridRetriever::RemoveDocument(const Napi::CallbackInfo &info)
     }
 
     std::string id = info[0].As<Napi::String>().Utf8Value();
+
+    // HY-1: also remove the document's vector from the HNSW index.
+    // Previously only the BM25 side was cleaned — the stale vector kept
+    // matching dense queries forever (returning ids for content that the
+    // JS pipeline had deleted/invalidated), and the index grew unboundedly
+    // across re-index cycles (workspaceMapper force:true, post-patch
+    // reindex, EW-3 vault re-chunking).
+    removeFromHnsw(id);
+
     auto it = docIndex_.find(id);
 
     if (it != docIndex_.end())

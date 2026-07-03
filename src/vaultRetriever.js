@@ -26,13 +26,29 @@
  *   VR-8: fetchNeighborChunks calls parallelized with Promise.all
  *         instead of sequential awaits. Reduces DB round-trips from
  *         O(n) sequential to O(1) parallel for n chunk results.
+ *
+ * Fixes applied (this pass — pipeline sync audit):
+ *   VX-1: TIER 3 was DEAD CODE. fetchFromCache(vaultId) looks up
+ *         semantic_cache by id — but semantic_cache ids are "RES_<uuid>"
+ *         (saveToCache) while vault ids are "cf_vault_<hex>". The lookup
+ *         could never match; the tier always returned null while looking
+ *         like a real fallback. Removed.
+ *   VX-2: The VR-8 "parallelization" was a no-op wrapper: better-sqlite3
+ *         is synchronous, so chunks.map(fetchNeighborChunks) executes the
+ *         queries eagerly BEFORE Promise.all sees them (verified). Also
+ *         the neighbor fetch was gated on `semanticCache` — an unrelated
+ *         parameter that has nothing to do with neighbor lookup. Now a
+ *         plain synchronous loop, ungated.
+ *   VX-3: Anthropic-format context messages (content as block arrays)
+ *         contributed nothing to expandedQuery — only string content was
+ *         read. Text blocks are now extracted, matching the rest of the
+ *         pipeline's dual-format handling.
  */
 
 import { getEmbedder } from "./memory/embedder.js";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  fetchFromCache,
   fetchChunksByIds,
   fetchVaultTextConcatenated,
   fetchNeighborChunks,
@@ -163,10 +179,24 @@ export async function retrieveFromVault(
   let expandedQuery = searchQuery || "";
 
   if (messages && Array.isArray(messages) && messages.length > 0) {
+    // VX-3: handle BOTH wire formats — Anthropic content is a block array;
+    // the old string-only read silently contributed nothing for Anthropic
+    // clients, weakening the semantic query exactly when it mattered.
+    const textOf = (content) => {
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) {
+        return content
+          .filter((b) => b.type === "text" && typeof b.text === "string")
+          .map((b) => b.text)
+          .join(" ");
+      }
+      return "";
+    };
+
     const recentContext = messages
       .slice(-3)
       .filter((m) => m.role === "user" || m.role === "assistant")
-      .map((m) => (typeof m.content === "string" ? m.content : ""))
+      .map((m) => textOf(m.content))
       .filter((c) => c.length > 0)
       .join(" ")
       .slice(0, 200);
@@ -200,15 +230,14 @@ export async function retrieveFromVault(
           const chunks   = await fetchChunksByIds(chunkIds);
 
           if (chunks.length > 0) {
-            // VR-8 FIX: Parallelize neighbor fetches instead of sequential awaits.
-            // Previously: 5 awaits in series = 5 sequential DB round-trips.
-            // Now: Promise.all = 1 parallel round-trip for all neighbors.
-            const neighborPromises = chunks.map((chunk) =>
-              semanticCache
-                ? fetchNeighborChunks(chunk.vaultId, chunk.index, 1, 1)
-                : Promise.resolve([])
+            // VX-2 FIX: better-sqlite3 is SYNCHRONOUS — the old Promise.all
+            // wrapper executed nothing in parallel (map ran the queries
+            // eagerly; verified). And gating on `semanticCache` — a planner
+            // anchor cache unrelated to neighbor lookup — silently disabled
+            // neighbors whenever the caller passed null. Plain sync loop.
+            const allNeighbors = chunks.map((chunk) =>
+              fetchNeighborChunks(chunk.vaultId, chunk.index, 1, 1)
             );
-            const allNeighbors = await Promise.all(neighborPromises);
 
             const contextPieces = [];
 
@@ -339,16 +368,10 @@ export async function retrieveFromVault(
     }
   }
 
-  // ── TIER 3: Cache fallback ───────────────────────────────────────────────
-  if (vaultId) {
-    const cachedResponse = await fetchFromCache(vaultId);
-    if (cachedResponse) {
-      console.log(`[Hybrid RAG] 📦 Cache fallback: ${vaultId}`);
-      statsEmitter.recordCacheHit("ragRetrieval", true);
-      statsEmitter.recordVaultRetrieval(vaultId, cachedResponse.length);
-      return cachedResponse;
-    }
-  }
+  // VX-1: former "TIER 3 cache fallback" removed — fetchFromCache(vaultId)
+  // queried semantic_cache by id, but semantic_cache ids are "RES_<uuid>"
+  // while vault ids are "cf_vault_<hex>". The lookup could never match:
+  // a fallback tier that always returned null while appearing to exist.
 
   console.log(`[Hybrid RAG] ❌ Vault ${vaultId ?? "none"} not found`);
   statsEmitter.recordCacheHit("ragRetrieval", false);

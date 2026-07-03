@@ -1,5 +1,6 @@
 import { createRequire } from "module";
 import { saveToVault, lookupVaultByContent, fetchFromVault } from "../logging/cacheDb.js";
+import { isRecentToolResult } from "./compressionPolicy.js";
 
 const require = createRequire(import.meta.url);
 
@@ -338,6 +339,12 @@ export async function compressCodeToolResults(payload) {
 
   const policy = payload.__policy ?? null;
 
+  // F1a: policy master switch — under LOW pressure with a local upstream,
+  // compressing tool results costs retrieve round-trips and saves nothing.
+  if (policy && policy.compressToolResults === false) {
+    return payload;
+  }
+
   const codeMessages = payload.messages.filter(
     (m) => m.role === "tool" && m._cf_type === "code"
   ).length;
@@ -359,9 +366,19 @@ export async function compressCodeToolResults(payload) {
 
   const newMessages = [];
 
-  for (const msg of payload.messages) {
+  for (let msgIndex = 0; msgIndex < payload.messages.length; msgIndex++) {
+    const msg = payload.messages[msgIndex];
     if (msg.role === "tool" && typeof msg.content === "string" && msg._cf_type === "code") {
       // ── Skip guards (ordered by cheapness) ───────────────────────────────
+      // F1b: AGE GATE — never compress a tool result the model hasn't had
+      // time to act on (fewer than policy.recentTurnExemption assistant
+      // turns after it). Compressing fresh reads forces an immediate
+      // contextforge_retrieve round-trip: the self-defeating loop observed
+      // in the S3-refactor session (read → stub → retrieve → dedup → re-read).
+      if (isRecentToolResult(payload.messages, msgIndex, policy)) {
+        newMessages.push(msg);
+        continue;
+      }
       if (msg._cf_editable === true) {
         newMessages.push(msg);
         continue;
@@ -427,8 +444,12 @@ export async function compressCodeToolResults(payload) {
         continue;
       }
 
-      // Line count guard — after vault checks, before tree-sitter
-      if (msg.content.split("\n").length < 30) {
+      // Line count guard — after vault checks, before tree-sitter.
+      // Threshold now policy-driven (LOW pressure → 120 lines, HIGH → 30):
+      // compressing a 35-line file saves ~20 lines but costs a retrieve
+      // round-trip if the model needs the bodies back.
+      const minLines = policy?.minLinesToCompress ?? 30;
+      if (msg.content.split("\n").length < minLines) {
         newMessages.push(msg);
         continue;
       }

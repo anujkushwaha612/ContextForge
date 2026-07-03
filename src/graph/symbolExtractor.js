@@ -349,7 +349,16 @@ function treesitterExtract(source, language, filePath) {
         (node.isExported && !existing.isExported) ||
         (node.isExported === existing.isExported &&
           node.complexity > existing.complexity);
-      if (newWins) nameMap.set(node.name, node);
+      if (newWins) {
+        if (process.env.CF_DEBUG_GRAPH === "1") {
+          console.warn(`[SymbolExtractor] Discarding previous duplicate symbol '${node.name}' in ${filePath}`);
+        }
+        nameMap.set(node.name, node);
+      } else {
+        if (process.env.CF_DEBUG_GRAPH === "1") {
+          console.warn(`[SymbolExtractor] Discarding new duplicate symbol '${node.name}' in ${filePath}`);
+        }
+      }
     }
   }
 

@@ -67,6 +67,7 @@ private:
 
     // HR-1: Core add/remove logic — O(1) swap-with-last instead of O(n) erase
     void addDocumentInternal(const std::string& id, const std::string& text);
+    void removeFromHnsw(const std::string& id);
 
     // HR-5: Inverted index maintenance — called by addDocumentInternal and RemoveDocument
     void addToInvertedIndex(size_t docIdx, const BM25Doc& doc);

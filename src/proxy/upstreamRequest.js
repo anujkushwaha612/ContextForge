@@ -65,7 +65,6 @@ import { isPatchToolCall, executePatchToolCall, PATCH_TOOL_NAME } from "../graph
 import { hasMemoryToolCalls, executeMemoryToolCalls } from "../memory/memoryTools.js";
 import { normalizeConceptKey } from "../graph/semanticResolver.js";
 import { invalidateRegistryEntry } from "../compression/semanticDedup.js";
-import { processPayloadForTelemetry } from "./toolTelemetry.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -805,10 +804,6 @@ export function createUpstreamHandler(ctx) {
     };
 
     return new Promise((resolve, reject) => {
-      if (retryCount === 0) {
-        setTimeout(() => processPayloadForTelemetry(currentPayload, req.headers), 0);
-      }
-
       const modelOverride = process.env.CF_MODEL_OVERRIDE;
       if (modelOverride) {
         currentPayload = { ...currentPayload, model: modelOverride };
@@ -983,22 +978,13 @@ export function createUpstreamHandler(ctx) {
                 if (delta?.tool_calls) {
                   hasSeenToolCall = true;
                   for (const tc of delta.tool_calls) {
-                    let idx = tc.index;
-
-                    if (tc.id) {
+                    let idx;
+                    if (typeof tc.index === "number") {
+                      idx = tc.index;
+                    } else if (tc.id) {
                       const existingIdx = toolCalls.findIndex((t) => t?.id === tc.id);
-                      if (existingIdx !== -1) {
-                        idx = existingIdx;
-                      } else {
-                        idx = toolCalls.length;
-                      }
-                    } else if (tc.function?.name) {
-                      if (toolCalls.length > 0 && toolCalls[toolCalls.length - 1].name) {
-                        idx = toolCalls.length;
-                      } else {
-                        idx = Math.max(0, toolCalls.length - 1);
-                      }
-                    } else if (idx === undefined) {
+                      idx = existingIdx !== -1 ? existingIdx : toolCalls.length;
+                    } else {
                       idx = Math.max(0, toolCalls.length - 1);
                     }
 

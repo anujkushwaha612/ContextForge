@@ -771,6 +771,26 @@ CompressionResult ASTCompressor::compress(
     : language_hint;
 
   auto grammar_it = grammars_.find(result.language_detected);
+
+  // AC-9 (sync fix): a hint with no matching grammar previously returned the
+  // source UNCHANGED but flagged syntax_valid=true and languageDetected=<hint>.
+  // Two consequences on the JS side (astCompressor.js):
+  //   1. The "language mismatch" branch could NEVER fire — C++ echoed the
+  //      hint back verbatim, so result.languageDetected always === hint.
+  //      The BUG-9 retry there was dead code.
+  //   2. A wrong-extension hint (e.g. ".js" file containing TypeScript
+  //      generics, or an unmapped extension) silently produced 0% compression
+  //      instead of trying auto-detection.
+  // Now: fall back to auto-detect when the hinted grammar is missing, and
+  // report what was ACTUALLY used — making the JS mismatch log truthful.
+  if (grammar_it == grammars_.end() && !language_hint.empty()) {
+    std::string detected = detectLanguage(source);
+    if (detected != result.language_detected) {
+      result.language_detected = detected;
+      grammar_it = grammars_.find(detected);
+    }
+  }
+
   if (grammar_it == grammars_.end()) {
     result.compressed_source = source;
     result.compressed_lines  = result.original_lines;

@@ -8,7 +8,7 @@ const ANSI_PATTERN = /\x1b\[[0-9;]*[a-zA-Z]/g;
 const OSC_PATTERN = /\x1b\][^\x07]*\x07/g;
 const SINGLE_ESC = /\x1b[()][0-9a-zA-Z]/g;
 
-const SPINNER_LINE_PATTERN = /^[\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠏⣾⣽⣻⢿⡿⣟⣯⣷#=\-|/\\%.\d(){}\]\[∧>]*$/;
+const SPINNER_LINE_PATTERN = /^[\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷#=\-|/\\%.\d(){}\]\[∧>]+$/;
 const NPM_PROGRESS_PATTERN = /^\[[#=\-.\s]{8,}\]\s+\d+%.*/;
 
 // ─────────────────────────────────────────────
@@ -71,10 +71,11 @@ function collapseCarriageReturnProgress(text) {
       }
     }
 
-    if (NPM_PROGRESS_PATTERN.test(line) || SPINNER_LINE_PATTERN.test(line)) {
+    if (line.trim().length > 0 && (NPM_PROGRESS_PATTERN.test(line) || SPINNER_LINE_PATTERN.test(line))) {
       let j = i + 1;
       while (
         j < lines.length &&
+        lines[j].trim().length > 0 &&
         (NPM_PROGRESS_PATTERN.test(lines[j]) || SPINNER_LINE_PATTERN.test(lines[j]))
       ) {
         j++;
@@ -265,7 +266,7 @@ export async function tagToolResults(payload) {
 
         // ── Read tool editable flag ─────────────────────────────────────
         if (msg._cf_editable === undefined) {
-          const isReadTool = lowerName.includes("read") || lowerName.includes("view");
+          const isReadTool = /^(?:mcp__\w+__|[\w]+__)?(?:read_file|read_file_chunk|read_function|view_file)$/.test(lowerName);
 
           if (isReadTool) {
             const args = meta.args || {};
@@ -321,7 +322,7 @@ export async function tagToolResults(payload) {
             }
 
             if (block._cf_editable === undefined) {
-              const isReadTool = lowerName.includes("read") || lowerName.includes("view");
+              const isReadTool = /^(?:mcp__\w+__|[\w]+__)?(?:read_file|read_file_chunk|read_function|view_file)$/.test(lowerName);
 
               if (isReadTool) {
                 const args = meta.args || {};

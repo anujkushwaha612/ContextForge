@@ -5,7 +5,8 @@
   "type": "module",
   "main": "src/server.js",
   "bin": {
-    "contextforge": "src/cli/index.js"
+    "contextforge": "cli/bin/contextforge.js",
+    "cf": "cli/bin/contextforge.js"
   },
   "engines": {
     "node": ">=20.0.0",
@@ -14,14 +15,13 @@
   "scripts": {
     "start": "node --env-file=.env src/server.js",
     "dev": "node --watch --env-file=.env src/server.js",
-    "postinstall": "node scripts/postinstall.js",
     "setup:models": "bash scripts/setup-onnx.sh",
     "setup:models:win": "powershell -ExecutionPolicy Bypass -File scripts/setup-onnx.ps1",
     "setup:grammars": "bash scripts/vendor-grammars.sh",
     "setup:all": "npm run setup:grammars && npm run setup:models",
     "build:native": "cd native && node-gyp rebuild",
     "build:native:debug": "cd native && node-gyp rebuild --debug",
-    "prebuild": "prebuildify --napi --target 18.0.0 --target 20.0.0 --target 22.0.0 --strip",
+    "prebuild": "cd native && prebuildify --napi --strip",
     "rebuild": "npm run build:native",
     "docker:build": "docker build -t contextforge:latest .",
     "docker:up": "docker compose up -d",
@@ -36,10 +36,11 @@
     "test:workflows": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --runInBand --forceExit --testPathPattern=tests/workflows",
     "test:watch": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --watch --testPathPattern=tests/unit",
     "test:ci": "npm run test:unit && npm run test:smoke",
+    "test:cli": "node cli/bin/contextforge.js doctor --json",
     "benchmark": "node benchmarks/compression_benchmark.js",
-    "lint": "eslint src/ --ext .js",
-    "format": "prettier --write 'src/**/*.js' 'tests/**/*.js'",
-    "clean": "rm -rf native/build native/tree-sitter-src node_modules models/*.onnx"
+    "lint": "eslint src/ cli/src/ --ext .js",
+    "format": "prettier --write 'src/**/*.js' 'cli/src/**/*.js' 'tests/**/*.js'",
+    "clean": "rm -rf native/build native/tree-sitter-src node_modules contextforge_models/*.onnx"
   },
   "keywords": [
     "llm",
@@ -75,21 +76,25 @@
   "homepage": "https://github.com/anujkushwaha612/ContextForge#readme",
   "files": [
     "src/",
-    "native/",
-    "models/",
-    "scripts/",
+    "cli/bin/",
+    "cli/src/",
     "prebuilds/",
+    "scripts/setup-onnx.sh",
+    "scripts/setup-onnx.ps1",
     "README.md",
     "LICENSE",
     ".env.example",
     "!**/*.test.js",
     "!**/__tests__",
-    "!src/data/*.db"
+    "!src/data/**",
+    "!src/cli/**",
+    "!**/CF-savings/**"
   ],
   "dependencies": {
-    "@huggingface/transformers": "^4.2.0",
     "better-sqlite3": "^12.10.0",
+    "commander": "^12.1.0",
     "node-addon-api": "^8.8.0",
+    "smol-toml": "^1.3.0",
     "tiktoken": "^1.0.22"
   },
   "devDependencies": {

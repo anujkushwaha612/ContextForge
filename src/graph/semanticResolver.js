@@ -21,6 +21,25 @@
  *         normalize to the same key. "quota storage" == "storage quota".
  *         This is correct for concept deduplication in the ghost interceptor
  *         where the goal is to detect semantically identical queries.
+ *
+ * Fixes applied (this pass — each verified by reproduction):
+ *   SR-6: QUERY NOT NORMALIZED PER INDEX (major). "GET /api/users" was
+ *         classified ROUTE but the FULL string went to queryFindRoutes —
+ *         route_path stores "/api/users", so LIKE '%GET /api/users%'
+ *         matched NOTHING. Same for "process.env.AWS_BUCKET_NAME" → the
+ *         config index stores bare keys ("AWS_BUCKET_NAME"); full-string
+ *         lookups returned zero rows. The classifier understood the prefix
+ *         but never stripped it. Each index now receives its canonical
+ *         query form.
+ *   SR-7: SIGNATURE FEATURE SILENTLY DEAD (major). runSymbolIndex reads
+ *         r.body_text — but GD-5 removed body_text from the findSymbol
+ *         SELECT. r.body_text is always undefined → signature was null in
+ *         every symbol result since GD-5 landed. Signature now derives
+ *         from name/kind/async metadata that IS selected.
+ *   SR-8: Fuzzy-only results were scored like exact candidates (name
+ *         includes query → 0.5 base) with no penalty, so a fuzzy match
+ *         could beat a same-file literal exact match. Fuzzy candidates
+ *         now carry a 0.15 score penalty.
  */
 
 import {
@@ -48,35 +67,62 @@ export const QueryKind = {
  *   primary     = the most likely index
  *   secondaries = other indexes worth checking
  */
+// SR-6: classification now also produces the CANONICAL query for each index.
+// The classifier understood prefixes ("GET ", "process.env.") but passed the
+// raw string to indexes that store canonical forms — guaranteed misses.
 function softClassify(q) {
-  // Route: METHOD /path
-  if (/^(GET|POST|PUT|PATCH|DELETE|ANY)\s+\//i.test(q)) {
-    return { primary: QueryKind.ROUTE, secondaries: [] };
+  // Route: METHOD /path → canonical query is the path alone
+  const methodRoute = q.match(/^(GET|POST|PUT|PATCH|DELETE|ANY)\s+(\/\S*)/i);
+  if (methodRoute) {
+    return {
+      primary: QueryKind.ROUTE,
+      secondaries: [],
+      canonical: { [QueryKind.ROUTE]: methodRoute[2] },
+    };
   }
 
   // Route: leading slash /path
   if (q.startsWith("/") && q.length > 1) {
-    return { primary: QueryKind.ROUTE, secondaries: [] };
+    return { primary: QueryKind.ROUTE, secondaries: [], canonical: {} };
   }
 
   // SR-2: Route: path-segment pattern without leading slash
   // e.g. "api/v1/users", "v1/chat/completions"
-  // Must have at least one slash and look like a path (no dots that would
-  // indicate a file extension, no spaces that would indicate a description).
   if (
     q.includes("/") &&
     !q.includes(".") &&
     !q.includes(" ") &&
     /^[a-zA-Z0-9_\-/]+$/.test(q)
   ) {
-    return { primary: QueryKind.ROUTE, secondaries: [] };
+    return {
+      primary: QueryKind.ROUTE,
+      secondaries: [],
+      // stored routes lead with "/" — normalize so LIKE '%/api/users%' hits
+      canonical: { [QueryKind.ROUTE]: "/" + q.replace(/^\/+/, "") },
+    };
   }
 
-  // Env var: process.env.X or SCREAMING_SNAKE (3+ chars, all caps+underscore)
-  if (/^process\.env\.[A-Z_]+$/.test(q) || /^[A-Z][A-Z0-9_]{2,}$/.test(q)) {
+  // Env var: process.env.X → canonical query is the bare key
+  const envAccess = q.match(/^process\.env\.([A-Z_][A-Z0-9_]*)$/);
+  if (envAccess) {
+    return {
+      primary: QueryKind.ENV_VAR,
+      secondaries: [QueryKind.SYMBOL, QueryKind.LITERAL],
+      canonical: {
+        [QueryKind.ENV_VAR]: envAccess[1],
+        [QueryKind.SYMBOL]: envAccess[1],
+        // literal index stores the full expression text in source
+        [QueryKind.LITERAL]: envAccess[1],
+      },
+    };
+  }
+
+  // SCREAMING_SNAKE (3+ chars, all caps+underscore)
+  if (/^[A-Z][A-Z0-9_]{2,}$/.test(q)) {
     return {
       primary:     QueryKind.ENV_VAR,
       secondaries: [QueryKind.SYMBOL],
+      canonical: {},
     };
   }
 
@@ -85,6 +131,7 @@ function softClassify(q) {
     return {
       primary:     QueryKind.SYMBOL,
       secondaries: [QueryKind.LITERAL],
+      canonical:   {},
     };
   }
 
@@ -93,6 +140,7 @@ function softClassify(q) {
     return {
       primary:     QueryKind.LITERAL,
       secondaries: [QueryKind.SYMBOL],
+      canonical:   {},
     };
   }
 
@@ -100,6 +148,7 @@ function softClassify(q) {
   return {
     primary:     QueryKind.SYMBOL,
     secondaries: [QueryKind.LITERAL],
+    canonical:   {},
   };
 }
 
@@ -146,6 +195,11 @@ function scoreCandidate(candidate, originalQuery, queryKind) {
     score += Math.min(0.1, Math.log(candidate.complexity + 1) * 0.03);
   }
 
+  // SR-8: fuzzy matches are guesses, not answers — without this penalty a
+  // fuzzy symbol hit ("doXwork" for "do_work") outranked exact literal
+  // matches from a secondary index.
+  if (candidate.fuzzy) score -= 0.15;
+
   return Math.min(score, 2.0);
 }
 
@@ -175,11 +229,16 @@ function runSymbolIndex(query) {
   }
 
   return rows.map((r) => {
-    let signature = null;
-    if (r.body_text) {
-      signature = r.body_text.split("\n")[0].trim();
-      if (signature.length > 120) signature = signature.slice(0, 120) + "...";
-    }
+    // SR-7 FIX: r.body_text is NEVER selected by findSymbol since GD-5 —
+    // the old code's `if (r.body_text)` was permanently false, so signature
+    // was silently null in every result. Build a synthetic signature from
+    // metadata that IS selected (name/kind/async/line-span) instead.
+    const span = r.end_line != null && r.start_line != null
+      ? r.end_line - r.start_line + 1
+      : null;
+    const signature =
+      `${r.is_async === 1 ? "async " : ""}${r.kind ?? "symbol"} ${r.name}` +
+      (span != null ? ` (${span} lines)` : "");
     return {
       type:        "symbol",
       name:        r.name,
@@ -296,41 +355,57 @@ export function resolve(query) {
     return { kind: "empty", strategy: "none", results: [], found: false, confidence: 0 };
   }
 
-  const { primary, secondaries } = softClassify(cleanQuery);
+  const { primary, secondaries, canonical = {} } = softClassify(cleanQuery);
+
+  // SR-6: each index gets its canonical query form (e.g. route path without
+  // the HTTP method, env key without the process.env. prefix). Falls back to
+  // the raw cleaned query when no canonicalization applies.
+  const queryFor = (kind) => canonical[kind] ?? cleanQuery;
 
   const allCandidates = [];
 
   // Always run primary
   switch (primary) {
-    case QueryKind.SYMBOL:  allCandidates.push(...runSymbolIndex(cleanQuery));  break;
-    case QueryKind.LITERAL: allCandidates.push(...runLiteralIndex(cleanQuery)); break;
-    case QueryKind.ENV_VAR: allCandidates.push(...runConfigIndex(cleanQuery));  break;
-    case QueryKind.ROUTE:   allCandidates.push(...runRouteIndex(cleanQuery));   break;
+    case QueryKind.SYMBOL:  allCandidates.push(...runSymbolIndex(queryFor(QueryKind.SYMBOL)));  break;
+    case QueryKind.LITERAL: allCandidates.push(...runLiteralIndex(queryFor(QueryKind.LITERAL))); break;
+    case QueryKind.ENV_VAR: allCandidates.push(...runConfigIndex(queryFor(QueryKind.ENV_VAR)));  break;
+    case QueryKind.ROUTE:   allCandidates.push(...runRouteIndex(queryFor(QueryKind.ROUTE)));   break;
   }
 
   const primaryFoundSomething = allCandidates.length > 0;
+
+  // SR-6: exact-match check compares against the canonical form the index
+  // actually searched — comparing "AWS_BUCKET_NAME" hits against the raw
+  // "process.env.AWS_BUCKET_NAME" string never matched, so secondaries
+  // always ran even after a perfect primary hit.
+  const matchTargets = new Set(
+    [cleanQuery, ...Object.values(canonical)].map((s) => s.toLowerCase())
+  );
 
   // Run secondaries only if primary found no exact matches
   for (const secondary of secondaries) {
     if (primaryFoundSomething) {
       const hasExact = allCandidates.some((c) => {
         const name = (c.name || c.value || c.key || "").toLowerCase();
-        return name === cleanQuery.toLowerCase();
+        return matchTargets.has(name);
       });
       if (hasExact) continue;
     }
 
     switch (secondary) {
-      case QueryKind.SYMBOL:  allCandidates.push(...runSymbolIndex(cleanQuery));  break;
-      case QueryKind.LITERAL: allCandidates.push(...runLiteralIndex(cleanQuery)); break;
-      case QueryKind.ENV_VAR: allCandidates.push(...runConfigIndex(cleanQuery));  break;
+      case QueryKind.SYMBOL:  allCandidates.push(...runSymbolIndex(queryFor(QueryKind.SYMBOL)));  break;
+      case QueryKind.LITERAL: allCandidates.push(...runLiteralIndex(queryFor(QueryKind.LITERAL))); break;
+      case QueryKind.ENV_VAR: allCandidates.push(...runConfigIndex(queryFor(QueryKind.ENV_VAR)));  break;
     }
   }
 
-  // Score
+  // Score — against the canonical form for the primary kind (SR-6): a
+  // route hit "/api/users" must score as an EXACT match for the query
+  // "GET /api/users", not as a weak substring miss.
+  const scoringQuery = queryFor(primary);
   const scored = allCandidates.map((c) => ({
     ...c,
-    _score: scoreCandidate(c, cleanQuery, primary),
+    _score: scoreCandidate(c, scoringQuery, primary),
   }));
 
   // Deduplicate

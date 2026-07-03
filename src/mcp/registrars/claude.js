@@ -1,6 +1,44 @@
-// src/mcp/registrars/claude.js
-import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+// src/mcp/registrars/claude.js — FIXED VERSION
+//
+// Fixes (CR-1 … CR-6):
+//
+//   CR-1  CONFIG PATH WRONG (critical). Claude Code stores user-scoped MCP
+//         servers in ~/.claude.json (home ROOT), not ~/.claude/.claude.json.
+//         The file fallback wrote a file Claude Code never reads — silent
+//         "registered but tools never appear". ~/.claude/.claude.json and
+//         ~/.claude/mcp.json kept as legacy READ candidates only.
+//
+//   CR-2  SHELL QUOTING (critical on this project!). _registerViaCli joined
+//         raw strings into one shell command — a workspace like
+//         "D:\NODE JS\...\server" (space!) or node in "C:\Program Files\..."
+//         split into multiple args and the command failed or registered a
+//         broken server. Also an injection hazard for env values.
+//         Unix: execFileSync with an args ARRAY (no shell parsing at all).
+//         Windows: every arg quoted via cmdQuote() (needed because .cmd
+//         shims require a shell; plain execFileSync throws EINVAL on
+//         modern Node).
+//
+//   CR-3  DATA-LOSS GUARD (critical). readJson() returned {} when the config
+//         was CORRUPT (parse error), then writeJson() overwrote the user's
+//         entire ~/.claude.json — which holds far more than mcpServers
+//         (settings, auth, history). Now: unreadable-but-existing config
+//         ABORTS registration with a clear error; writes are atomic
+//         (tmp + rename) with a .bak of the previous version.
+//
+//   CR-4  Constructor console.log noise removed — it fired on every
+//         getAllRegistrars() call, polluting `cf mcp status` output.
+//         Gated behind CF_DEBUG_MCP=1.
+//
+//   CR-5  HOME resolution via os.homedir() (handles HOMEDRIVE+HOMEPATH
+//         correctly on Windows — bare HOMEPATH lacks the drive letter).
+//
+//   CR-6  CLI arg building edge cases: empty spec.args no longer injects
+//         an empty string; spec.command with spaces quoted; unregister
+//         quoting fixed the same way.
+
+import { execFileSync, execSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -10,17 +48,25 @@ import {
   ServerSpec,
 } from "../base.js";
 
-// ── Resolve home dir with full Windows fallback chain ──
-const HOME =
-  process.env.HOME ||
-  process.env.USERPROFILE ||
-  process.env.HOMEPATH ||
-  "";
+// CR-5: os.homedir() handles USERPROFILE / HOMEDRIVE+HOMEPATH / HOME properly
+const HOME = os.homedir();
 
-// ── Resolve project root (where server.js lives) ──
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 const PROJECT_ROOT = path.resolve(__dirname, "../../../");
+
+const IS_WIN = process.platform === "win32";
+const debug = (...a) => {
+  if (process.env.CF_DEBUG_MCP === "1") console.error("[Claude Registrar]", ...a);
+};
+
+// CR-2: quote one argument for cmd.exe (wrap in "", double inner quotes)
+function cmdQuote(s) {
+  const str = String(s);
+  if (str === "") return '""';
+  if (!/[\s"^&|<>()%!]/.test(str)) return str;
+  return `"${str.replace(/"/g, '""')}"`;
+}
 
 export class ClaudeRegistrar extends MCPRegistrar {
   static agentName   = "claude";
@@ -31,43 +77,29 @@ export class ClaudeRegistrar extends MCPRegistrar {
 
     this._home         = homeDir;
     this._claudeDir    = path.join(homeDir, ".claude");
-    this._modernConfig = path.join(homeDir, ".claude", ".claude.json");
-    this._legacyConfig = path.join(homeDir, ".claude", "mcp.json");
+    // CR-1: the file Claude Code actually reads for user scope
+    this._userConfig   = path.join(homeDir, ".claude.json");
+    // Legacy locations — READ-ONLY candidates (never written)
+    this._legacyConfigs = [
+      path.join(homeDir, ".claude", ".claude.json"),
+      path.join(homeDir, ".claude", "mcp.json"),
+    ];
     this._claudeCli    = this._findCli();
 
-    console.log(`[Claude Registrar] Home:    ${homeDir}`);
-    console.log(`[Claude Registrar] CLI:     ${this._claudeCli ?? "not found"}`);
-    console.log(`[Claude Registrar] Config:  ${this._modernConfig}`);
+    debug(`home=${homeDir} cli=${this._claudeCli ?? "not found"} config=${this._userConfig}`);
   }
 
   // ── Find the claude binary on PATH (cross-platform) ──
   _findCli() {
-    const isWin = process.platform === "win32";
-
-    // On Windows, Git Bash might expose `where` but not `which`
-    // Try both — also try claude.cmd explicitly
-    const candidates = isWin
-      ? ["claude.cmd", "claude.exe", "claude"]
-      : ["claude"];
+    const candidates = IS_WIN ? ["claude.cmd", "claude.exe", "claude"] : ["claude"];
 
     for (const candidate of candidates) {
       try {
-        const cmd = isWin
-          ? `where ${candidate} 2>nul`
-          : `which ${candidate} 2>/dev/null`;
-
-        const result = execSync(cmd, {
-          encoding: "utf-8",
-          stdio: ["pipe", "pipe", "pipe"],
-          // Use cmd.exe on Windows for `where` to work properly
-          shell: isWin ? "cmd.exe" : "/bin/sh",
-        }).trim();
-
-        if (result) {
-          // `where` can return multiple lines — take the first
-          const first = result.split(/\r?\n/)[0].trim();
-          if (first) return first;
-        }
+        const result = IS_WIN
+          ? execSync(`where ${candidate}`, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], shell: "cmd.exe" })
+          : execFileSync("which", [candidate], { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
+        const first = result.trim().split(/\r?\n/)[0]?.trim();
+        if (first) return first;
       } catch {
         // try next candidate
       }
@@ -77,19 +109,15 @@ export class ClaudeRegistrar extends MCPRegistrar {
 
   detect() {
     if (this._claudeCli) return true;
-
-    // Check all possible .claude directory locations
-    const dirs = [
+    return [
       this._claudeDir,
-      path.join(process.env.USERPROFILE || "", ".claude"),
-      path.join(process.env.APPDATA    || "", "claude"),
-    ].filter(Boolean);
-
-    return dirs.some(existsSync);
+      this._userConfig,
+      path.join(process.env.APPDATA || "", "claude"),
+    ].filter(Boolean).some(existsSync);
   }
 
   getServer(serverName) {
-    for (const configPath of [this._modernConfig, this._legacyConfig]) {
+    for (const configPath of [this._userConfig, ...this._legacyConfigs]) {
       const entry = this._readServerEntry(configPath, serverName);
       if (entry) return entry;
     }
@@ -101,21 +129,14 @@ export class ClaudeRegistrar extends MCPRegistrar {
 
     if (existing) {
       if (specsEquivalent(existing, spec)) {
-        return new RegisterResult(
-          RegisterStatus.ALREADY,
-          "matches current configuration",
-        );
+        return new RegisterResult(RegisterStatus.ALREADY, "matches current configuration");
       }
       if (!force) {
-        return new RegisterResult(
-          RegisterStatus.MISMATCH,
-          diffSpecs(existing, spec),
-        );
+        return new RegisterResult(RegisterStatus.MISMATCH, diffSpecs(existing, spec));
       }
       this.unregisterServer(spec.name);
     }
 
-    // Prefer CLI if available — it's more reliable on Windows
     if (this._claudeCli) {
       return this._registerViaCli(spec);
     }
@@ -125,13 +146,15 @@ export class ClaudeRegistrar extends MCPRegistrar {
   unregisterServer(serverName) {
     if (this._claudeCli) {
       try {
-        execSync(
-          `"${this._claudeCli}" mcp remove "${serverName}" -s user`,
-          {
-            stdio: "pipe",
-            shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
-          },
-        );
+        if (IS_WIN) {
+          // CR-2/CR-6: every part quoted for cmd.exe
+          execSync(
+            [cmdQuote(this._claudeCli), "mcp", "remove", cmdQuote(serverName), "-s", "user"].join(" "),
+            { stdio: "pipe", shell: "cmd.exe" },
+          );
+        } else {
+          execFileSync(this._claudeCli, ["mcp", "remove", serverName, "-s", "user"], { stdio: "pipe" });
+        }
         return true;
       } catch {
         // fall through to file removal
@@ -139,7 +162,7 @@ export class ClaudeRegistrar extends MCPRegistrar {
     }
 
     let removed = false;
-    for (const configPath of [this._modernConfig, this._legacyConfig]) {
+    for (const configPath of [this._userConfig, ...this._legacyConfigs]) {
       if (this._removeFromFile(configPath, serverName)) removed = true;
     }
     return removed;
@@ -148,75 +171,71 @@ export class ClaudeRegistrar extends MCPRegistrar {
   // ── CLI registration ──
   _registerViaCli(spec) {
     try {
-      const envArgs = Object.entries(spec.env)
-        .flatMap(([k, v]) => ["-e", `${k}=${v}`]);
+      // claude mcp add <name> -s user [-e K=V ...] -- <command> [args...]
+      const args = ["mcp", "add", spec.name, "-s", "user"];
+      for (const [k, v] of Object.entries(spec.env)) args.push("-e", `${k}=${v}`);
+      args.push("--", spec.command);
 
-      // Build the command as an array then join
-      // Use forward slashes for the path — claude CLI handles them on Windows
-      const serverPath = spec.args[0]
-        ? path.resolve(PROJECT_ROOT, spec.args[0]).replace(/\\/g, "/")
-        : spec.args.join(" ");
+      // CR-6: resolve a relative script path against the project root;
+      // absolute paths pass through untouched. No empty-string injection.
+      for (let i = 0; i < spec.args.length; i++) {
+        const a = spec.args[i];
+        args.push(
+          i === 0 && a && !path.isAbsolute(a) && /\.(c|m)?js$/.test(a)
+            ? path.resolve(PROJECT_ROOT, a).replace(/\\/g, "/")
+            : a
+        );
+      }
 
-      const parts = [
-        `"${this._claudeCli}"`,
-        "mcp", "add", spec.name,
-        "-s", "user",
-        ...envArgs,
-        "--",
-        spec.command,
-        serverPath,
-        ...spec.args.slice(1),
-      ];
+      debug("running:", this._claudeCli, args.join(" "));
 
-      const cmd = parts.join(" ");
-      console.log(`[Claude Registrar] Running: ${cmd}`);
+      if (IS_WIN) {
+        // CR-2: .cmd shims need a shell — quote EVERY argument
+        const cmd = [cmdQuote(this._claudeCli), ...args.map(cmdQuote)].join(" ");
+        execSync(cmd, { stdio: "pipe", shell: "cmd.exe" });
+      } else {
+        // CR-2: no shell, no quoting problems, no injection
+        execFileSync(this._claudeCli, args, { stdio: "pipe" });
+      }
 
-      execSync(cmd, {
-        stdio: "pipe",
-        shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
-      });
-
-      return new RegisterResult(
-        RegisterStatus.REGISTERED,
-        "via `claude mcp add` (scope: user)",
-      );
+      return new RegisterResult(RegisterStatus.REGISTERED, "via `claude mcp add` (scope: user)");
     } catch (err) {
-      console.warn(`[Claude Registrar] CLI failed: ${err.message}`);
-      // Fall back to file
+      debug(`CLI failed: ${err.message}`);
       const fileResult = this._registerViaFile(spec);
       if (fileResult.status === RegisterStatus.REGISTERED) {
         return new RegisterResult(
           RegisterStatus.REGISTERED,
-          `via file fallback (CLI failed: ${err.message})`,
+          `via file fallback (CLI failed: ${firstLine(err.message)})`,
         );
       }
       return new RegisterResult(
         RegisterStatus.FAILED,
-        `CLI: ${err.message} | file: ${fileResult.detail}`,
+        `CLI: ${firstLine(err.message)} | file: ${fileResult.detail}`,
       );
     }
   }
 
   // ── File registration (fallback) ──
   _registerViaFile(spec) {
-    // On Windows use USERPROFILE to be safe
-    const home   = process.env.USERPROFILE || this._home;
-    let target   = path.join(home, ".claude", ".claude.json");
+    // CR-1: write to the file Claude Code actually reads
+    const target = this._userConfig;
 
-    // If modern config doesn't exist but legacy does, use legacy
-    if (!existsSync(target) && existsSync(path.join(home, ".claude", "mcp.json"))) {
-      target = path.join(home, ".claude", "mcp.json");
+    let config;
+    try {
+      config = readJsonStrict(target); // CR-3: throws on corrupt file
+    } catch (err) {
+      return new RegisterResult(
+        RegisterStatus.FAILED,
+        `${target} exists but is not valid JSON (${firstLine(err.message)}) — ` +
+        `refusing to overwrite it. Fix or back up the file, then retry.`,
+      );
     }
 
     try {
-      const config  = readJson(target);
       const servers = config.mcpServers || (config.mcpServers = {});
       servers[spec.name] = specToEntry(spec);
-      writeJson(target, config);
-      return new RegisterResult(
-        RegisterStatus.REGISTERED,
-        `wrote to ${target}`,
-      );
+      writeJsonAtomic(target, config); // CR-3: tmp+rename, .bak of previous
+      return new RegisterResult(RegisterStatus.REGISTERED, `wrote to ${target}`);
     } catch (err) {
       return new RegisterResult(
         RegisterStatus.FAILED,
@@ -228,21 +247,21 @@ export class ClaudeRegistrar extends MCPRegistrar {
   _removeFromFile(configPath, serverName) {
     if (!existsSync(configPath)) return false;
     try {
-      const config  = readJson(configPath);
+      const config  = readJsonStrict(configPath); // CR-3: never wipe corrupt files
       const servers = config.mcpServers || {};
       if (!(serverName in servers)) return false;
       delete servers[serverName];
-      writeJson(configPath, config);
+      writeJsonAtomic(configPath, config);
       return true;
     } catch {
-      return false;
+      return false; // corrupt or unwritable — leave it alone
     }
   }
 
   _readServerEntry(configPath, serverName) {
     if (!existsSync(configPath)) return null;
     try {
-      const config = readJson(configPath);
+      const config = readJsonStrict(configPath);
       const entry  = config?.mcpServers?.[serverName];
       if (!entry || typeof entry !== "object") return null;
       return entryToSpec(serverName, entry);
@@ -253,18 +272,29 @@ export class ClaudeRegistrar extends MCPRegistrar {
 }
 
 // ── JSON helpers ──
-function readJson(filePath) {
+
+// CR-3: strict — missing file → {}, corrupt file → THROW (caller decides).
+// Strips a UTF-8 BOM, which Windows editors love to add.
+function readJsonStrict(filePath) {
   if (!existsSync(filePath)) return {};
-  try {
-    return JSON.parse(readFileSync(filePath, "utf-8"));
-  } catch {
-    return {};
-  }
+  const raw = readFileSync(filePath, "utf-8").replace(/^\uFEFF/, "");
+  if (raw.trim() === "") return {};
+  return JSON.parse(raw); // throws on corrupt — intentionally not swallowed
 }
 
-function writeJson(filePath, data) {
+// CR-3: atomic write + backup of the previous version
+function writeJsonAtomic(filePath, data) {
   mkdirSync(path.dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  if (existsSync(filePath)) {
+    try { copyFileSync(filePath, `${filePath}.bak`); } catch { /* best effort */ }
+  }
+  const tmp = `${filePath}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  renameSync(tmp, filePath);
+}
+
+function firstLine(s) {
+  return String(s).split(/\r?\n/)[0];
 }
 
 function specToEntry(spec) {

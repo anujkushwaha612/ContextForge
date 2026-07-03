@@ -439,9 +439,10 @@ export async function executeGraphQuery(queryType, target, args = {}) {
         const callers = rows.map((r) => {
           let callLine = r.source_line ?? null;
           const rawFileName = r.source_file;
-          const fileName = path.isAbsolute(rawFileName)
-            ? rawFileName
-            : path.resolve(getWorkspaceRoot(), rawFileName);
+          let fileName = normalizeTargetPath(rawFileName);
+          if (!path.isAbsolute(fileName)) {
+            fileName = path.resolve(getWorkspaceRoot(), fileName);
+          }
           const lines = readFileLines(fileName);
 
           if (!callLine && lines) {
@@ -589,6 +590,7 @@ export async function executeGraphQuery(queryType, target, args = {}) {
       }
 
       case "find": {
+        clearLineCache(); // F6: files may have changed since the last query
         // GT-6 FIX: Fast path — try direct symbol lookup before routing through
         // planRetrieval. queryFindSymbol is a synchronous O(1) index lookup that
         // returns in <1ms. planRetrieval involves async embedding + multiple graph
@@ -677,7 +679,7 @@ export async function executeGraphQuery(queryType, target, args = {}) {
         try {
           const content = fs.readFileSync(resolvedPath, "utf-8");
           const allLines = content.replace(/\r\n/g, "\n").split("\n");
-          bodyLines = allLines.slice(sym.start_line - 1, sym.end_line);
+          bodyLines = allLines.slice(sym.start_line, sym.end_line + 1);
         } catch (e) {
           result = JSON.stringify({
             error: "Failed to read file",
@@ -991,6 +993,59 @@ export function injectReadFileChunkTool(tools) {
 // For a find query returning 20 symbols, this saves ~1200 chars (~300 tokens).
 // ─────────────────────────────────────────────
 
+// ─────────────────────────────────────────────
+// F6: include the actual matching source line in find results.
+//
+// Session evidence (S3-refactor run 2): find("BUCKET_NAME") and
+// find("AWS_BUCKET_NAME") returned indistinguishable results — file+line
+// but no text — so the model re-read three files to tell refactored call
+// sites (`Bucket: BUCKET_NAME`) from unrefactored ones
+// (`Bucket: process.env.AWS_BUCKET_NAME`). One line of text per hit
+// (~15 tokens) eliminates those re-reads.
+// ─────────────────────────────────────────────
+
+const _lineCache = new Map(); // filePath -> string[] (per-call cache, cleared each query)
+
+function readSourceLine(filePath, lineNumber, valueHint = null) {
+  if (filePath == null || lineNumber == null) return null;
+  try {
+    let lines = _lineCache.get(filePath);
+    if (!lines) {
+      let resolved = normalizeTargetPath(filePath);
+      if (!path.isAbsolute(resolved)) resolved = path.resolve(getWorkspaceRoot(), resolved);
+      lines = fs.readFileSync(resolved, "utf-8").replace(/\r\n/g, "\n").split("\n");
+      _lineCache.set(filePath, lines);
+    }
+
+    // Index conventions differ across extractor paths (tree-sitter rows are
+    // 0-based; some DB writers store 1-based). When we know the value we're
+    // looking for, snap to the candidate line that actually CONTAINS it —
+    // robust regardless of convention, and tolerant of ±1 drift after edits.
+    const candidates = [lineNumber, lineNumber - 1, lineNumber + 1];
+    let raw = null;
+    if (valueHint) {
+      for (const idx of candidates) {
+        const l = lines[idx];
+        if (typeof l === "string" && l.includes(valueHint)) {
+          raw = l;
+          break;
+        }
+      }
+    }
+    if (raw === null) raw = lines[lineNumber] ?? lines[lineNumber - 1];
+    if (typeof raw !== "string") return null;
+
+    const trimmed = raw.trim();
+    return trimmed.length > 160 ? trimmed.slice(0, 157) + "…" : trimmed;
+  } catch {
+    return null;
+  }
+}
+
+function clearLineCache() {
+  _lineCache.clear();
+}
+
 function formatEvidence(evidence) {
   const output = [];
   for (const e of evidence) {
@@ -1014,19 +1069,26 @@ function formatEvidence(evidence) {
 
         output.push(entry);
       } else if (item.type === "route") {
+        const routeLineText = readSourceLine(item.file, item.line, item.route || null);
         output.push({
           type: "route",
           route: item.route,
           file: item.file,
           line: item.line,
+          ...(routeLineText ? { line_text: routeLineText } : {}),
           handler: item.handler,
         });
       } else if (item.type === "literal" || item.type === "env_var") {
+        // F6: the actual source line — lets the model distinguish
+        // `Bucket: BUCKET_NAME` from `Bucket: process.env.AWS_BUCKET_NAME`
+        // without a follow-up read.
+        const lineText = readSourceLine(item.file, item.line, item.value || item.key || null);
         output.push({
           type: item.type,
           value: item.value || item.key,
           file: item.file,
           line: item.line,
+          ...(lineText ? { line_text: lineText } : {}),
           usedIn: item.usedIn,
           ...(item.containing_function ? { containing_function: item.containing_function } : {}),
         });

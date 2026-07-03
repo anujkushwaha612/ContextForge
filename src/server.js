@@ -43,7 +43,7 @@ import { createRequire } from "module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
-import { writeFileSync, readFileSync } from "node:fs";
+import { writeFileSync, readFileSync, mkdirSync, existsSync } from "node:fs";
 import crypto from "node:crypto";
 
 // ── ContextForge core ──
@@ -98,10 +98,13 @@ import {
   injectReadFileChunkTool,
   executeGraphQuery, // SV-4: static import replaces dynamic import()
   executeReadFileChunk, // SV-4: static import replaces dynamic import()
+  getGraphToolDefinition, // CF-P8: served to the MCP bridge via /v1/mcp/tools
+  getReadFileChunkToolDefinition, // CF-P8
 } from "./graph/graphTools.js";
 import {
   injectPatchTool,
   executePatchToolCall, // SV-4: static import replaces dynamic import()
+  getPatchToolDefinition, // CF-P8
 } from "./graph/patchTools.js";
 
 // ── Request Planner ──
@@ -112,10 +115,35 @@ import { createUpstreamHandler } from "./proxy/upstreamRequest.js";
 import { extractGeminiInlineContent } from "./compression/geminiContentExtractor.js";
 
 const require = createRequire(import.meta.url);
-const native = require("../native/build/Release/contextforge_native.node");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// CF-P1: Never crash with a raw stack trace at import. The CLI relays
+// structured CF_ERR_* lines to the user (cf doctor explains the fix).
+// Resolution order matches the CLI: shipped prebuild first, local dev build second.
+import { existsSync as _existsSync } from "node:fs";
+const NATIVE_CANDIDATES = [
+  path.join(__dirname, `../prebuilds/${process.platform}-${process.arch}/contextforge_native.node`),
+  path.join(__dirname, "../native/build/Release/contextforge_native.node"),
+];
+let native;
+{
+  const found = NATIVE_CANDIDATES.find((p) => _existsSync(p));
+  if (!found) {
+    console.error(`CF_ERR_NATIVE_LOAD no addon for ${process.platform}-${process.arch}`);
+    console.error(`Searched:\n  ${NATIVE_CANDIDATES.join("\n  ")}`);
+    console.error("Run `cf doctor` for diagnosis.");
+    process.exit(10);
+  }
+  try {
+    native = require(found);
+  } catch (err) {
+    console.error(`CF_ERR_NATIVE_LOAD ${err.message}`);
+    console.error("Native addon failed to load. Run `cf doctor` for diagnosis.");
+    process.exit(10);
+  }
+}
 
 const providerName = process.env.CF_PROVIDER || "ollama";
 const provider = ProviderFactory.getAdapter(providerName);
@@ -136,15 +164,30 @@ function hashMessage(msg) {
 
 console.log("Initializing ContextForge Native Engine...");
 
-const onnxEmbedder = new native.OnnxEmbedder(
-  path.join(__dirname, "../contextforge_models/all-MiniLM-L6-v2-int8.onnx"),
-  path.join(__dirname, "../contextforge_models/tokenizer.json"),
-  { dim: 384, cacheSize: 512, batchWaitMs: 1 }
-);
+// CF-P2: Model + data dirs are injectable by the CLI.
+//   CF_MODEL_DIR → ~/.contextforge/models        (default: repo-local)
+//   CF_DATA_DIR  → ~/.contextforge/data/<ws-hash> (default: repo-local ./data)
+const MODEL_DIR = process.env.CF_MODEL_DIR || path.join(__dirname, "../contextforge_models");
+const DATA_DIR = process.env.CF_DATA_DIR || path.join(__dirname, "./data");
+mkdirSync(DATA_DIR, { recursive: true });
+
+const modelPath = path.join(MODEL_DIR, "all-MiniLM-L6-v2-int8.onnx");
+const tokenizerPath = path.join(MODEL_DIR, "tokenizer.json");
+if (!existsSync(modelPath) || !existsSync(tokenizerPath)) {
+  console.error(`CF_ERR_MODEL_MISSING dir=${MODEL_DIR}`);
+  console.error("Models not found. Run `cf setup` (or scripts/setup-onnx.sh) to download them.");
+  process.exit(10);
+}
+
+const onnxEmbedder = new native.OnnxEmbedder(modelPath, tokenizerPath, {
+  dim: 384,
+  cacheSize: 512,
+  batchWaitMs: 1,
+});
 
 setEmbedder(onnxEmbedder);
 
-const memoryStore = new native.PersistentMemoryStore(path.join(__dirname, "./data/memory.db"), 384);
+const memoryStore = new native.PersistentMemoryStore(path.join(DATA_DIR, "memory.db"), 384);
 
 const semanticCache = new native.SemanticCache(384);
 
@@ -170,6 +213,17 @@ const memoryHandler = new MemoryHandler(memoryStore, hybridRetriever, {
 
 console.log("[Memory] PersistentMemoryStore ready");
 
+// CF-P3: Readiness state exposed via /healthz so the CLI can health-gate
+// `cf wrap` and show live indexing progress instead of a blind spinner.
+const readiness = {
+  status: "starting", // starting → indexing → ok
+  progress: { current: 0, total: 0 },
+  workspace: null,
+  indexedFiles: 0,
+  startedAt: Date.now(),
+  version: "1.0.0",
+};
+
 // ─────────────────────────────────────────────
 // Async startup
 // ─────────────────────────────────────────────
@@ -177,7 +231,23 @@ console.log("[Memory] PersistentMemoryStore ready");
 // By the time any await resolves, module evaluation is complete and
 // `server` (defined below) is available. This ordering is intentional.
 (async () => {
+  // Yield to allow module evaluation to complete so `server` (defined below) is initialized
+  await new Promise((resolve) => setImmediate(resolve));
+
   const workspacePath = process.env.CF_WORKSPACE_PATH || process.cwd();
+  readiness.workspace = workspacePath;
+
+  // CF-P6: Listen BEFORE indexing so /healthz is reachable during startup —
+  // the CLI polls it to show live indexing progress. readiness.status gates
+  // actual traffic: the CLI does not hand the agent over until status === "ok".
+  // PORT=0 lets the OS pick a free port; the CLI reads it from CF_LISTENING.
+  const PORT = parseInt(process.env.CF_PORT || process.env.PORT || "3000", 10);
+  await new Promise((resolve) => {
+    server.listen(PORT, () => {
+      console.log(`CF_LISTENING port=${server.address().port} pid=${process.pid}`);
+      resolve();
+    });
+  });
 
   await onnxEmbedder.embed("warmup");
   console.log("[Embedder] Ready");
@@ -185,15 +255,18 @@ console.log("[Memory] PersistentMemoryStore ready");
 
   setSymbolEmbedder(onnxEmbedder, symbolRetriever);
 
+  readiness.status = "indexing";
   try {
     await indexWorkspace(workspacePath, {
       force: true,
       onProgress: ({ current, total, file }) => {
+        readiness.progress = { current, total };
         if (current % 50 === 0) {
           console.log(`[GraphMapper] Progress: ${current}/${total} — ${file}`);
         }
       },
     });
+    readiness.indexedFiles = readiness.progress.total || readiness.progress.current;
     const watcher = watchWorkspace(workspacePath);
     process.on("SIGINT", () => watcher.stop());
   } catch (err) {
@@ -202,12 +275,13 @@ console.log("[Memory] PersistentMemoryStore ready");
 
   await initPlanner(onnxEmbedder, semanticCache);
 
-  const PORT = parseInt(process.env.CF_PORT || process.env.PORT || "3000", 10);
-  server.listen(PORT, () => {
-    console.log(
-      `ContextForge Proxy routing engine active on port ${PORT} [Provider: ${providerName}]`
-    );
-  });
+  const actualPort = server.address().port;
+  readiness.status = "ok";
+  console.log(
+    `ContextForge Proxy routing engine active on port ${actualPort} [Provider: ${providerName}]`
+  );
+  // CF-P4: Machine-readable readiness line — belt-and-braces alongside /healthz.
+  console.log(`CF_READY port=${actualPort} pid=${process.pid}`);
 })();
 
 // ─────────────────────────────────────────────
@@ -324,8 +398,67 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.url === "/healthz" && req.method === "GET") {
+    // CF-P3: Rich health payload — powers `cf wrap` health-gate, `cf status`,
+    // and proxy-reuse detection (same workspace? same version?).
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ status: "ok", provider: providerName }));
+    return res.end(
+      JSON.stringify({
+        status: readiness.status,
+        provider: providerName,
+        workspace: readiness.workspace,
+        progress: readiness.progress,
+        indexedFiles: readiness.indexedFiles,
+        uptimeMs: Date.now() - readiness.startedAt,
+        pid: process.pid,
+        version: readiness.version,
+      })
+    );
+  }
+
+  // CF-P8: MCP tool definitions in MCP shape. The stdio bridge fetches this
+  // at startup instead of importing graphTools/patchTools directly — those
+  // imports transitively load tree-sitter + graphDb into the bridge process.
+  if (req.url === "/v1/mcp/tools" && req.method === "GET") {
+    const adapt = (def) =>
+      def?.function
+        ? {
+            name: def.function.name,
+            description: def.function.description || "",
+            inputSchema: def.function.parameters || { type: "object", properties: {} },
+          }
+        : null;
+    const tools = [
+      adapt(getGraphToolDefinition()),
+      adapt(getPatchToolDefinition()),
+      adapt(getReadFileChunkToolDefinition()),
+    ].filter(Boolean);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ tools }));
+  }
+
+  // CF-P7: One-shot JSON stats — used by `cf status`, `cf stats`, and the
+  // end-of-session savings summary in `cf wrap`. The SSE stream at
+  // /v1/stats/stream stays for the dashboard; this is the scriptable variant.
+  if (req.url === "/v1/stats" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    try {
+      return res.end(JSON.stringify(statsEmitter.getSnapshot("oneshot")));
+    } catch (err) {
+      return res.end(JSON.stringify({ error: err.message }));
+    }
+  }
+
+  // CF-P9: Savings snapshot without the history array (can reach ~500KB).
+  // `cf wrap` diffs lifetime counters at session start/end for its summary.
+  if (req.url === "/v1/savings" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    try {
+      const snap = savingsTracker.snapshot();
+      const { history, ...rest } = snap;
+      return res.end(JSON.stringify({ ...rest, history_points: history?.length ?? 0 }));
+    } catch (err) {
+      return res.end(JSON.stringify({ error: err.message }));
+    }
   }
 
   // ── Dashboard ──
@@ -363,7 +496,15 @@ const server = http.createServer((req, res) => {
   if (req.url.startsWith("/v1/cache/reset") && req.method === "POST") {
     try {
       resetEntireCache(semanticCache);
-      console.log("\n[Cache Reset] ☢️ Nuclear reset triggered.");
+      // CF-P10: clearAll() wipes the ENTIRE SemanticCache — including the
+      // planner intent anchors initPlanner seeded into the same instance.
+      // Without re-seeding, the planner's semantic fallback silently
+      // returns null for the rest of the session. Fire-and-forget: anchor
+      // phrases are EmbedCache hits, so this completes in ~100ms.
+      initPlanner(onnxEmbedder, semanticCache).catch((err) =>
+        console.warn(`[Cache Reset] Planner re-seed failed: ${err.message}`)
+      );
+      console.log("\n[Cache Reset] ☢️ Nuclear reset triggered (planner anchors re-seeding).");
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ success: true, message: "Entire cache has been reset." }));
     } catch (e) {
@@ -416,6 +557,20 @@ const server = http.createServer((req, res) => {
     "/v1/mcp/tool",
   ];
   const isAllowed = ALLOWED_POST_ROUTES.some((route) => req.url.includes(route));
+
+  // CF-P6: Server listens before indexing completes (so /healthz can report
+  // progress). Reject inference traffic until fully ready — 503 with
+  // Retry-After lets well-behaved clients back off instead of failing hard.
+  if (isAllowed && readiness.status !== "ok") {
+    res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "2" });
+    return res.end(
+      JSON.stringify({
+        error: "ContextForge is still starting",
+        status: readiness.status,
+        progress: readiness.progress,
+      })
+    );
+  }
   if (!isAllowed) {
     res.writeHead(404, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ error: "Not Found" }));
@@ -564,6 +719,9 @@ async function handleRequest(req, res, chunks) {
         } else {
           content = vaultContent;
         }
+      } else {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: `Unknown _mcp_tool: ${_mcp_tool}` }));
       }
 
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -732,6 +890,7 @@ async function handleRequest(req, res, chunks) {
   }
 
   // ── COMPRESSION PIPELINE ──
+  const prePipelinePayloadStr = JSON.stringify(payload);
   const policy = getPolicyForModel(payload.model || "");
   Object.defineProperty(payload, "__policy", {
     value: policy,
@@ -810,7 +969,7 @@ async function handleRequest(req, res, chunks) {
   timer.time(STAGES.CCR_PIPELINE, () => {
     if (process.env.CF_CCR_ENABLED === "false") return;
 
-    let ccrBaseline = trueBaselineTokens; // SV-9 FIX: was a separate countTokens()
+    let ccrBaseline = countTokens(payload); // Use current payload size for accurate CCR ratios
 
     const hasVault = payload.messages?.some((m) => {
       if (typeof m.content === "string" && m.content.includes("[CF_VAULT:")) return true;
@@ -904,8 +1063,7 @@ async function handleRequest(req, res, chunks) {
   }
 
   // ── Mutation detection ──
-  const payloadStr = JSON.stringify(payload);
-  const { isMutation, mutatedFile } = detectMutation(payloadStr);
+  const { isMutation, mutatedFile } = detectMutation(prePipelinePayloadStr);
   if (isMutation && mutatedFile) {
     const newHash = hashFile(mutatedFile);
     const result = invalidateByFile(mutatedFile, newHash, semanticCache);
@@ -987,8 +1145,13 @@ async function handleRequest(req, res, chunks) {
 // in-flight connections. 5s timeout forces exit if drain stalls.
 // ─────────────────────────────────────────────
 
-process.on("SIGINT", () => {
-  console.log("\n🛑 Shutting down ContextForge Proxy...");
+// CF-P5: SIGTERM added — `cf stop`, docker stop, and process managers send
+// SIGTERM by default. Previously only SIGINT drained gracefully.
+let shuttingDown = false;
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n🛑 Shutting down ContextForge Proxy (${signal})...`);
 
   if (global.embeddingWorker) global.embeddingWorker.terminate();
 
@@ -1007,4 +1170,7 @@ process.on("SIGINT", () => {
     else console.log("\n[Stats] Session ended.");
     process.exit(0);
   });
-});
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));

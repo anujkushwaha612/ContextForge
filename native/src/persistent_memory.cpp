@@ -222,6 +222,20 @@ void PersistentMemoryStore::removeFromHNSW(const std::string& id) {
 // ─────────────────────────────────────────────
 
 std::string PersistentMemoryStore::save(const MemoryEntry& entry) {
+    // PM-D FIX: reject wrong-dimension embeddings up front. Previously a
+    // non-384 vector was written to SQLite AND pushed into HNSW —
+    // hnswlib reads dim_ floats regardless, so a shorter vector meant
+    // reading past the buffer (UB), and on restart loadAllIntoHNSW would
+    // silently skip the row (n != dim_) leaving a permanent SQLite/HNSW
+    // mismatch. The sibling addon (hybrid_retriever) already guards this
+    // at the N-API boundary; the memory store must too.
+    if ((int)entry.embedding.size() != dim_) {
+        fprintf(stderr,
+            "[PersistentMemory] save rejected for id=%s: embedding dim %zu != %d\n",
+            entry.id.c_str(), entry.embedding.size(), dim_);
+        return "";
+    }
+
     const char* sql = R"SQL(
         INSERT INTO memories
             (id, user_id, workspace, content, importance,
@@ -308,10 +322,19 @@ std::vector<MemorySearchResult> PersistentMemoryStore::search(
     std::sort(candidates.begin(), candidates.end(),
         [](const auto& a, const auto& b) { return a.second > b.second; });
 
-    // PM-3: Build a single IN query for all candidates.
-    // Replaces N individual prepare/step/finalize cycles with one query.
-    // Keep only up to top_k candidates for the IN clause.
-    size_t fetch_count = std::min((size_t)top_k, candidates.size());
+    // PM-C FIX (verified by harness): the old code cut candidates to top_k
+    // BEFORE the SQL user_id/workspace filter ran. HNSW is a GLOBAL index
+    // across all users/workspaces — if the top-k global vectors belonged to
+    // another workspace, matching memories ranked just below the cut were
+    // never fetched: search returned 0 results while the data existed.
+    // Bind ALL candidates (already bounded by k_search = 3*top_k) and let
+    // SQL filter; the final top_k cut happens after filtering, where it
+    // belongs.
+    size_t fetch_count = candidates.size();
+
+    // Safety: stay under SQLite's default 999 bound-variable limit
+    // (fetch_count + 2 bindings). k_search bounds this in practice.
+    if (fetch_count > 900) fetch_count = 900;
 
     std::string placeholders;
     for (size_t i = 0; i < fetch_count; i++) {
@@ -418,6 +441,14 @@ bool PersistentMemoryStore::update(
     const std::string&        new_content,
     const std::vector<float>& new_embedding
 ) {
+    // PM-D: same dimension guard as save()
+    if ((int)new_embedding.size() != dim_) {
+        fprintf(stderr,
+            "[PersistentMemory] update rejected for id=%s: embedding dim %zu != %d\n",
+            id.c_str(), new_embedding.size(), dim_);
+        return false;
+    }
+
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
@@ -620,6 +651,18 @@ Napi::Value PersistentMemoryStoreNAPI::Search(const Napi::CallbackInfo& info) {
     }
 
     Napi::Object opts = info[0].As<Napi::Object>();
+
+    // PM-E FIX: opts.embedding / opts.userId were read unchecked. A missing
+    // field made As<Float32Array>() operate on undefined — a hard N-API
+    // crash (or garbage read) instead of a JS-visible error. The sibling
+    // addon validates its typed-array inputs; the memory store must too.
+    if (!opts.Has("embedding") || !opts.Get("embedding").IsTypedArray() ||
+        !opts.Has("userId")    || !opts.Get("userId").IsString()) {
+        Napi::TypeError::New(env,
+            "search({ embedding: Float32Array, userId: string, ... })")
+            .ThrowAsJavaScriptException();
+        return env.Null();
+    }
 
     Napi::Float32Array emb = opts.Get("embedding").As<Napi::Float32Array>();
     std::vector<float> query_emb(emb.Data(), emb.Data() + emb.ElementLength());

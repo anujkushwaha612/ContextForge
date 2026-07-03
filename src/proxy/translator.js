@@ -56,23 +56,39 @@ function _sanitizeToolArray(tools) {
 
 // ─────────────────────────────────────────────
 // Per-message cache
+// WARNING: This cache is module-level and unscoped by session/request.
+// In a multi-tenant deployment, this could theoretically cause cross-tenant leaks.
+// This is a known limitation, not fixed. Fine for single-user local proxy.
 // ─────────────────────────────────────────────
 
 const _msgCache = new Map();
 const _MSG_CACHE_MAX = 500;
 
+// TR-10 FIX: keys previously used only type:id:length — two different text
+// blocks of EQUAL length (no id) collided, serving message A's cached
+// translation for message B ("delete the file" vs "restore the fil").
+// Verified by reproduction. A cheap FNV-1a fingerprint of head+tail makes
+// the key content-sensitive without hashing megabytes on every message.
+function _fnvFingerprint(s) {
+  let h = 0x811c9dc5;
+  // head + tail sample is enough: same length AND same 64-char head AND
+  // same 64-char tail colliding is astronomically unlikely for real prompts
+  const sample = s.length <= 128 ? s : s.slice(0, 64) + s.slice(-64);
+  for (let i = 0; i < sample.length; i++) {
+    h ^= sample.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16);
+}
+
 function _msgKey(msg) {
-  const first = msg.content[0];
-  const last = msg.content[msg.content.length - 1];
-  const firstStr = first
-    ? (first.type || "") +
-      (first.text?.slice(0, 40) || first.id || first.tool_use_id || first.tool_call_id || "")
-    : "";
-  const lastStr = last
-    ? (last.type || "") +
-      (last.text?.slice(0, 40) || last.id || last.tool_use_id || last.tool_call_id || "")
-    : "";
-  return msg.role + "|" + msg.content.length + "|" + firstStr + "|" + lastStr;
+  const parts = msg.content.map((b) => {
+    const idPart = b.id || b.tool_use_id || b.tool_call_id || "";
+    const text = typeof b.content === "string" ? b.content
+      : (typeof b.text === "string" ? b.text : "");
+    return `${b.type || ""}:${idPart}:${text.length}:${_fnvFingerprint(text)}`;
+  });
+  return msg.role + "|" + parts.join(",");
 }
 
 function _cacheGet(msg) {
@@ -306,7 +322,15 @@ function _translateMessage(msg) {
       if (block.type === "tool_result") {
         const content = Array.isArray(block.content)
           ? block.content
-              .filter((c) => c.type === "text")
+              .filter((c) => {
+                if (c.type !== "text") {
+                  if (process.env.CF_DEBUG_TRANSLATOR === "1") {
+                    console.warn(`[Translator] Dropped non-text block of type '${c.type}' from tool_result (tool_use_id: ${block.tool_use_id})`);
+                  }
+                  return false;
+                }
+                return true;
+              })
               .map((c) => c.text)
               .join("\n")
           : block.content || "";
@@ -447,6 +471,14 @@ export function stripAnthropicSpecificFields(payload) {
     prompt_cache_key,
     ...cleaned
   } = payload;
+  // TR-9 FIX: stop_sequences is not Anthropic-specific semantics — it maps
+  // directly to OpenAI's `stop` (supported by Ollama/OpenAI/Groq). Silently
+  // dropping it changed generation behavior for clients that rely on stop
+  // sequences (e.g. framework-generated prompts). Translate instead of strip.
+  if (Array.isArray(stop_sequences) && stop_sequences.length > 0 && cleaned.stop === undefined) {
+    // OpenAI accepts string | string[] (max 4); Ollama accepts string[].
+    cleaned.stop = stop_sequences.slice(0, 4);
+  }
   return cleaned;
 }
 
@@ -478,111 +510,111 @@ const _toolSchemaCacheMap = new Map();
 // All CF tools: contain vault retrieval instructions that
 //   compression stubs reference by exact wording (TR-4).
 // ─────────────────────────────────────────────
-const PRESERVE_FULL_DESCRIPTION = new Set(["AskUserQuestion", "Agent"]);
 
 const MAX_TOOL_DESCRIPTION_CHARS = 200;
 const MAX_PARAM_DESCRIPTION_CHARS = 80;
 
-export function minimizeToolSchemas(payload) {
-  if (!payload.tools || payload.tools.length === 0) return payload;
+// Tools where the description IS the behavioral contract (orchestration,
+// meta-tools, anything gating side-effecting decisions) — never truncate.
+// Prefer tools self-declaring this via `_cf_critical: true` on their schema;
+// this set is a fallback for tools you don't control/can't annotate.
+const PRESERVE_FULL_DESCRIPTION = new Set([
+  "AskUserQuestion", // truncation could hide when NOT to ask, causing spam
+  "Agent", // truncation could drop sub-agent context/handoff rules
+]);
 
-  const toolsJson = JSON.stringify(payload.tools);
-  const hash = crypto.createHash("sha256").update(toolsJson).digest("hex").slice(0, 16);
+// TR-7 FIX: The old regex /^(mcp__)?contextforge__|^cf_/ required a DOUBLE
+// underscore after "contextforge" — matching MCP wire names
+// (mcp__contextforge__contextforge_query_graph) but MISSING the bare names
+// server.js injects via injectGraphTool/injectPatchTool/injectReadFileChunkTool:
+//   contextforge_query_graph, contextforge_patch_ast, contextforge_retrieve
+// …and read_file_chunk (no "contextforge" in the name at all).
+// Result: TR-4's guarantee was broken — the engineered descriptions of every
+// server-injected CF tool (CRITICAL RULES, workflows, vault instructions)
+// were truncated to 200 chars. Verified by test before fixing.
+const isProtectedTool = (toolName, fn) =>
+  fn?._cf_critical === true ||
+  PRESERVE_FULL_DESCRIPTION.has(toolName) ||
+  /contextforge/i.test(toolName) ||
+  /(^|__)read_file_chunk$/.test(toolName) ||
+  /^cf_/.test(toolName);
 
-  if (_toolSchemaCacheMap.has(hash)) {
-    const cachedTools = _toolSchemaCacheMap.get(hash);
+// Truncate at sentence boundary, always keep the first sentence in full
+// (purpose + primary constraint usually lives there) regardless of its length.
+function truncateSemantic(text, maxChars) {
+  if (text.length <= maxChars) return text;
+  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+  let out = sentences[0];
+  for (let i = 1; i < sentences.length; i++) {
+    if ((out + sentences[i]).length > maxChars) break;
+    out += sentences[i];
+  }
+  return out.trim() + (out.length < text.length ? " …" : "");
+}
 
-    const originalSize = toolsJson.length;
-    const cachedSize = JSON.stringify(cachedTools).length;
-    const savedTokens = Math.floor((originalSize - cachedSize) / 4);
-    if (savedTokens > 0) {
-      payload._cf_minimizeTokensSaved = savedTokens;
-    }
+function minimizeSchema(schema, isProtected) {
+  if (!schema || typeof schema !== "object") return;
 
-    payload.tools = cachedTools;
-    return payload;
+  if (!isProtected && typeof schema.description === "string") {
+    schema.description = truncateSemantic(schema.description, MAX_PARAM_DESCRIPTION_CHARS);
   }
 
-  const originalSize = toolsJson.length;
+  // Never delete enums — they're a hard contract, not prose.
+  // If you must save tokens here, cap displayed values but signal there are more,
+  // so the model doesn't assume it has the full set.
+  // TR-8 FIX: read the TRUE count BEFORE slicing — the old code sliced first,
+  // so the note always said "10+ values" regardless of the real total (a
+  // 40-value enum and a 12-value enum produced identical messages).
+  if (!isProtected && Array.isArray(schema.enum) && schema.enum.length >= 12) {
+    const totalValues = schema.enum.length;
+    schema.enum = schema.enum.slice(0, 10);
+    schema.description =
+      (schema.description || "") +
+      ` (${totalValues} total values, showing first 10 — others exist and are valid)`;
+  }
+
+  if (schema.properties) {
+    for (const key of Object.keys(schema.properties))
+      minimizeSchema(schema.properties[key], isProtected);
+  }
+  if (schema.items) minimizeSchema(schema.items, isProtected);
+}
+
+export function minimizeToolSchemas(payload) {
+  if (!payload.tools?.length) return payload;
+
+  let savedChars = 0;
+  const originalSize = JSON.stringify(payload.tools).length;
 
   payload.tools = payload.tools.map((tool) => {
     const fn = tool.function || tool;
     const toolName = fn.name || tool.name || "";
+    const isProtected = isProtectedTool(toolName, fn);
 
-    // Determine if this tool's descriptions should be fully preserved
-    const isCFTool =
-      toolName.includes("contextforge") ||
-      toolName.includes("mcp__contextforge") ||
-      toolName.startsWith("cf_");
+    // Per-tool cache key, so editing one tool doesn't blow the whole cache
+    const key = crypto
+      .createHash("sha256")
+      .update(toolName + JSON.stringify(fn.description) + JSON.stringify(fn.parameters))
+      .digest("hex")
+      .slice(0, 16);
 
-    // isProtected = never truncate description or params
-    const isProtected = isCFTool || PRESERVE_FULL_DESCRIPTION.has(toolName);
+    if (_toolSchemaCacheMap.has(key)) {
+      return _toolSchemaCacheMap.get(key);
+    }
 
     const newFn = JSON.parse(JSON.stringify(fn));
-
-    // ── Top-level tool description ──────────────────────────────────────
-    // Protected tools: keep in full.
-    // All others: truncate to MAX_TOOL_DESCRIPTION_CHARS.
-    // The LLM knows how to use Bash, Glob, Grep etc from training —
-    // it does not need the full description on every request.
     if (!isProtected && typeof newFn.description === "string") {
-      if (newFn.description.length > MAX_TOOL_DESCRIPTION_CHARS) {
-        newFn.description = newFn.description.slice(0, MAX_TOOL_DESCRIPTION_CHARS) + "…";
-      }
+      newFn.description = truncateSemantic(newFn.description, MAX_TOOL_DESCRIPTION_CHARS);
     }
+    if (newFn.parameters) minimizeSchema(newFn.parameters, isProtected);
 
-    // ── Parameter schema minimization ───────────────────────────────────
-    function minimizeSchema(schema) {
-      if (!schema || typeof schema !== "object") return;
-
-      // Truncate parameter descriptions for non-protected tools.
-      // LLM infers parameter meaning from name + type + required list.
-      if (!isProtected && typeof schema.description === "string") {
-        if (schema.description.length > MAX_PARAM_DESCRIPTION_CHARS) {
-          schema.description = schema.description.slice(0, MAX_PARAM_DESCRIPTION_CHARS) + "…";
-        }
-      }
-
-      // Strip large enum arrays for non-protected tools.
-      // Keep enums with < 5 values — cheap and provide validation hints.
-      // Keep enums for CF tools — query_type enum is how LLM knows
-      // which graph operations are available.
-      if (!isProtected && Array.isArray(schema.enum) && schema.enum.length >= 5) {
-        delete schema.enum;
-      }
-
-      // Recurse into nested properties
-      if (schema.properties) {
-        for (const key of Object.keys(schema.properties)) {
-          minimizeSchema(schema.properties[key]);
-        }
-      }
-
-      // Recurse into array items
-      if (schema.items) {
-        minimizeSchema(schema.items);
-      }
-    }
-
-    if (newFn.parameters) {
-      minimizeSchema(newFn.parameters);
-    }
-
-    return {
-      type: "function",
-      function: newFn,
-    };
+    const result = { type: "function", function: newFn };
+    _toolSchemaCacheMap.set(key, result);
+    return result;
   });
 
-  const newSize = JSON.stringify(payload.tools).length;
-  const savedChars = originalSize - newSize;
-  const savedTokens = Math.floor(savedChars / 4);
-
-  _toolSchemaCacheMap.set(hash, payload.tools);
-
-  if (savedTokens > 0) {
-    payload._cf_minimizeTokensSaved = savedTokens;
-  }
+  savedChars = originalSize - JSON.stringify(payload.tools).length;
+  if (savedChars > 0) payload._cf_minimizeTokensSaved = Math.floor(savedChars / 4);
 
   return payload;
 }
@@ -594,20 +626,23 @@ export function minimizeToolSchemas(payload) {
 export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, toolState) {
   const events = [];
 
-  if (toolState.nextBlockIndex === undefined) {
-    toolState.nextBlockIndex = 0;
-    toolState.textBlockIndex = -1;
-    toolState.currentToolIndex = -1;
-  }
+  if (toolState.nextBlockIndex === undefined) toolState.nextBlockIndex = 0;
+  if (toolState.textBlockIndex === undefined) toolState.textBlockIndex = -1;
+  if (toolState.toolIndices === undefined) toolState.toolIndices = {};
+  if (toolState.openTools === undefined) toolState.openTools = new Set();
 
   if (openAIData.trim() === "[DONE]") {
-    if (toolState.inToolCall && toolState.currentToolIndex >= 0) {
-      events.push(
-        `event: content_block_stop\ndata: ${JSON.stringify({
-          type: "content_block_stop",
-          index: toolState.currentToolIndex,
-        })}\n\n`
-      );
+    if (toolState.openTools && toolState.openTools.size > 0) {
+      for (const idx of toolState.openTools) {
+        events.push(
+          `event: content_block_stop\ndata: ${JSON.stringify({
+            type: "content_block_stop",
+            index: idx,
+          })}\n\n`
+        );
+      }
+      toolState.openTools.clear();
+      
       events.push(
         `event: message_delta\ndata: ${JSON.stringify({
           type: "message_delta",
@@ -664,7 +699,7 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
           model: "contextforge",
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 1 },
+          usage: { input_tokens: 0, output_tokens: 0 },
         },
       })}\n\n`
     );
@@ -702,7 +737,7 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
 
   if (delta?.tool_calls) {
     for (const tc of delta.tool_calls) {
-      if (toolState.inTextBlock && !toolState.inToolCall) {
+      if (toolState.inTextBlock && toolState.openTools.size === 0) {
         toolState.inTextBlock = false;
         events.push(
           `event: content_block_stop\ndata: ${JSON.stringify({
@@ -713,22 +748,14 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
       }
 
       if (tc.id && tc.function?.name) {
-        if (toolState.inToolCall && toolState.currentToolIndex >= 0) {
-          events.push(
-            `event: content_block_stop\ndata: ${JSON.stringify({
-              type: "content_block_stop",
-              index: toolState.currentToolIndex,
-            })}\n\n`
-          );
-        }
-
-        toolState.inToolCall = true;
-        toolState.currentToolIndex = toolState.nextBlockIndex++;
+        const newBlockIndex = toolState.nextBlockIndex++;
+        toolState.toolIndices[tc.index] = newBlockIndex;
+        toolState.openTools.add(newBlockIndex);
 
         events.push(
           `event: content_block_start\ndata: ${JSON.stringify({
             type: "content_block_start",
-            index: toolState.currentToolIndex,
+            index: newBlockIndex,
             content_block: {
               type: "tool_use",
               id: tc.id,
@@ -739,17 +766,20 @@ export function translateOpenAISSEToAnthropic(openAIData, messageId, isFirst, to
         );
       }
 
-      if (tc.function?.arguments && toolState.currentToolIndex >= 0) {
-        events.push(
-          `event: content_block_delta\ndata: ${JSON.stringify({
-            type: "content_block_delta",
-            index: toolState.currentToolIndex,
-            delta: {
-              type: "input_json_delta",
-              partial_json: tc.function.arguments,
-            },
-          })}\n\n`
-        );
+      if (tc.function?.arguments) {
+        const blockIndex = toolState.toolIndices[tc.index];
+        if (blockIndex !== undefined) {
+          events.push(
+            `event: content_block_delta\ndata: ${JSON.stringify({
+              type: "content_block_delta",
+              index: blockIndex,
+              delta: {
+                type: "input_json_delta",
+                partial_json: tc.function.arguments,
+              },
+            })}\n\n`
+          );
+        }
       }
     }
   }

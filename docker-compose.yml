@@ -1,0 +1,77 @@
+version: "3.9"
+
+services:
+  contextforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: contextforge:latest
+    container_name: contextforge
+    restart: unless-stopped
+
+    ports:
+      - "${CF_PORT:-3000}:3000"
+
+    environment:
+      # ── Provider routing ───────────────────────────────────────────
+      # Set CF_PROVIDER to: ollama | openai | anthropic | groq | gemini
+      CF_PROVIDER: ${CF_PROVIDER:-ollama}
+
+      # ── Model override (optional) ──────────────────────────────────
+      # Leave unset to pass through the client's requested model
+      CF_MODEL_OVERRIDE: ${CF_MODEL_OVERRIDE:-}
+
+      # ── API Keys ───────────────────────────────────────────────────
+      OPENAI_API_KEY:     ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY:  ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY:       ${GROQ_API_KEY:-}
+      GEMINI_API_KEY:     ${GEMINI_API_KEY:-}
+
+      # ── Ollama (if using local Ollama on host machine) ─────────────
+      # On Linux: use host.docker.internal OR the host's actual LAN IP
+      # On Mac/Windows Docker Desktop: host.docker.internal works natively
+      OLLAMA_HOST:        ${OLLAMA_HOST:-host.docker.internal}
+      OLLAMA_PORT:        ${OLLAMA_PORT:-11434}
+
+      # ── Workspace ─────────────────────────────────────────────────
+      CF_WORKSPACE_PATH:  /workspace
+
+      # ── Server ────────────────────────────────────────────────────
+      CF_PORT:            3000
+      NODE_ENV:           production
+
+    volumes:
+      # Mount your actual project so the graph indexer can see it
+      - ${WORKSPACE_PATH:-./}:/workspace:ro
+
+      # Persist memory database between container restarts
+      - contextforge_data:/app/src/data
+
+    # Allows reaching Ollama running on the host machine (Linux only)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Optional: local Ollama sidecar ──────────────────────────────────
+  # Uncomment this block if you want Ollama to run inside Docker too.
+  # Requires NVIDIA Container Toolkit for GPU support.
+  #
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: ollama
+  #   volumes:
+  #     - ollama_data:/root/.ollama
+  #   ports:
+  #     - "11434:11434"
+  #   environment:
+  #     - OLLAMA_HOST=0.0.0.0
+
+volumes:
+  contextforge_data:
+  # ollama_data:
