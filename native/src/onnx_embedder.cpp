@@ -9,6 +9,12 @@
 #include <cstring>
 
 #ifdef _WIN32
+  // NOMINMAX: windows.h defines min/max as MACROS, which mangles std::max()
+  // into a syntax error (MSVC C2589). Must be defined before the include.
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
 #endif
 
@@ -65,7 +71,9 @@ OnnxEmbedder::OnnxEmbedder(
 
     int cores        = (int)std::thread::hardware_concurrency();
     if (cores <= 0) cores = 4;
-    int intra_threads = std::max(1, cores / 2);
+    // (std::max) parenthesized: macro-proof even if some other header
+    // re-introduces the min/max macros after our NOMINMAX guard.
+    int intra_threads = (std::max)(1, cores / 2);
     ort_api_->SetIntraOpNumThreads(ort_opts_, intra_threads);
     ort_api_->SetSessionGraphOptimizationLevel(ort_opts_, ORT_ENABLE_ALL);
 

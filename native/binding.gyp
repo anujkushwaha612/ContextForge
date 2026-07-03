@@ -81,7 +81,9 @@
                             "-Wl,-rpath,@loader_path",
                             "-Wl,-rpath,<(module_root_dir)/vendor/onnxruntime/lib"
                         ],
-                        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+                        "MACOSX_DEPLOYMENT_TARGET": "11.0",
+                        "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
+                        "CLANG_CXX_LANGUAGE_STANDARD": "c++17"
                     }
                 }],
 
