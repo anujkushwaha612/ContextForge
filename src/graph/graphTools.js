@@ -45,6 +45,7 @@ import {
   queryFindConfigByFn,
   getWorkspaceRoot,
   getAllIndexedFiles,
+  resolvePathCase,
 } from "./graphDb.js";
 import { statsEmitter } from "../proxy/statsEmitter.js";
 import fs from "node:fs";
@@ -104,11 +105,14 @@ function normalizeTargetPath(rawPath) {
 
 // ─────────────────────────────────────────────
 // Read file helper — CRLF normalized
+// GB-9 FIX: Resolve canonical path to actual filesystem path for case-sensitive systems
 // ─────────────────────────────────────────────
 
 function readFileLines(filePath) {
   try {
-    return fs.readFileSync(filePath, "utf-8").replace(/\r\n/g, "\n").split("\n");
+    // GB-9: Resolve canonical (lowercased) path back to actual filesystem path
+    const actualPath = resolvePathCase(filePath);
+    return fs.readFileSync(actualPath, "utf-8").replace(/\r\n/g, "\n").split("\n");
   } catch {
     return null;
   }
@@ -259,7 +263,9 @@ export function getGraphToolDefinition() {
 // ─────────────────────────────────────────────
 
 function readSymbolBody(sym) {
-  let resolvedPath = normalizeTargetPath(sym.file_path);
+  // GB-9 FIX: Resolve canonical path to actual filesystem path for case-sensitive systems
+  let resolvedPath = resolvePathCase(sym.file_path);
+  resolvedPath = normalizeTargetPath(resolvedPath);
   if (!path.isAbsolute(resolvedPath)) {
     resolvedPath = path.resolve(getWorkspaceRoot(), resolvedPath);
   }
@@ -969,7 +975,8 @@ export function executeReadFileChunk(filePath, startLine, endLine) {
       });
 
       if (matches.length === 1) {
-        resolvedPath = matches[0].file_path;
+        // GB-9: Resolve canonical path back to actual filesystem path for case-sensitive systems
+        resolvedPath = resolvePathCase(matches[0].file_path);
       } else if (matches.length > 1) {
         return JSON.stringify({
           error: "Ambiguous file path",
@@ -1110,7 +1117,9 @@ function readSourceLine(filePath, lineNumber, valueHint = null) {
   try {
     let lines = _lineCache.get(filePath);
     if (!lines) {
-      let resolved = normalizeTargetPath(filePath);
+      // GB-9: Resolve canonical path to actual filesystem path for case-sensitive systems
+      let resolved = resolvePathCase(filePath);
+      resolved = normalizeTargetPath(resolved);
       if (!path.isAbsolute(resolved)) resolved = path.resolve(getWorkspaceRoot(), resolved);
       lines = fs.readFileSync(resolved, "utf-8").replace(/\r\n/g, "\n").split("\n");
       _lineCache.set(filePath, lines);

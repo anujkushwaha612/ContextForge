@@ -494,6 +494,7 @@ export class SavingsTracker {
         tokens_before: tokensBefore,
         tokens_after: tokensAfter,
         tokens_saved: tokensSaved,
+        cache_read_tokens: Math.max(0, lifetime.cache_read_tokens || 0),
         ghost_retries: Math.max(0, lifetime.ghost_retries || 0),
         requests_with_retries: Math.max(0, lifetime.requests_with_retries || 0),
       },

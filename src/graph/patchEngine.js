@@ -23,19 +23,6 @@
  *         replacement key. Previously the fuzzy match could be a
  *         whitespace-normalized string not present in symbolBlock,
  *         causing replaceAll to silently no-op.
- *
- *   BUG-3 FIX: reindexFile() changed from setImmediate (deferred) to
- *         synchronous execution. The deferred re-index caused "Stale index:
- *         Body mismatch" warnings on the next patch call (which arrived
- *         before setImmediate fired), forcing a costly sync re-index
- *         recovery. Synchronous re-index adds ~2-5ms per patch but
- *         eliminates the stale-index recovery path entirely.
- *         Also removed the now-redundant reindexFileSync() helper.
- *
- *   BUG-4 FIX: Removed duplicate invalidateRegistryEntry() call from
- *         postPatchInvalidate(). The function already normalizes paths
- *         internally, so the second call with the workspace-relative
- *         form was redundant.
  */
 
 import fs from "node:fs";
@@ -47,6 +34,7 @@ import {
   queryNodeByStableId,
   writeFileGraph,
   getWorkspaceRoot,
+  resolvePathCase,
 } from "./graphDb.js";
 import { extractSymbols, getLanguageForFile } from "./symbolExtractor.js";
 import { extractLiterals, buildNodeSummaries } from "./literalExtractor.js";
@@ -74,7 +62,20 @@ const MAX_PATCHABLE_FILE_SIZE = 500_000;
 // ─────────────────────────────────────────────
 
 function resolveFilePath(filePath) {
+  // GB-9: First resolve the canonical path to actual filesystem path for case-sensitive systems
+  // The LLM may provide paths from graph queries which are stored in lowercase (canonical form)
+  // We need to resolve them back to actual filesystem paths to avoid ENOENT on Linux/macOS
   let p = filePath.replace(/\\/g, "/").replace(/^\.\//, "");
+
+  // Try to resolve through the path case cache
+  // First check if this is already a canonical path (lowercase)
+  const canonicalP = p.toLowerCase();
+  const resolvedFromCache = resolvePathCase(canonicalP);
+
+  // If we got a different path from cache, use it (it has the correct case)
+  if (resolvedFromCache && resolvedFromCache.toLowerCase() === canonicalP) {
+    p = resolvedFromCache;
+  }
 
   if (path.isAbsolute(p) || /^[A-Za-z]:\//.test(p)) {
     return p;
@@ -348,7 +349,7 @@ function atomicWrite(filePath, content, hasCRLF = false) {
 }
 
 // ─────────────────────────────────────────────
-// Re-index — SYNCHRONOUS to prevent stale index on next patch
+// Re-index — deferred to avoid blocking event loop
 // ─────────────────────────────────────────────
 
 // PE-12 FIX: writeFileGraph must receive the SAME path form the indexer
@@ -378,20 +379,54 @@ function toGraphPath(filePath) {
 // Fix: re-run the same extraction workspaceMapper.js uses and pass it
 // through, so a patched file's graph richness is preserved exactly like a
 // freshly-indexed one.
-//
-// BUG-3 FIX: Changed from setImmediate() to synchronous execution.
-// The deferred re-index caused "Stale index: Body mismatch" warnings on
-// the next patch call (which arrived before setImmediate fired), forcing
-// a costly sync re-index recovery. Synchronous re-index adds ~2-5ms per
-// patch but eliminates the stale-index recovery path entirely.
 function reindexFile(filePath, newSource) {
+  setImmediate(() => {
+    try {
+      const graphPath = toGraphPath(filePath); // PE-12
+      const langInfo = getLanguageForFile(filePath);
+      const language = langInfo?.language || "unknown";
+      const stat = fs.statSync(filePath);
+      const { nodes, edges } = extractSymbols(newSource, graphPath);
+      const { literals, configRefs } = extractLiterals(newSource, graphPath, nodes); // PE-15
+      const summaries = buildNodeSummaries(nodes, literals, configRefs, graphPath); // PE-15
+
+      writeFileGraph({
+        filePath: graphPath,
+        language,
+        lastModified: stat.mtimeMs,
+        nodes,
+        edges,
+        literals,
+        configRefs,
+        summaries,
+      });
+
+      console.log(
+        `[PatchEngine] 🔄 Re-indexed ${path.basename(filePath)} ` +
+          `(${nodes.length} nodes, ${edges.length} edges)`
+      );
+    } catch (err) {
+      console.error(`[PatchEngine] ⚠️  Re-index failed for ${filePath}: ${err.message}`);
+    }
+  });
+}
+
+// ─────────────────────────────────────────────
+// Synchronous re-index — used ONLY for stale recovery
+//
+// PE-2 FIX: Extracted from the inline stale recovery block so the
+// logic is not duplicated. Called synchronously (not via setImmediate)
+// because stale recovery must complete before re-resolving the symbol.
+// ─────────────────────────────────────────────
+
+function reindexFileSync(filePath, source) {
   try {
     const graphPath = toGraphPath(filePath); // PE-12
     const langInfo = getLanguageForFile(filePath);
     const language = langInfo?.language || "unknown";
     const stat = fs.statSync(filePath);
-    const { nodes, edges } = extractSymbols(newSource, graphPath);
-    const { literals, configRefs } = extractLiterals(newSource, graphPath, nodes); // PE-15
+    const { nodes, edges } = extractSymbols(source, graphPath);
+    const { literals, configRefs } = extractLiterals(source, graphPath, nodes); // PE-15
     const summaries = buildNodeSummaries(nodes, literals, configRefs, graphPath); // PE-15
 
     writeFileGraph({
@@ -406,17 +441,13 @@ function reindexFile(filePath, newSource) {
     });
 
     console.log(
-      `[PatchEngine] 🔄 Re-indexed ${path.basename(filePath)} ` +
+      `[PatchEngine] 🔄 Sync re-indexed ${path.basename(filePath)} ` +
         `(${nodes.length} nodes, ${edges.length} edges)`
     );
   } catch (err) {
-    console.error(`[PatchEngine] ⚠️  Re-index failed for ${filePath}: ${err.message}`);
+    console.error(`[PatchEngine] ⚠️  Sync re-index failed for ${filePath}: ${err.message}`);
   }
 }
-
-// BUG-3 FIX: reindexFileSync removed — reindexFile() is now synchronous,
-// so the separate "sync" variant is no longer needed. Stale recovery
-// simply calls reindexFile() directly.
 
 // ─────────────────────────────────────────────
 // Diff summary
@@ -449,11 +480,9 @@ function postPatchInvalidate(normalizedFilePath, newSource, semanticCache) {
   }
   try {
     invalidateRegistryEntry(cacheKeyPath);
-    // BUG-4 FIX: Removed second invalidateRegistryEntry(toGraphPath(...)) call.
-    // invalidateRegistryEntry() already normalizes paths internally
-    // (strips CWD prefix, src/ prefix, extracts basename as fallback).
-    // The second call with the workspace-relative form was redundant —
-    // the single call above already finds all matching registry entries.
+    // Also invalidate under the workspace-relative form — semanticDedup's
+    // registry keys come from message _filename fields which are relative.
+    invalidateRegistryEntry(toGraphPath(normalizedFilePath).toLowerCase());
   } catch (err) {
     console.warn(`[PatchEngine] ⚠️  SimHash registry invalidation failed: ${err.message}`);
   }
@@ -840,11 +869,13 @@ export async function executePatch({
   if (integrity.stale) {
     console.log(`[PatchEngine] ⚠️  Stale index: ${integrity.reason}. Re-indexing…`);
 
-    // BUG-3 FIX: reindexFile() is now synchronous (setImmediate removed).
-    // This re-index completes before the function returns, so subsequent
-    // patches in the same batch see fresh index data — no more "Stale index"
-    // warnings from racing with deferred re-indexing.
-    reindexFile(normalizedFilePath, source);
+    // PE-2 FIX: Use reindexFileSync for stale recovery — do NOT call
+    // reindexFile() here. reindexFile() defers via setImmediate, scheduling
+    // a SECOND writeFileGraph call that fires after the synchronous one below.
+    // Previously: reindexFile() (deferred) + inline sync block + setImmediate fires
+    // = 3 writeFileGraph calls for one stale detection.
+    // Now: reindexFileSync() only = 1 writeFileGraph call.
+    reindexFileSync(normalizedFilePath, source);
 
     const fresh = resolveSymbol(target_symbol, file_path);
     if (fresh.error) {

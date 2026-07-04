@@ -76,7 +76,7 @@ AI coding agents waste **thousands of tokens** on every request:
 
 ---
 
-## How It Works (30 seconds)
+## How It Works (High Level Overview)
 
 ```
   Claude Code            ← launched by `cf wrap claude`
@@ -103,7 +103,7 @@ AI coding agents waste **thousands of tokens** on every request:
 1. **`cf wrap claude`** ensures the environment (models, native engine), starts the proxy, indexes your repo (a 30-file Express app indexes in ~0.5s), and launches Claude Code with the proxy as its base URL plus ContextForge's MCP tools registered.
 2. **Requests are translated** between Anthropic format (what Claude Code speaks) and your upstream provider's format — this is how Claude Code drives local Ollama models.
 3. **Repository tools answer locally.** `find_symbol('deleteFile')` returns file + line range from the pre-built graph — no file reads, no wasted round-trip.
-4. **The optimizer compresses what's left** — schemas, duplicate history, oversized junk — with age-gating so content the model *just requested* is never compressed out from under it.
+4. **The optimizer compresses what's left** — schemas, duplicate history, oversized junk — with age-gating so content the model _just requested_ is never compressed out from under it.
 5. **On exit**, you get the receipt: `✔ Session: 14 requests · 424,129 tokens in → 208,163 sent · 50.9% saved (est)`.
 
 ---
@@ -172,36 +172,84 @@ Any agent that honors `ANTHROPIC_BASE_URL` (or an OpenAI-compatible base URL) ca
 
 ## Real Results
 
-From a real session — a multi-file refactor task ("create an error-handler utility, then refactor 3 error responses across 2 controllers to use it") run through ContextForge with Claude Code driving a **local Ollama model**:
+The same **Soft-Delete** feature was implemented twice in the same Express.js cloud storage backend using the **same model (local Ollama)**, **same repository state**, and **same instructions**.
 
-```
-✔ Session: 9 requests · 246,421 tokens in → 114,930 sent · 53.4% saved (est)
-```
+### Head-to-head Comparison
 
-Four patches applied (1 file created + 3 refactors), zero failed edits, zero wasted round-trips — in 46 seconds of model time.
-
-| Where the savings come from        | Per-turn effect (measured)                    |
-| ---------------------------------- | --------------------------------------------- |
-| Tool-schema minimization           | ~16,800 tokens/turn                           |
-| System-prompt dedup + skills prune | ~1,100–1,200 tokens/turn                      |
-| Keep-newest file dedup             | up to ~2,700 tokens/turn on repeated reads    |
-| Self-verifying patch diffs         | replaces 500–2,000-token re-reads with ~50-token proofs |
-| AST skeleton compression           | engages on large files under context pressure |
-
-**The trajectory matters more than one number.** The same class of task, measured across pipeline iterations on the same repo and model:
-
-| Pipeline version                  | Requests | Saved  | Failure modes observed                     |
-| --------------------------------- | -------- | ------ | ------------------------------------------ |
-| Early pipeline                    | 12       | 49.3%  | 4 forced retrieval loops, 3 failed native edits |
-| Tool-nudging enabled              | 14       | 50.9%  | ~5 verification re-reads after patches      |
-| **Current (v1)**                  | **9**    | **53.4%** | **none**                                 |
-
-**Honest notes:** savings scale with session length and repo size — turn 1 is roughly break-even (tool injection costs before compression recovers), steady state arrives by turn 3. Token counts are estimated with cl100k tokenization, so absolute numbers are approximate; the ratio and the request count are what matter. Compression is *pressure-aware*: small sessions against local models deliberately compress less, because a forced retrieval round-trip costs more than free local tokens — the pipeline's job is to stay out of the way until it pays.
-
-Run `npm run benchmark` against your own codebase for numbers you can trust more than anyone's README.
+| Metric | Passthrough Mode | ContextForge Mode | Difference |
+|--------|-----------------:|------------------:|-----------:|
+| **LLM round-trips** | 41 | 14 | **66% fewer** |
+| **Input tokens** | 1,632,266 | 444,092 | **72.8% fewer** |
+| **Output tokens** | 1,632,266 | 384,033 | **76.5% fewer** |
+| **Session-reported token savings** | — | 60,059 (13.5%) | — |
+| **Repository exploration** | Full-file reads and repeated searches | Graph-guided symbol lookup with targeted reads | More targeted |
+| **Task management** | 6 TaskCreate/TaskUpdate operations | None | Lower overhead |
+| **Final implementation** | ✅ Correct | ✅ Correct | Equivalent output |
 
 ---
 
+## Implementation Comparison
+
+To compare the two approaches, I implemented the same **Soft-Delete** feature in the cloud storage backend repository using both **ContextForge Mode** and **Passthrough Mode**, with each run starting from the **exact same initial repository state**.
+
+- **Repository:** https://github.com/anujkushwaha612/ADrive_backend
+
+### ContextForge Mode
+
+- **Commit:** https://github.com/anujkushwaha612/ADrive_backend/commit/e78700d5cb15b130df85f728772785bd88d5b413
+- **Run Statistics:** 14 requests · ~444k input tokens
+
+### Passthrough Mode
+
+- **Commit:** https://github.com/anujkushwaha612/ADrive_backend/commit/0f912bfb00b805882b1154a136520d6edecc3a9d
+- **Run Statistics:** 41 requests · ~1.63M input tokens
+
+---
+
+## Understanding the Metrics
+
+At first glance, two numbers appear contradictory:
+
+- **72.8% fewer input tokens** compared to Passthrough Mode.
+- **13.5% session-reported token savings** reported by ContextForge.
+
+These measure **different things**.
+
+### Behavioral Savings
+
+The **72.8% reduction** comes from comparing the two complete executions.
+
+ContextForge changes how the model interacts with the repository:
+
+- Uses graph-based symbol lookup instead of repeated repository exploration.
+- Performs targeted line-range reads instead of repeatedly reading entire files.
+- Reduces unnecessary tool calls and repeated verification.
+- Reaches the same implementation in **14 requests instead of 41**.
+
+These are **behavioral savings**: tokens that were never generated because the model solved the task more efficiently.
+
+Since those requests never happened, they cannot be counted by an in-session compression tracker.
+
+### Session Compression
+
+The **13.5%** figure is the amount of prompt text removed **within the ContextForge session itself**.
+
+This metric measures how much prompt content ContextForge compressed or eliminated before forwarding requests to the model. It does **not** compare against an external Passthrough run.
+
+In other words:
+
+- **72.8%** answers: *"How much smaller was this entire implementation compared to Passthrough?"*
+- **13.5%** answers: *"How much prompt content did ContextForge remove from the requests that were actually sent?"*
+
+These metrics are complementary rather than contradictory.
+
+---
+
+## Notes
+
+- Session-level compression depends on conversation length. Short sessions naturally provide less opportunity for compression than long-running coding sessions.
+- Token counts are estimated using `cl100k` tokenization, so absolute values are approximate.
+- The implementation produced by both runs was functionally equivalent; the primary differences were repository navigation strategy, request count, and token consumption.
 
 ## When to Use · When to Skip
 
@@ -251,7 +299,7 @@ Run `npm run benchmark` against your own codebase for numbers you can trust more
          │ translated + compressed request
          ↓
 ┌─────────────────┐
-│  LLM Provider   │  Ollama · Anthropic · OpenAI 
+│  LLM Provider   │  Ollama · Anthropic · OpenAI
 └─────────────────┘
 ```
 
@@ -328,12 +376,12 @@ Every stage is format-aware (Anthropic tool_result blocks and OpenAI tool messag
 
 ## Supported Providers
 
-| Provider      | Models                     | Notes                                            |
-| ------------- | -------------------------- | ------------------------------------------------ |
+| Provider      | Models                     | Notes                                                                                                  |
+| ------------- | -------------------------- | ------------------------------------------------------------------------------------------------------ |
 | **Ollama**    | All local & cloud models   | Default. The reason many users are here: Claude Code driving `qwen2.5-coder`, `minimax-m3:cloud`, etc. |
-| **Anthropic** | Claude Sonnet, Opus, Haiku | Model picked inside Claude Code via `/model`     |
-| **OpenAI**    | GPT-4o, o-series           | Set `OPENAI_API_KEY`                             |
-| **Gemini**    | Gemini 2.5 family          | Set `GEMINI_API_KEY`                             |
+| **Anthropic** | Claude Sonnet, Opus, Haiku | Model picked inside Claude Code via `/model`                                                           |
+| **OpenAI**    | GPT-4o, o-series           | Set `OPENAI_API_KEY`                                                                                   |
+| **Gemini**    | Gemini 2.5 family          | Set `GEMINI_API_KEY`                                                                                   |
 
 Switch providers anytime:
 
@@ -400,13 +448,13 @@ The most honest benchmark is your own repo — publish yours in a Discussion.
 
 ## Documentation
 
-| Start here                          | Go deeper                                            |
-| ----------------------------------- | ---------------------------------------------------- |
-| [Quick Start](#quick-start)         | [Architecture](#architecture)                        |
+| Start here                             | Go deeper                                            |
+| -------------------------------------- | ---------------------------------------------------- |
+| [Quick Start](#quick-start)            | [Architecture](#architecture)                        |
 | [Agent Setup](#use-with-your-ai-agent) | [How It Works — Deep Dive](#how-it-works--deep-dive) |
-| [Configuration](#configuration)     | [RELEASE.md](RELEASE.md) — publish pipeline          |
-| [Troubleshooting](#troubleshooting) | [INTEGRATION.md](INTEGRATION.md) — repo layout       |
-| [Contributing](#contributing)       | [FAQ](#faq)                                          |
+| [Configuration](#configuration)        | [RELEASE.md](RELEASE.md) — publish pipeline          |
+| [Troubleshooting](#troubleshooting)    | [INTEGRATION.md](INTEGRATION.md) — repo layout       |
+| [Contributing](#contributing)          | [FAQ](#faq)                                          |
 
 ---
 
@@ -458,7 +506,7 @@ Yes. SSE streams are translated between provider formats in real time — respon
 <details>
 <summary><b>What kind of token savings should I expect?</b></summary>
 
-Real multi-file coding sessions measure around **50%** (see [Real Results](#real-results)). Repository-heavy work benefits most. Short chats benefit least — and by design: the policy engine compresses *less* when context pressure is low and your upstream is a free local model, because a forced retrieval round-trip costs more than the tokens it saves.
+Real multi-file coding sessions measure around **50%** (see [Real Results](#real-results)). Repository-heavy work benefits most. Short chats benefit least — and by design: the policy engine compresses _less_ when context pressure is low and your upstream is a free local model, because a forced retrieval round-trip costs more than the tokens it saves.
 
 </details>
 
@@ -479,7 +527,7 @@ Oversized or junk content (lockfiles, minified bundles, huge outputs) is stored 
 <details>
 <summary><b>Is my code sent anywhere besides my chosen provider?</b></summary>
 
-No. ContextForge runs entirely on your machine — the graph, vaults, memory, and embeddings (local ONNX model) never leave it. The only outbound traffic is the compressed request to the provider *you* configured. With Ollama, nothing leaves your machine at all.
+No. ContextForge runs entirely on your machine — the graph, vaults, memory, and embeddings (local ONNX model) never leave it. The only outbound traffic is the compressed request to the provider _you_ configured. With Ollama, nothing leaves your machine at all.
 
 </details>
 
@@ -655,13 +703,13 @@ MIT — see [LICENSE](LICENSE).
 
 Almost everything above is real. The short remaining list:
 
-| Item                       | Where             | What to do                                                              |
-| -------------------------- | ----------------- | ----------------------------------------------------------------------- |
-| Demo GIF                   | below the intro   | Record `cf wrap claude` on a real task (vhs/asciinema) → `docs/images/demo.gif` — re-add the `<img>` block when ready |
-| Benchmark table            | [Real Results](#real-results) | After the next benchmark run, add a with/without comparison from `npm run benchmark` |
-| LICENSE file               | repo root         | Commit the MIT text (package.json already declares it)                  |
-| Good-first-issue links     | [Contributing](#contributing) | Open 3–4 real issues and link them                                       |
-| npm badge                  | badges block      | After first publish: `https://img.shields.io/npm/v/contextforge`        |
+| Item                   | Where                         | What to do                                                                                                            |
+| ---------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Demo GIF               | below the intro               | Record `cf wrap claude` on a real task (vhs/asciinema) → `docs/images/demo.gif` — re-add the `<img>` block when ready |
+| Benchmark table        | [Real Results](#real-results) | After the next benchmark run, add a with/without comparison from `npm run benchmark`                                  |
+| LICENSE file           | repo root                     | Commit the MIT text (package.json already declares it)                                                                |
+| Good-first-issue links | [Contributing](#contributing) | Open 3–4 real issues and link them                                                                                    |
+| npm badge              | badges block                  | After first publish: `https://img.shields.io/npm/v/contextforge`                                                      |
 
 ---
 

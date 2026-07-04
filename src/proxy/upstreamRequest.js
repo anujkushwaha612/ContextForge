@@ -499,7 +499,6 @@ class ToolInterceptor {
       const normalized = normalizeGraphToolName(name);
       let toolSucceeded = false;
       let isActionTool = false;
-      const toolStart = Date.now();
 
       // ── Graph tool ────────────────────────────────────────────────────────
       if (isGraphToolCall(name)) {
@@ -722,7 +721,6 @@ class ToolInterceptor {
         __cf_raw: isReadFileChunkTool(name),
         _source_file: args.file_path || null,
       });
-      statsEmitter.recordToolExecution(name, Date.now() - toolStart);
     }
 
     return {

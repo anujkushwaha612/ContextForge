@@ -75,6 +75,41 @@ export function getWorkspaceRoot() {
   return _workspaceRoot || process.env.CF_WORKSPACE_PATH || process.cwd();
 }
 
+// GB-9: Path case cache — maps canonical (lowercased) paths to actual filesystem paths.
+// This is necessary because we store paths in lowercase for consistency (GB-1),
+// but on case-sensitive filesystems (Linux/macOS) we need the original case to read files.
+// Populated during writeFileGraph() and used by readSymbolBody() to resolve paths.
+const _pathCaseCache = new Map();
+
+/**
+ * Register the actual filesystem path for a canonical path.
+ * Called during indexing to preserve the original case.
+ * @param {string} canonicalPath - The lowercased canonical path
+ * @param {string} actualPath - The actual filesystem path with correct case
+ */
+export function registerPathCase(canonicalPath, actualPath) {
+  if (!canonicalPath || !actualPath) return;
+  _pathCaseCache.set(canonicalPath, actualPath);
+}
+
+/**
+ * Resolve a canonical path back to its actual filesystem path.
+ * Falls back to the input path if not found in cache (for backward compatibility).
+ * @param {string} canonicalPath - The lowercased canonical path
+ * @returns {string} The actual filesystem path with correct case, or the input if not cached
+ */
+export function resolvePathCase(canonicalPath) {
+  if (!canonicalPath) return canonicalPath;
+  return _pathCaseCache.get(canonicalPath) || canonicalPath;
+}
+
+/**
+ * Clear the path case cache. Called when clearing the graph.
+ */
+export function clearPathCaseCache() {
+  _pathCaseCache.clear();
+}
+
 // GB-1: THE canonical path form. Applied at every write and every read.
 // Lowercase matches normalizePathForCache in upstreamRequest.js.
 // (Trade-off: on case-sensitive filesystems two files differing only by case
@@ -492,6 +527,10 @@ export function writeFileGraph(fileData) {
 
   // GB-1: canonicalize ONCE; every row and every derived id uses this form.
   const filePath = canonicalPath(fileData.filePath);
+  
+  // GB-9: Register the actual filesystem path for case-sensitive resolution.
+  // This maps the canonical (lowercased) path to the original path with correct case.
+  registerPathCase(filePath, fileData.filePath);
 
   const fileId = crypto.createHash("sha256").update(filePath).digest("hex").slice(0, 16);
 
@@ -777,4 +816,6 @@ export function clearGraph() {
     DELETE FROM nodes;
     DELETE FROM files;
   `);
+  // GB-9: Clear the path case cache when clearing the graph
+  clearPathCaseCache();
 }
