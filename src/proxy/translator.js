@@ -616,45 +616,6 @@ export function minimizeToolSchemas(payload) {
   return payload;
 }
 
-export function minimizeToolSchemas(payload) {
-  if (!payload.tools?.length) return payload;
-
-  let savedChars = 0;
-  const originalSize = JSON.stringify(payload.tools).length;
-
-  payload.tools = payload.tools.map((tool) => {
-    const fn = tool.function || tool;
-    const toolName = fn.name || tool.name || "";
-    const isProtected = isProtectedTool(toolName, fn);
-
-    // Per-tool cache key, so editing one tool doesn't blow the whole cache
-    const key = crypto
-      .createHash("sha256")
-      .update(toolName + JSON.stringify(fn.description) + JSON.stringify(fn.parameters))
-      .digest("hex")
-      .slice(0, 16);
-
-    if (_toolSchemaCacheMap.has(key)) {
-      return _toolSchemaCacheMap.get(key);
-    }
-
-    const newFn = JSON.parse(JSON.stringify(fn));
-    if (!isProtected && typeof newFn.description === "string") {
-      newFn.description = truncateSemantic(newFn.description, MAX_TOOL_DESCRIPTION_CHARS);
-    }
-    if (newFn.parameters) minimizeSchema(newFn.parameters, isProtected);
-
-    const result = { type: "function", function: newFn };
-    _toolSchemaCacheMap.set(key, result);
-    return result;
-  });
-
-  savedChars = originalSize - JSON.stringify(payload.tools).length;
-  if (savedChars > 0) payload._cf_minimizeTokensSaved = Math.floor(savedChars / 4);
-
-  return payload;
-}
-
 // ========================================================
 // 3. STREAM TRANSLATOR: OpenAI Server Deltas -> Anthropic SSE
 // ========================================================
