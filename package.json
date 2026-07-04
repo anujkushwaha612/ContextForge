@@ -1,5 +1,5 @@
 {
-  "name": "contextforge",
+  "name": "@anuj612/contextforge",
   "version": "1.0.0",
   "description": "Repository-aware execution runtime for AI coding agents. AST-powered compression, graph queries, and verified patching.",
   "type": "module",

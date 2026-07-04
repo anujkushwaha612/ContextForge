@@ -41,7 +41,7 @@ Repository-aware execution runtime for Claude Code
 ContextForge is a **local proxy + CLI** that sits between Claude Code and your LLM provider — executing repository tool calls locally, compressing context before it reaches the model, and maintaining an AST-level knowledge graph of your codebase. Run local models through Ollama or any major cloud provider. Designed to produce the same result while using significantly fewer tokens on repository-aware tasks.
 
 ```
-npm i -g contextforge
+npm i -g @anuj612/contextforge
 cd your-project
 cf wrap claude
 ```
@@ -116,7 +116,7 @@ AI coding agents waste **thousands of tokens** on every request:
 Requires Node ≥ 20. No compilers — prebuilt native binaries ship for Windows, macOS (Intel/ARM), and Linux (x64/ARM).
 
 ```bash
-npm i -g contextforge
+npm i -g @anuj612/contextforge
 cd your-project
 cf wrap claude
 ```
@@ -484,7 +484,7 @@ _(Note: In Mac/Linux or Git Bash, the syntax would be `export OPENAI_API_KEY="yo
 
 ```bash
 # npm install
-npm update -g contextforge
+npm update -g @anuj612/contextforge
 
 
 # From source
@@ -563,7 +563,7 @@ No. ContextForge runs entirely on your machine — the graph, vaults, memory, an
 <details>
 <summary><b>Do I need to compile the native components?</b></summary>
 
-Not with `npm i -g contextforge`. Prebuilt N-API binaries ship for all major platforms. Compiling from source is only needed for unsupported architectures or development; `cf doctor` tells you exactly which binary type is currently loaded.
+Not with `npm i -g @anuj612/contextforge`. Prebuilt N-API binaries ship for all major platforms. Compiling from source is only needed for unsupported architectures or development; `cf doctor` tells you exactly which binary type is currently loaded.
 
 </details>
 
@@ -714,7 +714,7 @@ Include `cf doctor --json` output in any bug report.
 <details>
 <summary><b>Native addon fails to load (CF_ERR_NATIVE_LOAD)</b></summary>
 
-`cf doctor` shows which path was searched. If you're on one of the 5 prebuilt platforms, reinstall (`npm i -g contextforge`). On other platforms, build from source:
+`cf doctor` shows which path was searched. If you're on one of the 5 prebuilt platforms, reinstall (`npm i -g @anuj612/contextforge`). On other platforms, build from source:
 
 ```bash
 # Windows: VS Build Tools ("Desktop development with C++") + Python 3
