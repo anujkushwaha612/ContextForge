@@ -48,22 +48,7 @@ const SKILLS_PHRASE = "The following skills are available for use with the Skill
 //          `diff`; the workflow now says NOT to re-read to verify. This is
 //          what converts the observed 3-6 verification round-trips per
 //          session into zero.
-// SM-13 FIX: TOOL_GUIDANCE/PATCH_GUIDANCE were hardcoded to the
-//          `mcp__contextforge__` name prefix unconditionally. That's only
-//          correct when the client discovers these tools via MCP (mcp/bridge.js).
-//          server.js's GRAPH_INJECT stage can ALSO inject the tools directly
-//          under their BARE names (contextforge_query_graph, etc.) for
-//          non-MCP clients — and when it does, this guidance was still
-//          telling the model to call the mcp__-prefixed name, which does not
-//          exist in that request's tools array. Reproduced: the model
-//          correctly reported "the tools I have access to don't include
-//          contextforge_query_graph" because the guidance lied about the
-//          actual tool name available to it.
-//
-// Fix: build BOTH variants once at module load (preserving the original
-// SM-1 intent of not recomputing per request — there are only two possible
-// shapes, not one per request) and select the correct one per request based
-// on which naming convention is actually present in payload.tools.
+
 function buildToolGuidance(prefix) {
   return process.env.CF_NUDGE_TOOLS === "1"
     ? `\n\n## ContextForge Mandatory Workflow
@@ -116,7 +101,7 @@ for a DIFFERENT edit.
 // SM-9 FIX: Rewritten to teach correct workflow, not just warn.
 // SM-11: softened — in non-nudge mode native Edit IS available; the advice
 // is preference (CF patching survives compressed content), not a ban.
-// SM-13 FIX: same prefix parameterization as buildToolGuidance above.
+
 function buildPatchGuidance(prefix) {
   return process.env.CF_NUDGE_TOOLS !== "1"
     ? `\n\n## ContextForge Edit Workflow (recommended)
@@ -136,56 +121,8 @@ If you see compressed content, retrieve the full source first with
 }
 
 const MCP_PREFIX = "mcp__contextforge__";
-const BARE_PREFIX = "";
 
-// SM-13 FIX: both variants precomputed once at module load (same spirit as
-// the original SM-1 fix — avoid rebuilding these strings per request).
-const CF_RULE_MCP = CF_NOTICE + buildToolGuidance(MCP_PREFIX) + buildPatchGuidance(MCP_PREFIX);
-const CF_RULE_BARE = CF_NOTICE + buildToolGuidance(BARE_PREFIX) + buildPatchGuidance(BARE_PREFIX);
-
-// SM-13 FIX: bare-name tool-name constants used to detect which naming
-// convention is actually present in a given request's tools array.
-const BARE_TOOL_NAMES = [
-  "contextforge_query_graph",
-  "contextforge_patch_ast",
-  "read_file_chunk",
-  "contextforge_retrieve",
-];
-
-/**
- * SM-13 FIX: Determine whether payload.tools carries the tools under their
- * mcp__contextforge__-prefixed names (MCP-discovered) or their bare names
- * (server.js's direct GRAPH_INJECT-stage injection for non-MCP clients).
- * Mirrors the isGraphToolCall/isPatchToolCall/isReadFileChunkTool alias
- * checks in graphTools.js/patchTools.js, kept independent here since
- * systemMessages.js should not gain a dependency on the graph/patch modules
- * just to pick a guidance string.
- *
- * Ordering note: server.js runs STAGES.DEDUPLICATE (which calls
- * injectContextForgeRule) BEFORE STAGES.GRAPH_INJECT (where bare-named
- * tools actually get added to payload.tools for non-MCP clients). That
- * means on a non-MCP session's FIRST turn, payload.tools contains no
- * ContextForge tool yet at the point this function runs — the bare names
- * are injected later in the same request. An MCP session, by contrast,
- * ALWAYS arrives with mcp__-prefixed tools already present in payload.tools
- * from turn 1 onward, because Claude Code includes its full MCP-discovered
- * tool list on every request once registered.
- *
- * So the correct default when no ContextForge tool is present yet is BARE
- * naming, not MCP — the absence of mcp__-prefixed tools is itself the
- * signal that this is (or will be, this same request) a non-MCP session.
- */
-function usesMcpToolNames(payload) {
-  if (!Array.isArray(payload.tools)) return false;
-  for (const t of payload.tools) {
-    const name = t.name || t.function?.name;
-    if (!name) continue;
-    if (name.startsWith(MCP_PREFIX)) return true;
-    if (BARE_TOOL_NAMES.includes(name)) return false;
-  }
-  return false; // no ContextForge tool present yet — default to bare naming
-}
-
+const CF_RULE = CF_NOTICE + buildToolGuidance(MCP_PREFIX) + buildPatchGuidance(MCP_PREFIX);
 
 // ─────────────────────────────────────────────
 // injectContextForgeRule
@@ -193,10 +130,6 @@ function usesMcpToolNames(payload) {
 
 export function injectContextForgeRule(payload) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
-
-  // SM-13 FIX: pick the guidance variant matching the tool names actually
-  // present (or about to be injected this same request) for this client.
-  const cfRule = usesMcpToolNames(payload) ? CF_RULE_MCP : CF_RULE_BARE;
 
   for (let i = 0; i < payload.messages.length; i++) {
     const msg = payload.messages[i];
@@ -209,7 +142,7 @@ export function injectContextForgeRule(payload) {
     const newMessages = [...payload.messages];
     newMessages[i] = {
       ...msg,
-      content: msg.content + cfRule,
+      content: msg.content + CF_RULE,
     };
 
     return { ...payload, messages: newMessages };
@@ -217,7 +150,7 @@ export function injectContextForgeRule(payload) {
 
   return {
     ...payload,
-    messages: [{ role: "system", content: cfRule.trim() }, ...payload.messages],
+    messages: [{ role: "system", content: CF_RULE.trim() }, ...payload.messages],
   };
 }
 

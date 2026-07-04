@@ -112,7 +112,7 @@ export const AGENTS = {
             2
           )
         );
-        // args.push("--mcp-config", mcpConfigFile);
+        args.push("--mcp-config", mcpConfigFile);
         cleanupFiles.push(mcpConfigFile);
       }
 

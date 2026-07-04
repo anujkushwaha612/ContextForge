@@ -21,6 +21,14 @@
  *         statsEmitter.recordAgentAction("astPatches") — the actual method
  *         that exists on statsEmitter. recordPatchOperation was silently
  *         no-op'd by the ?. operator since the method doesn't exist.
+ *
+ *   BUG-5 FIX: Added early validation for common LLM mistakes — catches
+ *         invalid operation values, missing replacement_string for
+ *         replace_string, and missing target_symbol for operations that
+ *         require it. These validations run BEFORE calling patchEngine,
+ *         giving faster, clearer error messages that reduce retries.
+ *         Previously the LLM made 3 consecutive malformed patch calls
+ *         (retries 2-4) before succeeding on retry 5, burning ~41s E2E.
  */
 
 import { executePatch, PATCH_OPERATIONS } from "./patchEngine.js";
@@ -55,7 +63,13 @@ export function getPatchToolDefinition() {
       name: PATCH_TOOL_NAME,
       description:
         "Apply a surgical patch to a source file. " +
-        "MANDATORY WORKFLOW — follow this sequence exactly: " +
+        "\n\n⚠️ VALID `operation` VALUES (exactly these 7 strings — no others exist): " +
+        "replace_body, insert_after, insert_before, delete, replace_string, insert_at_line, create_file. " +
+        "There is NO 'replace' or 'edit' operation — using either will be rejected. " +
+        "\n\n⚠️ REQUIRED FIELDS: `file_path` and `operation` are ALWAYS required. " +
+        "`replace_string` ALSO requires both `search_string` AND `replacement_string` " +
+        "(pass replacement_string: \"\" to delete matched text — omitting it entirely is an error). " +
+        "\n\nMANDATORY WORKFLOW — follow this sequence exactly: " +
         "Step 1: call contextforge_query_graph(find_symbol, 'functionName') to get location (file + line numbers). " +
         "Step 2: call contextforge_query_graph(read_function, 'functionName') to get the full body. " +
         "Step 3: call this tool with the complete body from step 2. " +
@@ -74,7 +88,7 @@ export function getPatchToolDefinition() {
           file_path: {
             type: "string",
             description:
-              "Relative path to the file to patch (e.g. 'src/helper.js'). " +
+              "REQUIRED (always). Relative path to the file to patch (e.g. 'src/helper.js'). " +
               "Must match the path shown by find_symbol or find_route.",
           },
           target_symbol: {
@@ -88,9 +102,10 @@ export function getPatchToolDefinition() {
           new_body: {
             type: "string",
             description:
-              "Complete replacement — every line from declaration to closing brace. " +
-              "You MUST call read_function first to get the full body before using replace_body. " +
-              "Not required for replace_string or delete operations.",
+              "Required for replace_body, insert_after, insert_before, insert_at_line, and create_file. " +
+              "Not used by replace_string (use search_string/replacement_string instead) or delete. " +
+              "For replace_body: complete replacement — every line from declaration to closing brace. " +
+              "You MUST call read_function first to get the full body before using replace_body.",
           },
           operation: {
             type: "string",
@@ -110,11 +125,14 @@ export function getPatchToolDefinition() {
               "create_file",
             ],
             description:
+              "REQUIRED. Must be EXACTLY one of these 7 values — 'replace', 'edit', 'update', 'modify', " +
+              "'delete_node', and 'write' are ALL INVALID and will be rejected. " +
               "replace_body: replaces entire symbol — requires reading complete body first via read_function. " +
               "insert_after: adds code after symbol — safe WITHOUT reading body first. " +
               "insert_before: adds code before symbol — safe WITHOUT reading body first. " +
               "delete: removes symbol entirely — safe WITHOUT reading body first. " +
-              "replace_string: surgical find-and-replace INSIDE a symbol (or globally if target_symbol omitted). " +
+              "replace_string: surgical find-and-replace INSIDE a symbol (or globally if target_symbol omitted) — " +
+              "REQUIRES both search_string AND replacement_string to be set. " +
               "insert_at_line: inserts new_body at a specific 1-based line number — " +
               "use this when find_route gives you a line number for an anonymous handler. " +
               "No target_symbol needed. " +
@@ -125,8 +143,8 @@ export function getPatchToolDefinition() {
           search_string: {
             type: "string",
             description:
-              "replace_string only. The exact string to find inside target_symbol's body " +
-              "(or the entire file if target_symbol is omitted). " +
+              "REQUIRED when operation=replace_string (unused otherwise). The exact string to find inside " +
+              "target_symbol's body (or the entire file if target_symbol is omitted). " +
               "Must be unique. Matched literally, not as a regex. Copy verbatim from source. " +
               "If the proxy returns a 'Did you mean?' error with <exact_match> tags, " +
               "use that exact text as your next search_string.",
@@ -134,14 +152,15 @@ export function getPatchToolDefinition() {
           replacement_string: {
             type: "string",
             description:
-              "replace_string only. The string to substitute in place of search_string. " +
-              'May be empty string "" to delete the matched text.',
+              "REQUIRED when operation=replace_string (unused otherwise) — this field must be present " +
+              "even to delete text. The string to substitute in place of search_string. " +
+              'Pass "" (empty string) to delete the matched text — do NOT omit this field.',
           },
           insert_line: {
             type: "integer",
             description:
-              "insert_at_line only. The 1-based line number to insert new_body before. " +
-              "Line 1 = before the first line. Use the line number from find_route results. " +
+              "REQUIRED when operation=insert_at_line (unused otherwise). The 1-based line number to insert " +
+              "new_body before. Line 1 = before the first line. Use the line number from find_route results. " +
               "The new content is inserted BEFORE this line (existing content shifts down).",
           },
         },
@@ -153,6 +172,7 @@ export function getPatchToolDefinition() {
 
   return _toolDef;
 }
+
 
 export function isPatchToolCall(toolName) {
   if (!toolName) return false;
@@ -233,9 +253,69 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
   }
 
   if (!args.file_path || !args.operation) {
+    const missing = [
+      !args.file_path && "file_path",
+      !args.operation && "operation",
+    ].filter(Boolean);
     return JSON.stringify({
       success: false,
-      error: "Required fields missing: file_path, operation",
+      error:
+        `Required field(s) missing: ${missing.join(", ")}. ` +
+        `Both file_path and operation are always required. ` +
+        `Valid operation values: replace_body, insert_after, insert_before, delete, replace_string, insert_at_line, create_file.`,
+    });
+  }
+
+  // BUG-5 FIX: Early validation of common LLM mistakes — catches errors BEFORE
+  // calling patchEngine, giving faster, clearer feedback that reduces retries.
+  const VALID_OPERATIONS = ["replace_body", "insert_after", "insert_before", "delete", "replace_string", "insert_at_line", "create_file"];
+  if (!VALID_OPERATIONS.includes(args.operation)) {
+    return JSON.stringify({
+      success: false,
+      error:
+        `Unknown operation '${args.operation}'. ` +
+        `Valid operation values (must match exactly): ${VALID_OPERATIONS.join(", ")}. ` +
+        `There is no 'replace', 'edit', 'update', 'modify', or 'write' operation. ` +
+        `Retry with one of the valid values above.`,
+    });
+  }
+
+  // Early check: replace_string requires both search_string AND replacement_string
+  if (args.operation === "replace_string") {
+    if (!args.search_string || typeof args.search_string !== "string" || !args.search_string.trim()) {
+      return JSON.stringify({
+        success: false,
+        error:
+          `replace_string requires a non-empty search_string parameter ` +
+          `(the exact text to find, copied verbatim from source). ` +
+          `Retry with search_string set to the exact text you want to replace.`,
+      });
+    }
+    if (args.replacement_string === undefined || args.replacement_string === null) {
+      return JSON.stringify({
+        success: false,
+        error:
+          `replace_string requires replacement_string — it must be present in the call ` +
+          `even to delete text. Pass replacement_string: "" (empty string) to delete the ` +
+          `matched text instead of omitting the field. Retry with replacement_string set.`,
+      });
+    }
+  }
+
+  // Early check: operations that require target_symbol
+  if (
+    (args.operation === "insert_after" || args.operation === "insert_before" ||
+     args.operation === "replace_body" || args.operation === "delete") &&
+    !args.target_symbol
+  ) {
+    return JSON.stringify({
+      success: false,
+      error:
+        `${args.operation} requires a target_symbol parameter — the exact declared name ` +
+        `of the function, class, or const to target. ` +
+        `Only replace_string and insert_at_line can be used without target_symbol. ` +
+        `If you want to patch globally (entire file), use operation=replace_string instead. ` +
+        `Retry with target_symbol set to the symbol name.`,
     });
   }
 

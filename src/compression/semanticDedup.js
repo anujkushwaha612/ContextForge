@@ -647,16 +647,35 @@ export async function applySemanticDedup(payload) {
   // ── F2 pre-pass: locate the NEWEST occurrence of each dedup key ────────
   // (iterating forward and overwriting leaves the last occurrence in the map)
   const DEDUPABLE = ["code", "text", "markdown"];
+
+  /**
+   * SD-FIX: Fallback type detection for messages whose _cf_type was stripped
+   * by the client adapter during the round-trip. If the message has a
+   * recognizable file path with a source extension, treat it as dedupable
+   * regardless of the _cf_type field. This fixes the persistent "Skipped: N
+   * wrong-type" log lines where read_file_chunk results (which ARE file content)
+   * were being incorrectly excluded from dedup because _cf_type was undefined.
+   */
+  function isDedupableType(msg) {
+    if (DEDUPABLE.includes(msg._cf_type)) return true;
+    const filename = extractFilename(msg);
+    if (filename) {
+      const ext = filename.split(".").pop()?.toLowerCase();
+      if (ext && SOURCE_EXTENSIONS.has(ext)) return true;
+    }
+    return false;
+  }
+
   const newestByKey = new Map();
   for (let mi = 0; mi < payload.messages.length; mi++) {
     const m = payload.messages[mi];
-    if (m.role === "tool" && typeof m.content === "string" && DEDUPABLE.includes(m._cf_type)) {
+    if (m.role === "tool" && typeof m.content === "string" && isDedupableType(m)) {
       const k = buildMessageKey(m);
       if (k) newestByKey.set(k, { mi, bi: -1, content: m.content });
     } else if (m.role === "user" && Array.isArray(m.content)) {
       for (let bi = 0; bi < m.content.length; bi++) {
         const b = m.content[bi];
-        if (b?.type === "tool_result" && typeof b.content === "string" && DEDUPABLE.includes(b._cf_type)) {
+        if (b?.type === "tool_result" && typeof b.content === "string" && isDedupableType(b)) {
           const k = buildMessageKey(b);
           if (k) newestByKey.set(k, { mi, bi, content: b.content });
         }
@@ -732,7 +751,10 @@ export async function applySemanticDedup(payload) {
 
     // Near-dup with the newest copy → stub; the newest (still full) is the
     // authoritative version, so pointing at it is always safe.
-    if (content.length >= MIN_NEARDUP_DEDUP_CHARS && newest.content.length >= MIN_NEARDUP_DEDUP_CHARS) {
+    if (
+      content.length >= MIN_NEARDUP_DEDUP_CHARS &&
+      newest.content.length >= MIN_NEARDUP_DEDUP_CHARS
+    ) {
       const fp = computeFingerprint(content);
       const newestFp = computeFingerprint(newest.content);
       if (fp !== null && newestFp !== null) {
@@ -795,7 +817,7 @@ export async function applySemanticDedup(payload) {
         continue;
       }
 
-      if (!["code", "text", "markdown"].includes(msg._cf_type)) {
+      if (!isDedupableType(msg)) {
         stats.skippedType++;
         newMessages.push(msg);
         continue;
@@ -833,7 +855,7 @@ export async function applySemanticDedup(payload) {
             newBlocks.push(block);
             continue;
           } // ← NEW
-          if (!["code", "text", "markdown"].includes(block._cf_type)) {
+          if (!isDedupableType(block)) {
             stats.skippedType++;
             newBlocks.push(block);
             continue;
@@ -845,7 +867,12 @@ export async function applySemanticDedup(payload) {
             continue;
           }
           stats.checked++;
-          const { deduplicated, msg: updatedBlock } = await dedupKeepNewest(block, key, msgIndex, m_bi);
+          const { deduplicated, msg: updatedBlock } = await dedupKeepNewest(
+            block,
+            key,
+            msgIndex,
+            m_bi
+          );
           if (deduplicated) {
             stats.deduplicated++;
             stats.charsSaved += block.content.length - updatedBlock.content.length;
@@ -867,7 +894,7 @@ export async function applySemanticDedup(payload) {
 
   payload.messages = newMessages;
 
-  if (stats.checked > 0 || stats.skippedNoKey > 0 || stats.skippedType > 0) {
+  if (stats.checked > 0 || stats.deduplicated > 0 || process.env.CF_DEBUG_DEDUP === "1") {
     console.log(
       `[SemanticDedup] Checked ${stats.checked} | ` +
         `Deduped ${stats.deduplicated} ` +
@@ -921,7 +948,7 @@ export function invalidateRegistryEntry(filePath) {
     }
   }
 
-  if (invalidated === 0) {
+  if (invalidated === 0 && process.env.CF_DEBUG_DEDUP === "1") {
     console.log(
       `[SemanticDedup] ℹ️ invalidateRegistryEntry: no entry found for "${normalized ?? basename}"`
     );

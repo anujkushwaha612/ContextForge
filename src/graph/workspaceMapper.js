@@ -83,6 +83,42 @@ const IGNORE_DIRS = new Set([
 const IGNORE_PATTERNS = [/\.min\.(js|css)$/, /\.bundle\.js$/, /\.d\.ts$/, /\.map$/, /\.lock$/];
 
 // ─────────────────────────────────────────────
+// .gitignore parsing
+// ─────────────────────────────────────────────
+function loadGitignore(workspacePath) {
+  try {
+    const gitignorePath = path.join(workspacePath, ".gitignore");
+    if (!fs.existsSync(gitignorePath)) return;
+    
+    const lines = fs.readFileSync(gitignorePath, "utf-8").split("\n");
+    let addedCount = 0;
+    
+    for (let line of lines) {
+      line = line.trim();
+      if (!line || line.startsWith("#")) continue;
+      
+      // Strip trailing and leading slashes for directory match
+      if (line.endsWith("/")) line = line.slice(0, -1);
+      if (line.startsWith("/")) line = line.slice(1);
+      
+      if (line.startsWith("*.")) {
+        // Handle extension wildcards like *.log -> /\.log$/
+        const ext = line.slice(2).replace(/\./g, "\\.");
+        IGNORE_PATTERNS.push(new RegExp('\\\\.' + ext + '$'));
+        addedCount++;
+      } else if (!line.includes("*") && !line.includes("/")) {
+        // Handle standard directory/file names like 'coverage' or '.env'
+        IGNORE_DIRS.add(line);
+        addedCount++;
+      }
+    }
+    console.log('[GraphMapper] 🛡️  Loaded ' + addedCount + ' ignore rules from .gitignore');
+  } catch (err) {
+    console.warn('[GraphMapper] ⚠️  Could not parse .gitignore: ' + err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
 // WM-8: Path normalization
 //
 // All paths stored in Maps, passed to SQLite, or compared against
@@ -500,6 +536,8 @@ export async function indexWorkspace(workspacePath, options = {}) {
   // WM-13: fs-facing root preserves case; DB/key root is lowercased.
   const normalizedWorkspacePath = normalizeSlashes(path.resolve(workspacePath));
   setWorkspaceRoot(normalizeKey(normalizedWorkspacePath));
+  
+  loadGitignore(normalizedWorkspacePath);
 
   // WM-12: default force:true — stale SQLite entries from previous sessions
   // cause graph to return outdated symbol locations after patches.

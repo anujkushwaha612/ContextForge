@@ -64,7 +64,6 @@ import { getWorkspaceRoot } from "../graph/graphDb.js";
 import { isPatchToolCall, executePatchToolCall, PATCH_TOOL_NAME } from "../graph/patchTools.js";
 import { hasMemoryToolCalls, executeMemoryToolCalls } from "../memory/memoryTools.js";
 import { normalizeConceptKey } from "../graph/semanticResolver.js";
-import { invalidateRegistryEntry } from "../compression/semanticDedup.js";
 import { DEFAULT_MEMORY_USER_ID } from "./memoryDecision.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -500,6 +499,7 @@ class ToolInterceptor {
       const normalized = normalizeGraphToolName(name);
       let toolSucceeded = false;
       let isActionTool = false;
+      const toolStart = Date.now();
 
       // ── Graph tool ────────────────────────────────────────────────────────
       if (isGraphToolCall(name)) {
@@ -609,7 +609,9 @@ class ToolInterceptor {
               parsed.lines_changed ?? parsed.lines_inserted ?? 0
             );
             this._consecutivePatchFailures = 0;
-            invalidateRegistryEntry(args.file_path);
+            // BUG-4 FIX: Removed redundant invalidateRegistryEntry() call.
+            // patchEngine.js's postPatchInvalidate() already handles semantic
+            // dedup registry invalidation for the patched file.
           } else {
             console.log(`[Ghost Interceptor] ❌ Patch failed: ${parsed.error?.slice(0, 100)}`);
             chunkCacheInvalidateFile(args.file_path);
@@ -718,7 +720,9 @@ class ToolInterceptor {
         name,
         content,
         __cf_raw: isReadFileChunkTool(name),
+        _source_file: args.file_path || null,
       });
+      statsEmitter.recordToolExecution(name, Date.now() - toolStart);
     }
 
     return {
@@ -1157,6 +1161,7 @@ export function createUpstreamHandler(ctx) {
                         name: r.name,
                         content: r.content,
                         _cf_type: cfType,
+                        ...(r._source_file ? { _args: { file_path: r._source_file } } : {}),
                         ...(r.__cf_raw ? { __cf_raw: true } : {}),
                       });
                     }
@@ -1293,6 +1298,7 @@ export function createUpstreamHandler(ctx) {
                     name: r.name,
                     content: r.content,
                     _cf_type: cfType,
+                    ...(r._source_file ? { _args: { file_path: r._source_file } } : {}),
                     ...(r.__cf_raw ? { __cf_raw: true } : {}),
                   });
                 }
