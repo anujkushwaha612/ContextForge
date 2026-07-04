@@ -25,7 +25,12 @@ let NativeASTCompressor = null;
 let nativeAvailable = false;
 
 try {
-  const native = require("../../native/build/Release/contextforge_native.node");
+  let native;
+  try {
+    native = require(`../../prebuilds/${process.platform}-${process.arch}/contextforge_native.node`);
+  } catch (e) {
+    native = require("../../native/build/Release/contextforge_native.node");
+  }
   NativeASTCompressor = native.ASTCompressor;
   nativeAvailable = true;
   console.log("[AST Compressor] ✅ Native tree-sitter engine loaded");

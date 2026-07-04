@@ -54,7 +54,12 @@ import { statsEmitter } from "../proxy/statsEmitter.js";
 import { isRecentToolResult, looksLikeStub } from "./compressionPolicy.js";
 
 const require = createRequire(import.meta.url);
-const native = require("../../native/build/Release/contextforge_native.node");
+let native;
+try {
+  native = require(`../../prebuilds/${process.platform}-${process.arch}/contextforge_native.node`);
+} catch (e) {
+  native = require("../../native/build/Release/contextforge_native.node");
+}
 
 // ─────────────────────────────────────────────
 // Session registry
