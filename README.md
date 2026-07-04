@@ -21,12 +21,14 @@ Repository-aware execution runtime for Claude Code
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen" alt="Node.js Version"></a>
   <a href="#documentation"><img src="https://img.shields.io/badge/docs-in--repo-blue.svg" alt="Docs"></a>
+  <a href="https://www.npmjs.com/package/@anuj612/contextforge"><img src="https://img.shields.io/npm/v/@anuj612/contextforge.svg" alt="npm version"></a>
+  <a href="https://github.com/anujkushwaha612/ContextForge/actions/workflows/prebuild.yml"><img src="https://github.com/anujkushwaha612/ContextForge/actions/workflows/prebuild.yml/badge.svg" alt="Build"></a>
 </p>
 
 <p align="center">
   <a href="#the-problem">Problem</a> ·
   <a href="#what-it-does">What It Does</a> ·
-  <a href="#how-it-works-30-seconds">How It Works</a> ·
+  <a href="#how-it-works-high-level-overview">How It Works</a> ·
   <a href="#quick-start">Install</a> ·
   <a href="#real-results">Results</a> ·
   <a href="#use-with-your-ai-agent">Agents</a> ·
@@ -457,7 +459,7 @@ file = false         # Set to true to write debug logs to ~/.contextforge/logs/
 
 ### Authentication & API Keys
 
-If you want the API key to work automatically across _all_ your projects without having to set it every time, you can save it into ContextForge's global configuration file (located at `C:\Users\ASUS\AppData\Roaming\contextforge\config.toml`).
+If you want the API key to work automatically across _all_ your projects without having to set it every time, you can save it into ContextForge's global configuration file (located at `~/.contextforge/config.toml` on macOS/Linux, or `%APPDATA%\contextforge\config.toml` on Windows).
 
 The easiest way to do this is to run the setup command again:
 
