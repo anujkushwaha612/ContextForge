@@ -86,9 +86,10 @@ export const AGENTS = {
     prepare({ port }) {
       const env = {
         ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
-        // Claude Code refuses to start without a key even when the upstream
-        // (e.g. ollama) never sees it. Only set a placeholder if absent.
-        ...(process.env.ANTHROPIC_API_KEY ? {} : { ANTHROPIC_API_KEY: "contextforge-local" }),
+        // Only inject a dummy key if the user hasn't provided a real one.
+        // Claude Code requires the sk-ant- prefix to bypass its login check.
+        // The dummy key is never forwarded upstream — the proxy handles all requests.
+        ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "sk-ant-contextforge-local-dummy-key",
       };
 
       const args = [];

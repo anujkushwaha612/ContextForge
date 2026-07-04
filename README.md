@@ -563,6 +563,29 @@ No. ContextForge runs entirely on your machine — the graph, vaults, memory, an
 </details>
 
 <details>
+<summary><b>Claude Code says "Not logged in" or asks me to run /login — what do I do?</b></summary>
+
+Claude Code validates that `ANTHROPIC_API_KEY` starts with `sk-ant-` before it considers you authenticated. If you are using **Ollama, OpenAI, or Gemini** as your upstream, you do not need a real Anthropic account — ContextForge automatically injects a valid-format dummy key for you.
+
+If you still see this error (e.g. you are running from source after an older install), set the key manually before running:
+
+```powershell
+# PowerShell
+$env:ANTHROPIC_API_KEY="sk-ant-contextforge-local-dummy-key"
+cf wrap claude
+```
+
+```bash
+# Git Bash / Linux / macOS
+export ANTHROPIC_API_KEY=sk-ant-contextforge-local-dummy-key
+cf wrap claude
+```
+
+Claude Code will see the `sk-ant-` prefix, assume you are authenticated, and send all requests to ContextForge — which then routes them to your real provider. The dummy key is never forwarded upstream.
+
+</details>
+
+<details>
 <summary><b>Do I need to compile the native components?</b></summary>
 
 Not with `npm i -g @anuj612/contextforge`. Prebuilt N-API binaries ship for all major platforms. Compiling from source is only needed for unsupported architectures or development; `cf doctor` tells you exactly which binary type is currently loaded.
@@ -783,6 +806,8 @@ Expected. Tool injection costs tokens before compression can recover them, and l
 ## Known Issues
 
 - **False Token Savings on Failed Upstream Requests:** Currently, the proxy logs tokens passed through it as "saved" as long as it compressed the context, regardless of whether the upstream server accepted the request (e.g., 401 Unauthorized errors). This can lead to misleading savings metrics if an invalid API key is used and the CLI automatically retries the request.
+
+- **"Not logged in" prompt in Claude Code *(fixed in current version)*:** Older builds used `contextforge-local` as the `ANTHROPIC_API_KEY` placeholder, which lacks the `sk-ant-` prefix that Claude Code requires to bypass its login check. The placeholder has been updated to `sk-ant-contextforge-local-dummy-key`. If you experience this on an older install, set the env var manually or upgrade: `npm update -g @anuj612/contextforge`.
 
 ---
 
