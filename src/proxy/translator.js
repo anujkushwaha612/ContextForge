@@ -511,8 +511,9 @@ const _toolSchemaCacheMap = new Map();
 //   compression stubs reference by exact wording (TR-4).
 // ─────────────────────────────────────────────
 
-const MAX_TOOL_DESCRIPTION_CHARS = 200;
-const MAX_PARAM_DESCRIPTION_CHARS = 80;
+const MAX_TOOL_DESCRIPTION_CHARS = 350;    // Increased for better context
+const MAX_PARAM_DESCRIPTION_CHARS = 150;   // Increased to preserve constraints
+
 
 // Tools where the description IS the behavioral contract (orchestration,
 // meta-tools, anything gating side-effecting decisions) — never truncate.
@@ -559,18 +560,14 @@ function minimizeSchema(schema, isProtected) {
     schema.description = truncateSemantic(schema.description, MAX_PARAM_DESCRIPTION_CHARS);
   }
 
-  // Never delete enums — they're a hard contract, not prose.
-  // If you must save tokens here, cap displayed values but signal there are more,
-  // so the model doesn't assume it has the full set.
-  // TR-8 FIX: read the TRUE count BEFORE slicing — the old code sliced first,
-  // so the note always said "10+ values" regardless of the real total (a
-  // 40-value enum and a 12-value enum produced identical messages).
-  if (!isProtected && Array.isArray(schema.enum) && schema.enum.length >= 12) {
+  // TR-8 REFINED: Increased threshold to 30. Logic-driving enums are usually small.
+  // We only truncate "data-heavy" enums that bloat the context window.
+  if (!isProtected && Array.isArray(schema.enum) && schema.enum.length >= 30) {
     const totalValues = schema.enum.length;
-    schema.enum = schema.enum.slice(0, 10);
+    schema.enum = schema.enum.slice(0, 25); // Show more values (25 instead of 10)
     schema.description =
       (schema.description || "") +
-      ` (${totalValues} total values, showing first 10 — others exist and are valid)`;
+      ` (${totalValues} total values, showing first 25 — others exist and are valid)`;
   }
 
   if (schema.properties) {
@@ -578,6 +575,45 @@ function minimizeSchema(schema, isProtected) {
       minimizeSchema(schema.properties[key], isProtected);
   }
   if (schema.items) minimizeSchema(schema.items, isProtected);
+}
+
+export function minimizeToolSchemas(payload) {
+  if (!payload.tools?.length) return payload;
+
+  let savedChars = 0;
+  const originalSize = JSON.stringify(payload.tools).length;
+
+  payload.tools = payload.tools.map((tool) => {
+    const fn = tool.function || tool;
+    const toolName = fn.name || tool.name || "";
+    const isProtected = isProtectedTool(toolName, fn);
+
+    const key = crypto
+      .createHash("sha256")
+      .update(toolName + JSON.stringify(fn.description) + JSON.stringify(fn.parameters))
+      .digest("hex")
+      .slice(0, 16);
+
+    if (_toolSchemaCacheMap.has(key)) {
+      return _toolSchemaCacheMap.get(key);
+    }
+
+    const newFn = JSON.parse(JSON.stringify(fn));
+    if (!isProtected && typeof newFn.description === "string") {
+      // Increased to 350 to ensure the primary "contract" is never lost
+      newFn.description = truncateSemantic(newFn.description, MAX_TOOL_DESCRIPTION_CHARS);
+    }
+    if (newFn.parameters) minimizeSchema(newFn.parameters, isProtected);
+
+    const result = { type: "function", function: newFn };
+    _toolSchemaCacheMap.set(key, result);
+    return result;
+  });
+
+  savedChars = originalSize - JSON.stringify(payload.tools).length;
+  if (savedChars > 0) payload._cf_minimizeTokensSaved = Math.floor(savedChars / 4);
+
+  return payload;
 }
 
 export function minimizeToolSchemas(payload) {

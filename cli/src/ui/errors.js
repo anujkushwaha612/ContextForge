@@ -1,8 +1,9 @@
 /**
  * ui/errors.js — CFError convention + exit codes.
  * Every user-facing failure carries { code, message, hint }.
- * No raw stack traces unless --verbose.
  */
+
+import { red, bold, gray, cyan, italic } from "./output.js";
 
 export const EXIT = {
   OK: 0,
@@ -12,6 +13,7 @@ export const EXIT = {
   PROXY: 11,    // proxy failed to start / health timeout
   PORT: 12,     // port conflict with unmanaged process
   AGENT: 13,    // agent binary not found
+  PROVIDER: 14, // provider unreachable / invalid API key
 };
 
 const CODE_TO_EXIT = {
@@ -26,6 +28,9 @@ const CODE_TO_EXIT = {
   CF_ERR_PROXY_HEALTH: EXIT.PROXY,
   CF_ERR_PORT_CONFLICT: EXIT.PORT,
   CF_ERR_AGENT_NOT_FOUND: EXIT.AGENT,
+  CF_ERR_PROVIDER_INVALID: EXIT.PROVIDER,
+  CF_ERR_API_KEY_MISSING: EXIT.PROVIDER,
+  CF_ERR_API_KEY_INVALID: EXIT.PROVIDER,
 };
 
 export class CFError extends Error {
@@ -40,6 +45,7 @@ export class CFError extends Error {
   }
 }
 
+/** Consistent fatal error formatter. */
 export function handleFatal(err, { verbose = false, json = false } = {}) {
   if (json) {
     console.error(JSON.stringify({
@@ -48,13 +54,15 @@ export function handleFatal(err, { verbose = false, json = false } = {}) {
       hint: err.hint ?? null,
     }));
   } else if (err instanceof CFError) {
-    console.error(`\n  ✖ ${err.message}   [${err.code}]`);
-    if (err.hint) console.error(`  → ${err.hint}`);
-    if (verbose && err.stack) console.error(`\n${err.stack}`);
+    console.error(`\n  ${red("✖")} ${bold(err.message)}   ${gray(`[${err.code}]`)}`);
+    if (err.hint) {
+      console.error(`  ${cyan("→")} ${italic(err.hint)}`);
+    }
+    if (verbose && err.stack) console.error(`\n${gray(err.stack)}`);
   } else {
-    console.error(`\n  ✖ Unexpected error: ${err.message}`);
-    console.error(`  → Run \`cf doctor\` and file an issue with the output.`);
-    if (verbose && err.stack) console.error(`\n${err.stack}`);
+    console.error(`\n  ${red("✖")} ${bold("Unexpected error:")} ${err.message}`);
+    console.error(`  ${cyan("→")} ${italic("Run `cf doctor` and file an issue with the output.")}`);
+    if (verbose && err.stack) console.error(`\n${gray(err.stack)}`);
   }
   process.exit(err instanceof CFError ? err.exitCode : EXIT.ERROR);
 }

@@ -1,12 +1,17 @@
 /**
+ * commands/doctor.js
+ *
  * cf doctor — diagnose the install. Checks in dependency order:
  *   1. Node version           5. Write access to CF home
  *   2. Native addon loads     6. Stale runfiles
  *   3. Models verified        7. Agent binary (claude)
  *   4. Embedder smoke test    8. Proxy health (if running)
+ *   9. Provider config        10. Provider connectivity
  *
  * --fix    re-download corrupt models, clean stale runfiles
  * --json   machine-readable output for bug reports
+ *
+ * Enhanced with provider validation and connectivity testing.
  */
 
 import { accessSync, constants, readdirSync, readFileSync, unlinkSync, existsSync } from "node:fs";
@@ -15,6 +20,8 @@ import { execFileSync } from "node:child_process";
 import { cfHome, modelsDir, runDir, ensureLayout } from "../core/paths.js";
 import { modelStatus, ensureModels } from "../core/assets.js";
 import { diagnoseNative, smokeTestEmbedder, platformTriple } from "../core/native.js";
+import { resolveConfig, validateProvider, getProviderRequirements, VALID_PROVIDERS } from "../core/config.js";
+import { testProvider } from "../core/daemon.js";
 import { header, ok, fail, warn, info, dim } from "../ui/output.js";
 import { EXIT } from "../ui/errors.js";
 
@@ -124,6 +131,64 @@ export async function doctor(opts = {}) {
     }
   } catch { /* ignore */ }
   if (!proxyChecked) add("proxy", true, "not running (start with `cf start` or `cf wrap claude`)");
+
+  // 9. Provider configuration
+  const { values } = resolveConfig({ workspace: process.cwd() });
+  const provider = values["provider.name"];
+  
+  if (VALID_PROVIDERS.includes(provider)) {
+    add("provider:name", true, provider);
+    
+    // Check API key for paid providers
+    const requirements = getProviderRequirements(provider);
+    if (requirements && requirements.envVars.length > 0) {
+      const missingEnvVars = requirements.envVars.filter(varName => !process.env[varName]);
+      
+      if (missingEnvVars.length === 0) {
+        add("provider:apikey", true, "environment variables set");
+        
+        // 10. Provider connectivity (only if API key is set and not skipped)
+        if (!opts.skipProviderTest && provider !== "ollama") {
+          try {
+            info(dim("Testing provider connectivity..."));
+            const testResult = await testProvider(provider, { timeout: 10000 });
+            
+            if (testResult.ok) {
+              const latency = testResult.latency ? `${testResult.latency}ms` : "OK";
+              add("provider:connectivity", true, `connected (${latency})`);
+            } else {
+              add("provider:connectivity", false, testResult.error,
+                "Check your API key and network connection. Run `cf test` for details.");
+            }
+          } catch (error) {
+            add("provider:connectivity", false, error.message,
+              "Provider test failed. Run `cf test` for more details.");
+          }
+        } else if (provider === "ollama") {
+          // Test Ollama connectivity
+          try {
+            const testResult = await testProvider("ollama");
+            if (testResult.ok) {
+              add("provider:connectivity", true, `connected (${testResult.models?.length || 0} models)`);
+            } else {
+              add("provider:connectivity", false, testResult.error,
+                "Make sure Ollama is running: ollama serve");
+            }
+          } catch (error) {
+            add("provider:connectivity", false, error.message);
+          }
+        }
+      } else {
+        const envVarList = missingEnvVars.join(", ");
+        const url = requirements.url ? `\n  Get your key: ${requirements.url}` : "";
+        add("provider:apikey", false, `missing: ${envVarList}`,
+          `${requirements.note}${url}\n  Set it with: export ${missingEnvVars[0]}=your_key_here`);
+      }
+    }
+  } else {
+    add("provider:name", false, `invalid: ${provider}`,
+      `Valid providers: ${VALID_PROVIDERS.join(", ")}\n  Fix with: cf config set provider.name ollama`);
+  }
 
   // ── Report ──
   const failed = results.filter((r) => !r.ok);

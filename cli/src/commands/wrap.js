@@ -2,17 +2,20 @@
  * cf wrap <agent> [-- args...] — the flagship flow.
  *
  *   1. Environment check (models present? native ok?) — auto-runs setup-lite
- *   2. Ensure proxy (reuse if healthy + same workspace, else start)
- *   3. Snapshot savings counters
- *   4. Launch agent with proxy env + MCP config, full TTY passthrough
- *   5. On exit: savings summary, teardown (unless --keep-alive or reused)
- *   6. Exit with the agent's own exit code
+ *   2. Validate provider configuration (API keys, connectivity)
+ *   3. Ensure proxy (reuse if healthy + same workspace, else start)
+ *   4. Snapshot savings counters
+ *   5. Launch agent with proxy env + MCP config, full TTY passthrough
+ *   6. On exit: savings summary, teardown (unless --keep-alive or reused)
+ *   7. Exit with the agent's own exit code
+ *
+ * Enhanced with provider validation and connectivity testing.
  */
 
 import { spawn } from "node:child_process";
 import { unlinkSync } from "node:fs";
 import path from "node:path";
-import { resolveConfig } from "../core/config.js";
+import { resolveConfig, validateProvider, getProviderRequirements } from "../core/config.js";
 import { resolveWorkspace, modelsDir } from "../core/paths.js";
 import { ensureProxy, stopProxy, fetchHealth } from "../core/daemon.js";
 import { resolveAgent, buildSpawn } from "../core/agents.js";
@@ -52,6 +55,39 @@ async function ensureEnvironment() {
     });
   }
   ok(`Environment OK ${dim(`(native: ${native.kind ?? "skipped"}, models verified)`)}`);
+}
+
+// ── Provider validation ──────────────────────────────────────────────────────
+
+async function validateProviderConfig(configValues) {
+  const validation = validateProvider(configValues, false);
+  
+  if (!validation.ok) {
+    const provider = validation.provider;
+    const requirements = getProviderRequirements(provider);
+    
+    // Provider name invalid
+    if (validation.errors.length > 0) {
+      throw new CFError(
+        "CF_ERR_PROVIDER_INVALID",
+        validation.errors[0],
+        `Valid providers: ollama, anthropic, openai, groq, gemini\n  Fix with: cf config set provider.name ollama`
+      );
+    }
+    
+    // Missing API keys
+    if (validation.missingEnvVars.length > 0 && requirements) {
+      const envVarList = validation.missingEnvVars.join(", ");
+      const url = requirements.url ? `\n  Get your key: ${requirements.url}` : "";
+      throw new CFError(
+        "CF_ERR_API_KEY_MISSING",
+        `Missing required environment variable${validation.missingEnvVars.length > 1 ? 's' : ''}: ${envVarList}`,
+        `${requirements.note}${url}\n  Set it with: export ${validation.missingEnvVars[0]}=your_key_here\n  Or run: cf setup --reconfigure`
+      );
+    }
+  }
+  
+  ok(`Provider validated: ${configValues["provider.name"]}`);
 }
 
 // ── Savings summary ───────────────────────────────────────────────────────────
@@ -113,6 +149,9 @@ export async function wrap(agentName, opts = {}, command) {
   const { values } = resolveConfig({ workspace, flags: opts });
 
   await ensureEnvironment();
+
+  // Validate provider configuration (API keys, etc.)
+  await validateProviderConfig(values);
 
   // ── Proxy ──
   let lastPhase = "";

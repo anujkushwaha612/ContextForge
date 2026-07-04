@@ -10,6 +10,8 @@
  *
  * toEnv() materializes the resolved config into the CF_* env vars that
  * server.js already reads, so the server needs no config-file code at all.
+ *
+ * Enhanced with provider validation for paid API support.
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
@@ -17,6 +19,53 @@ import path from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { globalConfigPath, projectConfigPath, cfHome } from "./paths.js";
 import { CFError } from "../ui/errors.js";
+
+// ── Provider Registry ───────────────────────────────────────────────────────
+export const VALID_PROVIDERS = ["ollama", "anthropic", "openai", "groq", "gemini"];
+
+// Provider-specific configuration requirements
+const PROVIDER_REQUIREMENTS = {
+  ollama: {
+    name: "Ollama",
+    envVars: [],
+    supportsModelOverride: true,
+    defaultModel: null,
+    url: null,
+    note: "Local models via Ollama (no API key required)",
+  },
+  anthropic: {
+    name: "Anthropic",
+    envVars: ["ANTHROPIC_API_KEY"],
+    supportsModelOverride: false, // Claude Code picks model via /model
+    defaultModel: "claude-3-sonnet-20240229",
+    url: "https://console.anthropic.com/",
+    note: "Claude models via Anthropic API",
+  },
+  openai: {
+    name: "OpenAI",
+    envVars: ["OPENAI_API_KEY"],
+    supportsModelOverride: true,
+    defaultModel: "gpt-4o",
+    url: "https://platform.openai.com/api-keys",
+    note: "GPT models via OpenAI API",
+  },
+  groq: {
+    name: "Groq",
+    envVars: ["GROQ_API_KEY"],
+    supportsModelOverride: true,
+    defaultModel: "llama-3.1-70b-versatile",
+    url: "https://console.groq.com/keys",
+    note: "Fast inference for open models",
+  },
+  gemini: {
+    name: "Google Gemini",
+    envVars: ["GEMINI_API_KEY"],
+    supportsModelOverride: true,
+    defaultModel: "gemini-2.0-flash-exp",
+    url: "https://aistudio.google.com/app/apikey",
+    note: "Google Gemini models",
+  },
+};
 
 // ── Schema: every known key, its default, type, and the CF_* env var it maps to ──
 export const SCHEMA = {
@@ -27,24 +76,15 @@ export const SCHEMA = {
                                  envMap: (v) => (v === "full" ? undefined : v) },
   // "ollama" is the tested v1 default: Claude Code (client) → proxy → Ollama
   // (upstream, OpenAI-compatible). CF_PROVIDER names the UPSTREAM, not the client.
-  "provider.name":             { def: "ollama",    type: "string", env: "CF_PROVIDER" },
+  "provider.name":             { def: "ollama",    type: "enum",   env: "CF_PROVIDER",
+                                 values: VALID_PROVIDERS },
   "provider.model_override":   { def: null,        type: "string", env: "CF_MODEL_OVERRIDE" },
-  "compression.ccr":           { def: true,        type: "bool",   env: "CF_CCR_ENABLED",
-                                 // server.js checks CF_CCR_ENABLED === "false"
-                                 envMap: (v) => (v ? undefined : "false") },
   "compression.nudge_tools":   { def: true,       type: "bool",   env: "CF_NUDGE_TOOLS",
                                  envMap: (v) => (v ? "1" : undefined) },
   "logging.file":              { def: false,      type: "bool",   env: "CF_LOGGING_FILE",
                                  envMap: (v) => (v ? "1" : undefined) },
   // NOTE: CF_DEBUG_* env vars still work (server reads them directly) but are
   // intentionally NOT part of the user-facing config surface.
-};
-
-const FLAG_TO_KEY = {
-  port: "proxy.port",
-  mode: "proxy.mode",
-  provider: "provider.name",
-  model: "provider.model_override",
 };
 
 // ── Coercion & validation ─────────────────────────────────────────────────────
@@ -183,6 +223,13 @@ export function toEnv(values, { workspace, modelDir, dataDir } = {}) {
 
 // ── Mutation (cf config set) ──────────────────────────────────────────────────
 
+const FLAG_TO_KEY = {
+  port: "proxy.port",
+  mode: "proxy.mode",
+  provider: "provider.name",
+  model: "provider.model_override",
+};
+
 export function setConfigValue(key, rawValue, { project = false, workspace } = {}) {
   const value = coerce(key, rawValue, project ? "cf config set --project" : "cf config set");
   const file = project ? projectConfigPath(workspace ?? process.cwd()) : globalConfigPath();
@@ -231,7 +278,6 @@ name = "${provider}"      # ollama | openai | anthropic | groq | gemini
 ${modelOverride ? `model_override = "${modelOverride}"` : `# model_override = "qwen2.5-coder:14b"`}
 
 [compression]
-ccr = true
 nudge_tools = true
 
 [logging]
@@ -245,4 +291,106 @@ export function ensureGlobalConfig() {
   const file = globalConfigPath();
   if (existsSync(file)) return { file, created: false };
   return writeGlobalConfig();
+}
+
+// ── Provider Validation ───────────────────────────────────────────────────────
+
+/**
+ * Get provider requirements/metadata.
+ * @param {string} providerName
+ * @returns {object|null}
+ */
+export function getProviderRequirements(providerName) {
+  return PROVIDER_REQUIREMENTS[providerName] || null;
+}
+
+/**
+ * Validate that a provider name is valid.
+ * @param {string} provider
+ * @throws {CFError} if invalid
+ */
+export function validateProviderName(provider) {
+  if (!VALID_PROVIDERS.includes(provider)) {
+    throw new CFError(
+      "CF_ERR_PROVIDER_INVALID",
+      `Invalid provider "${provider}"`,
+      `Valid providers: ${VALID_PROVIDERS.join(", ")}`
+    );
+  }
+}
+
+/**
+ * Validate that required environment variables are set for a provider.
+ * @param {string} provider - Provider name
+ * @param {boolean} throwOnError - Whether to throw on missing vars (default: false)
+ * @returns {{ ok: boolean, missing: string[], provider: string }}
+ */
+export function validateProviderEnvVars(provider, throwOnError = false) {
+  const requirements = PROVIDER_REQUIREMENTS[provider];
+  if (!requirements) {
+    if (throwOnError) {
+      throw new CFError("CF_ERR_PROVIDER_INVALID", `Unknown provider: ${provider}`);
+    }
+    return { ok: false, missing: [], provider, error: "Unknown provider" };
+  }
+
+  const missing = requirements.envVars.filter(varName => !process.env[varName]);
+  const ok = missing.length === 0;
+
+  if (!ok && throwOnError && missing.length > 0) {
+    const url = requirements.url ? `\n  Get your key: ${requirements.url}` : "";
+    throw new CFError(
+      "CF_ERR_API_KEY_MISSING",
+      `Missing required environment variable${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}`,
+      `${requirements.note}${url}\n  Set it with: export ${missing[0]}=your_key_here`
+    );
+  }
+
+  return { ok, missing, provider };
+}
+
+/**
+ * Validate current provider configuration (name + env vars).
+ * @param {object} configValues - Resolved config values
+ * @param {boolean} throwOnError - Whether to throw on errors
+ * @returns {{ ok: boolean, provider: string, missingEnvVars: string[], errors: string[] }}
+ */
+export function validateProvider(configValues, throwOnError = false) {
+  const provider = configValues["provider.name"];
+  const errors = [];
+  
+  // Validate provider name
+  if (!VALID_PROVIDERS.includes(provider)) {
+    errors.push(`Invalid provider: ${provider}`);
+    if (throwOnError) {
+      throw new CFError("CF_ERR_PROVIDER_INVALID", `Invalid provider: ${provider}`,
+        `Valid providers: ${VALID_PROVIDERS.join(", ")}`);
+    }
+  }
+
+  // Validate environment variables
+  const envValidation = validateProviderEnvVars(provider, throwOnError);
+  
+  return {
+    ok: errors.length === 0 && envValidation.ok,
+    provider,
+    missingEnvVars: envValidation.missing,
+    errors,
+  };
+}
+
+/**
+ * Get all available providers with their metadata.
+ * @returns {Array<{name: string, requiresApiKey: boolean, envVars: string[]}>}
+ */
+export function getAvailableProviders() {
+  return Object.entries(PROVIDER_REQUIREMENTS).map(([name, req]) => ({
+    name,
+    displayName: req.name,
+    requiresApiKey: req.envVars.length > 0,
+    envVars: req.envVars,
+    defaultModel: req.defaultModel,
+    url: req.url,
+    note: req.note,
+  }));
 }

@@ -38,7 +38,7 @@ Repository-aware execution runtime for Claude Code
 
 ---
 
-ContextForge is a **local proxy + CLI** that sits between Claude Code and your LLM provider — executing repository tool calls locally, compressing context before it reaches the model, and maintaining an AST-level knowledge graph of your codebase. Run local models through Ollama or any major cloud provider. Same answers. Fraction of the tokens.
+ContextForge is a **local proxy + CLI** that sits between Claude Code and your LLM provider — executing repository tool calls locally, compressing context before it reaches the model, and maintaining an AST-level knowledge graph of your codebase. Run local models through Ollama or any major cloud provider. Designed to produce the same result while using significantly fewer tokens on repository-aware tasks.
 
 ```
 npm i -g contextforge
@@ -54,10 +54,10 @@ That's the whole setup. No compilers, no config files, no `.env` editing — a f
 
 AI coding agents waste **thousands of tokens** on every request:
 
-- 🔄 Re-reading entire files to find a single function
-- 🗺️ Re-discovering repository structure on every edit
-- 📦 Re-sending ~100KB of tool schemas and unchanged tool outputs with every turn
-- 🔁 Burning LLM round-trips on file navigation a local index could answer instantly
+-  Re-reading entire files to find a single function
+-  Re-discovering repository structure on every edit
+-  Re-sending large tool schemas and unchanged tool outputs with every turn
+-  Burning LLM round-trips on file navigation a local index could answer instantly
 
 **Result:** Slow responses. High API costs. Context window limits hit constantly. And if you run local models, most agent tooling assumes a cloud API and leaves you out entirely.
 
@@ -66,8 +66,9 @@ AI coding agents waste **thousands of tokens** on every request:
 ## What It Does
 
 - **One-command wrapper** — `cf wrap claude` starts the proxy, indexes your repo, launches Claude Code through it, and prints a savings summary when you exit
+- **Model Context Protocol (MCP)** — Exposes ContextForge's native tools directly to Claude Code, Codex, and Gemini CLI through a lightweight stdio bridge (`mcp/bridge.js`)
 - **Repository Graph** — `find_symbol`, `analyze_impact`, `find_route` — AST-level queries over JS/TS/TSX/Python/Go/Rust/Java that answer without reading files
-- **Transparent Tool Interception** — graph/read/patch tool calls execute locally in the proxy; background hops never burn a full agent round-trip
+- **Transparent Tool Interception** — graph/read/patch tool calls execute locally in the proxy; background tool hops are intercepted by the proxy, avoiding additional client-agent interactions
 - **Context Optimizer** — tool-schema minimization, system-prompt dedup, keep-newest file dedup, AST skeleton compression, junk interception (lockfiles, minified bundles, base64 blobs)
 - **Surgical patching** — `contextforge_patch_ast` applies edits with AST awareness and returns a unified diff in the result, so the model doesn't re-read files to verify
 - **Session memory** — persistent per-workspace memory store with HNSW vector search, injected as context when relevant
@@ -84,25 +85,25 @@ AI coding agents waste **thousands of tokens** on every request:
        ▼
   ┌──────────────────────────────────────────────────────────────────┐
   │                  ContextForge  (runs locally)                    │
-  │  ──────────────────────────────────────────────────────────────  │
+  ├──────────────────────────────────────────────────────────────────┤
   │                                                                  │
-  │   🧠 Repository Graph          ⚡ Transparent Interception        │
+  │    Repository Graph           Transparent Interception           │
   │   AST · symbols · call graph   graph/read/patch run here         │
   │                      │                                           │
   │                      ▼                                           │
-  │               📦 Context Optimizer                                │
+  │                Context Optimizer                                 │
   │     Schema minimization · System dedup · Keep-newest dedup       │
   │       AST skeletons · Junk vaulting · History pruning            │
   │                                                                  │
   └──────────────────────────────────────────────────────────────────┘
-       │   compressed payload — ~50% smaller in real sessions
+       │   compressed payload — substantially smaller in real sessions
        ▼
   LLM Provider  (Ollama · Anthropic · OpenAI · Groq · Gemini)
 ```
 
 1. **`cf wrap claude`** ensures the environment (models, native engine), starts the proxy, indexes your repo (a 30-file Express app indexes in ~0.5s), and launches Claude Code with the proxy as its base URL plus ContextForge's MCP tools registered.
 2. **Requests are translated** between Anthropic format (what Claude Code speaks) and your upstream provider's format — this is how Claude Code drives local Ollama models.
-3. **Repository tools answer locally.** `find_symbol('deleteFile')` returns file + line range from the pre-built graph — no file reads, no wasted round-trip.
+3. **Repository navigation and ContextForge-specific tools execute locally.** `find_symbol('deleteFile')` returns file + line range from the pre-built graph — no file reads, no wasted round-trip.
 4. **The optimizer compresses what's left** — schemas, duplicate history, oversized junk — with age-gating so content the model _just requested_ is never compressed out from under it.
 5. **On exit**, you get the receipt: `✔ Session: 14 requests · 424,129 tokens in → 208,163 sent · 50.9% saved (est)`.
 
@@ -143,48 +144,67 @@ cf doctor
 
 ## Use With Your AI Agent
 
-### Claude Code (v1 — fully supported)
+### Claude Code *(fully supported)*
 
 ```bash
 cd your-project
 cf wrap claude                     # everything automatic
-cf wrap claude -- --continue       # pass args through to claude after --
+cf wrap claude -- --continue       # pass args through to Claude after --
 ```
 
-`cf wrap` injects `ANTHROPIC_BASE_URL`, registers ContextForge's MCP tools for the session, and tears everything down when Claude exits. Nothing in your Claude Code config is permanently modified.
+`cf wrap` automatically configures the proxy, injects `ANTHROPIC_BASE_URL`, registers ContextForge's MCP tools for the session, and cleans everything up when Claude exits. Your Claude Code configuration is never permanently modified.
 
 **Prefer managing the proxy yourself?**
 
 ```bash
-cf start                           # proxy in the background
-cf mcp install                     # persistent MCP registration (Claude/Codex/Gemini CLI)
-claude                             # launch however you like
+cf start                           # start the proxy in the background
+cf mcp install                     # persistent MCP registration
+claude                             # launch Claude however you like
 cf stop
 ```
 
-Useful commands: `cf status` · `cf logs -f` · `cf restart` · `cf mcp status`
+Useful commands:
 
-### Other agents
+```text
+cf status
+cf logs -f
+cf restart
+cf mcp status
+```
 
-Any agent that honors `ANTHROPIC_BASE_URL` (or an OpenAI-compatible base URL) can point at the running proxy. Codex and Gemini CLI get persistent MCP tool registration via `cf mcp install`. Official wrap support for more agents is on the roadmap.
+---
+
+### Codex & Gemini CLI *(experimental)*
+
+ContextForge also supports persistent MCP registration for **Codex** and **Gemini CLI** via:
+
+```bash
+cf mcp install
+```
+
+Basic compatibility is implemented, but these integrations have not yet received the same level of real-world testing as Claude Code.
+
+If you use Codex or Gemini CLI with ContextForge, we'd greatly appreciate bug reports, compatibility feedback, and feature requests.
 
 ---
 
 ## Real Results
 
+> **Note:** The following is a real-world case study. A comprehensive automated test suite and official benchmark runs against standardized AI evaluation suites (like SWE-bench) are currently in development.
+
 The same **Soft-Delete** feature was implemented twice in the same Express.js cloud storage backend using the **same model (local Ollama)**, **same repository state**, and **same instructions**.
 
 ### Head-to-head Comparison
 
-| Metric | Passthrough Mode | ContextForge Mode | Difference |
-|--------|-----------------:|------------------:|-----------:|
-| **LLM round-trips** | 41 | 14 | **66% fewer** |
-| **Input tokens** | 1,632,266 | 444,092 | **72.8% fewer** |
-| **Output tokens** | 1,632,266 | 384,033 | **76.5% fewer** |
-| **Session-reported token savings** | — | 60,059 (13.5%) | — |
-| **Repository exploration** | Full-file reads and repeated searches | Graph-guided symbol lookup with targeted reads | More targeted |
-| **Task management** | 6 TaskCreate/TaskUpdate operations | None | Lower overhead |
-| **Final implementation** | ✅ Correct | ✅ Correct | Equivalent output |
+| Metric                             |                      Passthrough Mode |                              ContextForge Mode |        Difference |
+| ---------------------------------- | ------------------------------------: | ---------------------------------------------: | ----------------: |
+| **LLM round-trips**                |                                    41 |                                             14 |     **66% fewer** |
+| **Input tokens**                   |                             1,632,266 |                                        444,092 |   **72.8% fewer** |
+| **Output tokens**                  |                             1,632,266 |                                        384,033 |   **76.5% fewer** |
+| **Session-reported token savings** |                                     — |                                 60,059 (13.5%) |                 — |
+| **Repository exploration**         | Full-file reads and repeated searches | Graph-guided symbol lookup with targeted reads |     More targeted |
+| **Task management**                |    6 TaskCreate/TaskUpdate operations |                                           None |    Lower overhead |
+| **Final implementation**           |                            ✅ Correct |                                     ✅ Correct | Equivalent output |
 
 ---
 
@@ -215,7 +235,7 @@ At first glance, two numbers appear contradictory:
 
 These measure **different things**.
 
-### Behavioral Savings
+### Workflow Savings
 
 The **72.8% reduction** comes from comparing the two complete executions.
 
@@ -226,7 +246,7 @@ ContextForge changes how the model interacts with the repository:
 - Reduces unnecessary tool calls and repeated verification.
 - Reaches the same implementation in **14 requests instead of 41**.
 
-These are **behavioral savings**: tokens that were never generated because the model solved the task more efficiently.
+These are **workflow savings**: tokens that were never generated because the tooling changed the workflow and the task was solved more efficiently.
 
 Since those requests never happened, they cannot be counted by an in-session compression tracker.
 
@@ -238,18 +258,18 @@ This metric measures how much prompt content ContextForge compressed or eliminat
 
 In other words:
 
-- **72.8%** answers: *"How much smaller was this entire implementation compared to Passthrough?"*
-- **13.5%** answers: *"How much prompt content did ContextForge remove from the requests that were actually sent?"*
+- **72.8%** answers: _"How much smaller was this entire implementation compared to Passthrough?"_
+- **13.5%** answers: _"How much prompt content did ContextForge remove from the requests that were actually sent?"_
 
 These metrics are complementary rather than contradictory.
-
----
 
 ## Notes
 
 - Session-level compression depends on conversation length. Short sessions naturally provide less opportunity for compression than long-running coding sessions.
 - Token counts are estimated using `cl100k` tokenization, so absolute values are approximate.
 - The implementation produced by both runs was functionally equivalent; the primary differences were repository navigation strategy, request count, and token consumption.
+
+---
 
 ## When to Use · When to Skip
 
@@ -281,19 +301,19 @@ These metrics are complementary rather than contradictory.
 │           ContextForge Proxy          │◄─┤  start/stop · mcp · init │
 │                                       │  └──────────────────────────┘
 │  ┌─────────────────────────────────┐  │
-│  │ 🧠 Repository Graph              │  │  SQLite graph: symbols, calls,
+│  │   Repository Graph              │  │  SQLite graph: symbols, calls,
 │  │    (Tree-sitter AST + HNSW)     │  │  imports, routes + vector index
 │  └─────────────────────────────────┘  │
 │  ┌─────────────────────────────────┐  │
-│  │ ⚡ Execution Engine              │  │  graph/read/patch tools run
+│  │   Execution Engine              │  │  graph/read/patch tools run
 │  │    (Transparent Interception)   │  │  locally; patches return diffs
 │  └─────────────────────────────────┘  │
 │  ┌─────────────────────────────────┐  │
-│  │ 📦 Context Optimizer             │  │  pressure-aware, age-gated
+│  │   Context Optimizer             │  │  pressure-aware, age-gated
 │  │    (Compression Pipeline)       │  │  compression + dedup + vaulting
 │  └─────────────────────────────────┘  │
 │  ┌─────────────────────────────────┐  │
-│  │ 💾 Memory (per-workspace)        │  │  persistent HNSW + SQLite
+│  │   Memory (per-workspace)        │  │  persistent HNSW + SQLite
 │  └─────────────────────────────────┘  │
 └────────┬──────────────────────────────┘
          │ translated + compressed request
@@ -306,13 +326,14 @@ These metrics are complementary rather than contradictory.
 <details>
 <summary><b>What's inside</b></summary>
 
-- **Repository Graph** — Tree-sitter AST parsing for JavaScript, TypeScript, TSX, Python, Go, Rust, Java (pinned grammar versions, compiled into a native N-API addon). Indexes functions, classes, imports/exports, call edges, HTTP routes, string literals, and env-var references into SQLite, plus a symbol-level HNSW vector index for semantic lookup. Updated live by a file watcher and after every patch.
-- **Transparent Tool Interception** — `contextforge_query_graph`, `read_file_chunk`, `contextforge_patch_ast`, and `contextforge_retrieve` execute inside the proxy. Background tool hops are intercepted and resolved without a full client round-trip.
-- **Tool Schema Minimization** — Claude Code ships ~100KB of tool schemas per request. ContextForge truncates non-critical descriptions semantically (never its own tools' instructions, never enums) and caches the result.
+- **Repository Graph** — Tree-sitter AST parsing for JavaScript, TypeScript, TSX, Python, Go, Rust, Java (pinned grammar versions, compiled into a native N-API addon). Indexes functions, classes, imports/exports, call edges, HTTP routes, string literals, and env-var references into SQLite, plus a symbol-level HNSW vector index for semantic lookup. Automatically refreshed after patches and filesystem changes.
+- **Model Context Protocol (MCP) Bridge** — ContextForge integrates with agents using the open MCP standard. The `mcp/bridge.js` script acts as a high-performance, lightweight stdio bridge that dynamically fetches tool definitions from the proxy and forwards execution requests. This keeps the client integration entirely decoupled from the heavy AST graph engine.
+- **Transparent Tool Interception** — `contextforge_query_graph`, `read_file_chunk`, `contextforge_patch_ast`, and `contextforge_retrieve` execute inside the proxy. Background tool hops are intercepted by the proxy, avoiding additional client-agent interactions.
+- **Tool Schema Minimization** — ContextForge truncates non-critical descriptions semantically (never its own tools' instructions) and caches the result.
 - **Keep-newest Deduplication** — when the same file appears multiple times in history, older copies become vault pointers and the newest stays full — so the model always has exactly one current copy. SimHash-based near-dup detection marks superseded pre-patch versions as outdated.
 - **AST Compression** — large code files in older history become structural skeletons (signatures + first body lines) with a retrieval pointer. Age-gated: content from the last 2 turns is never compressed, so the model is never forced to re-retrieve what it just read.
 - **Junk Interception** — lockfiles, minified bundles, base64 blobs, and giant single-line JSON get vaulted aggressively with a preview stub — content no model benefits from reading raw.
-- **Self-verifying patches** — every successful patch returns a unified diff of the exact change applied, eliminating verification re-reads.
+- **Self-reporting patches** — every successful patch returns a unified diff of the exact change applied, eliminating verification re-reads.
 - **Pressure-aware policy** — compression aggressiveness scales with context size and upstream cost (local vs cloud). Small local sessions compress minimally; big cloud sessions compress hard.
 - **Live Dashboard** — real-time SSE metrics at `/dashboard`; scriptable snapshots at `/v1/stats` and `/v1/savings`.
 
@@ -320,7 +341,7 @@ These metrics are complementary rather than contradictory.
 
 ---
 
-## How It Works — Deep Dive
+<!-- ## How It Works — Deep Dive
 
 <details>
 <summary><b>🧠 Repository Graph</b> — AST-powered knowledge graph</summary>
@@ -372,23 +393,23 @@ Every stage is format-aware (Anthropic tool_result blocks and OpenAI tool messag
 
 </details>
 
----
+--- -->
 
 ## Supported Providers
 
-| Provider      | Models                     | Notes                                                                                                  |
-| ------------- | -------------------------- | ------------------------------------------------------------------------------------------------------ |
-| **Ollama**    | All local & cloud models   | Default. The reason many users are here: Claude Code driving `qwen2.5-coder`, `minimax-m3:cloud`, etc. |
-| **Anthropic** | Claude Sonnet, Opus, Haiku | Model picked inside Claude Code via `/model`                                                           |
-| **OpenAI**    | GPT-4o, o-series           | Set `OPENAI_API_KEY`                                                                                   |
-| **Gemini**    | Gemini 2.5 family          | Set `GEMINI_API_KEY`                                                                                   |
+| Provider      | Models                      | Notes                                                                                                  |
+| ------------- | --------------------------- | ------------------------------------------------------------------------------------------------------ |
+| **Ollama**    | All local & cloud models    | Default. The reason many users are here: Claude Code driving `qwen2.5-coder`, `minimax-m3:cloud`, etc. |
+| **Anthropic** | Text-generation models      | Model picked inside Claude Code via `/model`                                                           |
+| **OpenAI**    | Text-generation models      | Set `OPENAI_API_KEY`                                                                                   |
+| **Gemini**    | Text-generation models      | Set `GEMINI_API_KEY`                                                                                   |
 
 Switch providers anytime:
 
 ```bash
 cf config set provider.name anthropic          # machine-wide
 cf init --provider ollama --model qwen2.5-coder:14b   # per-project (committable)
-cf wrap claude --provider groq                 # one session only
+cf wrap claude --provider openai                 # one session only
 ```
 
 ---
@@ -404,59 +425,60 @@ CLI flags  >  CF_* env vars  >  ./.contextforge.toml  >  ~/.contextforge/config.
 ```bash
 cf config                        # every resolved value + WHERE it came from
 cf config set proxy.port 4000    # edit global config
-cf config set provider.model_override llama3.1:8b --project
+cf config set provider.model_override minimax-m3:cloud --project
 cf init                          # scaffold ./.contextforge.toml for this repo
 cf setup --reconfigure           # re-run the provider wizard
 ```
 
+### Configuration File Layout
+
+Below is a typical `~/.contextforge/config.toml` created by the first-run wizard. All state (models, databases, logs) is stored under `~/.contextforge/` to keep your repositories clean.
+
 ```toml
-# ~/.contextforge/config.toml (created by the first-run wizard)
 [proxy]
-port = 3000          # 0 = auto-pick a free port
-mode = "full"        # full | passthrough
+port = 3000          # The local port for the proxy (0 = auto-pick free port)
+mode = "full"        # "full" (optimization enabled) | "passthrough" (transparent proxy)
 
 [provider]
-name = "ollama"      # the UPSTREAM (where requests are sent)
-model_override = "qwen2.5-coder:14b"   # required for ollama
+# The UPSTREAM where requests are sent.
+name = "ollama"      # ollama | openai | anthropic | groq | gemini
+model_override = "qwen2.5-coder:14b"
 
 [compression]
-ccr = true
-nudge_tools = true   # strip native Edit/Read so the model uses graph tools
+# Recommended: true. Strips native Edit/Read tools so the agent is guided
+# to use ContextForge's optimized graph-aware tools exclusively.
+nudge_tools = true
+
+[logging]
+file = false         # Set to true to write debug logs to ~/.contextforge/logs/
 ```
 
-See [`.contextforge.example.toml`](.contextforge.example.toml) for the fully-commented reference. All state (models, per-workspace databases, logs) lives under `~/.contextforge/` — your repos stay clean.
-
 ---
 
-## Performance
+### Authentication & API Keys
 
-- **Pipeline overhead:** ~25–145ms per request (measured; dominated by first-turn planning — steady-state turns run ~25–40ms)
-- **Indexing:** ~0.5s for a 30-file Express app at startup; incremental re-index per file save/patch afterward
-- **Graph queries:** sub-millisecond SQLite lookups; semantic fallback ~50–200ms when regex-confidence is low
-- **Embeddings:** int8 ONNX MiniLM (~23MB) on a dedicated inference thread with LRU caching — ~3ms warm inference
-- **Net effect:** payloads roughly halve in real coding sessions, which more than repays the overhead in provider latency alone
+If you want the API key to work automatically across _all_ your projects without having to set it every time, you can save it into ContextForge's global configuration file (located at `C:\Users\ASUS\AppData\Roaming\contextforge\config.toml`).
 
-### Benchmarks
+The easiest way to do this is to run the setup command again:
 
-```bash
-npm run benchmark      # runs the compression suite against your own codebase
+```powershell
+cf setup --reconfigure
 ```
 
-The most honest benchmark is your own repo — publish yours in a Discussion.
+Select **OpenAI** when prompted, and it will ask you to paste your `OPENAI_API_KEY`. Once you do that, ContextForge will save it globally, and you can run `cf wrap claude` in any project folder.
 
----
+Alternatively, the proxy will read directly from your shell's current environment variables. If you don't want to save the key globally, you must set it in your terminal right before running the command.
 
-## Documentation
+In **PowerShell** (Windows), you set it like this:
 
-| Start here                             | Go deeper                                            |
-| -------------------------------------- | ---------------------------------------------------- |
-| [Quick Start](#quick-start)            | [Architecture](#architecture)                        |
-| [Agent Setup](#use-with-your-ai-agent) | [How It Works — Deep Dive](#how-it-works--deep-dive) |
-| [Configuration](#configuration)        | [RELEASE.md](RELEASE.md) — publish pipeline          |
-| [Troubleshooting](#troubleshooting)    | [INTEGRATION.md](INTEGRATION.md) — repo layout       |
-| [Contributing](#contributing)          | [FAQ](#faq)                                          |
+```powershell
+$env:OPENAI_API_KEY="your_api_key_here"
+cf wrap claude --provider openai
+```
 
----
+_(Note: In Mac/Linux or Git Bash, the syntax would be `export OPENAI_API_KEY="your_api_key_here"`)_
+
+
 
 ## Updating
 
@@ -490,9 +512,37 @@ Yes — this is a headline use case. ContextForge translates Claude Code's Anthr
 </details>
 
 <details>
+<summary><b>How do I know if the install is healthy?</b></summary>
+
+Run `cf doctor`. It performs an 8-point check on your Node version, native engine, ONNX models, and connectivity. If anything is corrupt, `cf doctor --fix` will repair it automatically.
+
+</details>
+
+<details>
+<summary><b>What platforms are supported?</b></summary>
+
+ContextForge ships with prebuilt native binaries for **5 platforms**: Windows (x64), macOS (Intel & Apple Silicon), and Linux (x64 & ARM64). It requires **Node.js 20.0.0** or higher.
+
+</details>
+
+<details>
+<summary><b>How does the "Session Memory" work?</b></summary>
+
+ContextForge maintains a persistent SQLite + HNSW vector database for every workspace. As you work, important context is embedded (using a local 23MB ONNX model) and stored. When you ask questions about past decisions or complex logic, relevant snippets are injected back into the prompt automatically.
+
+</details>
+
+<details>
+<summary><b>Is the Repository Graph case-sensitive?</b></summary>
+
+The graph engine includes a resolution layer for case-sensitive filesystems (Linux/macOS). It ensures that symbol lookups and path resolution remain stable even if the LLM makes minor casing errors in tool calls—preventing common `ENOENT` errors.
+
+</details>
+
+<details>
 <summary><b>Does ContextForge modify my code automatically?</b></summary>
 
-No. Files change only when your agent explicitly calls the patch tool. Every applied patch returns the exact diff, the graph re-indexes immediately, and patches are written atomically.
+No. Files change only when your agent explicitly calls the patch tool. Every applied patch returns the exact diff, the graph re-indexes, and patches are written atomically.
 
 </details>
 
@@ -504,63 +554,120 @@ Yes. SSE streams are translated between provider formats in real time — respon
 </details>
 
 <details>
-<summary><b>What kind of token savings should I expect?</b></summary>
-
-Real multi-file coding sessions measure around **50%** (see [Real Results](#real-results)). Repository-heavy work benefits most. Short chats benefit least — and by design: the policy engine compresses _less_ when context pressure is low and your upstream is a free local model, because a forced retrieval round-trip costs more than the tokens it saves.
-
-</details>
-
-<details>
-<summary><b>How does the Repository Graph stay up to date?</b></summary>
-
-Full index at startup, then incremental: the file watcher re-indexes changed files, and every applied patch re-indexes its file synchronously — the graph is current before the model's next query.
-
-</details>
-
-<details>
-<summary><b>What is Large Result Vaulting?</b></summary>
-
-Oversized or junk content (lockfiles, minified bundles, huge outputs) is stored in a local SQLite vault and replaced with a stub containing a preview and a `contextforge_retrieve` pointer. Content-hash dedup means the same content is stored once. Nothing is discarded — retrieval is always one tool call away.
-
-</details>
-
-<details>
 <summary><b>Is my code sent anywhere besides my chosen provider?</b></summary>
 
-No. ContextForge runs entirely on your machine — the graph, vaults, memory, and embeddings (local ONNX model) never leave it. The only outbound traffic is the compressed request to the provider _you_ configured. With Ollama, nothing leaves your machine at all.
-
-</details>
-
-<details>
-<summary><b>Can individual optimization stages be disabled?</b></summary>
-
-Partially: `nudge_tools` and `ccr` are config toggles, and `mode = "passthrough"` disables the whole pipeline (useful for baselining). Per-stage toggles are on the roadmap. `CF_DISABLE_FAT_CATCH=true` disables junk vaulting for debugging.
+No. ContextForge runs entirely on your machine — the graph, vaults, memory, and embeddings never leave it. The only outbound traffic is the compressed request to the provider _you_ configured. With Ollama, **nothing** leaves your machine.
 
 </details>
 
 <details>
 <summary><b>Do I need to compile the native components?</b></summary>
 
-Not with `npm i -g contextforge` — prebuilt N-API binaries ship for win32-x64, darwin-x64/arm64, and linux-x64/arm64, working across Node 18/20/22+. Compiling from source is only needed for other platforms or development; `cf doctor` tells you exactly which binary loaded (`prebuild` vs `local-gyp`).
+Not with `npm i -g contextforge`. Prebuilt N-API binaries ship for all major platforms. Compiling from source is only needed for unsupported architectures or development; `cf doctor` tells you exactly which binary type is currently loaded.
 
 </details>
 
+--- 
+
+## Performance
+
+> Measurements were collected on the development machine and should be treated as indicative rather than guaranteed.
+
+- **Pipeline overhead:** ~25–145ms per request (measured; dominated by first-turn planning — steady-state turns run ~25–40ms).
+- **Indexing:** ~0.5s for a 30-file Express app at startup; incremental re-index per file save/patch afterward.
+- **Graph queries:** Typically sub-millisecond SQLite lookups on indexed repositories; semantic fallback ~50–200ms when regex-confidence is low.
+- **Embeddings:** int8 ONNX MiniLM (~23MB) on a dedicated inference thread with LRU caching — ~3ms warm inference.
+- **Net effect:** Payload reductions vary by workload. In longer repository-aware sessions we commonly observe substantial reductions, which more than repays the overhead in provider latency alone.
+
+---
+
+<!-- ### Benchmarks
+
+```bash
+npm run benchmark      # runs the compression suite against your own codebase
+```
+
+The most honest benchmark is your own repo — publish yours in a Discussion.
+
+--- -->
+
 ## Roadmap
 
-- [x] `cf` CLI: wrap, setup wizard, doctor, daemon, config, per-project init
-- [x] Claude Code ↔ Ollama/OpenAI/Anthropic/Groq/Gemini translation with streaming
-- [x] AST knowledge graph (JS, TS, TSX, Python, Go, Rust, Java) + symbol embeddings
-- [x] Pressure-aware, age-gated compression pipeline with keep-newest dedup
-- [x] Self-verifying patches (diff-in-result) and junk interception
-- [x] MCP registration for Claude Code, Codex, Gemini CLI
-- [x] Prebuilt native binaries for 5 platforms via CI
-- [ ] **v1.1:** Per-stage compression toggles · more `cf wrap` agents
-- [ ] **v1.2:** Multi-workspace / monorepo support
-- [ ] **v1.3:** Cross-session memory surfaced in the dashboard
-- [ ] **v1.4:** Native prompt-caching integration (Anthropic, OpenAI, Gemini)
-- [ ] **v1.5:** C#, Ruby, and Swift grammar support
+### v1.0 — Foundation *(Released)*
 
-See [open issues](https://github.com/anujkushwaha612/ContextForge/issues) for the live list.
+ContextForge's core architecture is complete.
+
+- [x] **`cf` CLI** — Project initialization, wrapping, diagnostics, daemon management, and configuration.
+- [x] **Protocol Translation** — Claude Code ↔ Ollama / OpenAI / Anthropic / Gemini (streaming supported).
+- [x] **AST Knowledge Graph** — Native indexing for JavaScript, TypeScript, TSX, Python, Go, Rust, and Java.
+- [x] **Compression Pipeline** — Pressure-aware compression with age-gated skeletonization and keep-newest deduplication.
+- [x] **Execution Engine** — Self-reporting patches, diff-in-result validation, and junk-response interception.
+- [x] **MCP Integration** — Persistent registration for Claude Code, Codex, and Gemini CLI.
+- [x] **Cross-Platform Support** — Prebuilt native binaries for Windows, macOS, and Linux (x64 + ARM).
+
+---
+
+## Vision
+
+> **Help wanted:** ContextForge is well-tested with **Claude Code**, but we are actively looking for community testing on **Codex** and **Gemini CLI**. If you use either, we would love your feedback! Please report any issues, incompatibilities, or unexpected behavior so we can improve support.
+
+### Agent Ecosystem
+
+- Thorough testing and refinement for **Codex** and **Gemini CLI**.
+- Expanded `cf wrap` compatibility.
+- First-class support for additional coding agents (Aider, Cursor, OpenDevin, and more).
+
+### Compression & Intelligence
+
+- Per-stage compression controls.
+- Improved semantic deduplication and retrieval heuristics.
+- Native prompt-caching integration for Anthropic, OpenAI, and Gemini.
+- Smarter context selection and repository summarization.
+
+### Workspace Support
+
+- Multi-workspace and monorepo awareness.
+- Project-specific compression policies.
+- Enhanced handling of exceedingly large repositories.
+
+### Language Support
+
+- Native grammar support for C#, Ruby, Swift, C++, and additional Tree-sitter grammars.
+
+### Developer Experience
+
+- Richer Live Dashboard.
+- Cross-session memory visualization.
+- Knowledge graph exploration.
+- Enhanced telemetry, profiling, and benchmarking tools.
+
+### Testing & Benchmarks
+
+- Comprehensive unit, integration, and end-to-end test coverage.
+- Official benchmark runs against standard AI coding evaluations (e.g., SWE-bench) to formally measure token reduction and success rates.
+
+### Performance
+
+- Faster repository indexing.
+- Lower latency across the compression pipeline.
+- Reduced memory usage.
+- Additional native optimizations.
+
+### Enterprise
+
+- Shared team configuration.
+- Custom compression policies.
+- Workspace-wide analytics.
+- Expanded deployment and integration options.
+
+---
+
+## Help Shape ContextForge
+
+Whether you're testing **Codex**, **Gemini CLI**, or have ideas for new features, your feedback is invaluable.
+
+**Open an issue:**  
+https://github.com/anujkushwaha612/ContextForge/issues
 
 ---
 
@@ -580,7 +687,7 @@ npm link
 cf doctor                          # should be all green
 ```
 
-**Run tests:**
+<!-- **Run tests:**
 
 ```bash
 npm test               # full suite
@@ -589,7 +696,7 @@ npm run test:smoke
 npm run benchmark      # compression suite against your codebase
 ```
 
-**Good first areas:** a new tree-sitter grammar (see `native/binding.gyp` + `scripts/vendor-grammars.sh`), a new agent in `cli/src/core/agents.js`, or a new MCP registrar in `src/mcp/registrars/`.
+**Good first areas:** a new tree-sitter grammar (see `native/binding.gyp` + `scripts/vendor-grammars.sh`), a new agent in `cli/src/core/agents.js`, or a new MCP registrar in `src/mcp/registrars/`. -->
 
 ---
 
@@ -658,14 +765,7 @@ The SSE stream at `/v1/stats/stream` isn't reachable. Check `cf status` says the
 <details>
 <summary><b>Compression ratio is 0% or negative on the first message</b></summary>
 
-Expected. Tool injection costs tokens before compression can recover them, and low-pressure sessions deliberately compress less. Steady-state ratios appear by message 3 of real work.
-
-</details>
-
-<details>
-<summary><b>LLM responses look wrong / truncated</b></summary>
-
-Baseline against the raw pipeline: `cf wrap claude --mode passthrough`. If passthrough is fine but full mode isn't, capture a payload with `CF_DEBUG_PAYLOAD=1 cf start` and open an issue with `debug_payload.json` (redact secrets).
+Expected. Tool injection costs tokens before compression can recover them, and low-pressure sessions deliberately compress less. Positive compression ratios typically appear after a few turns of real work.
 
 </details>
 
@@ -675,6 +775,12 @@ Baseline against the raw pipeline: `cf wrap claude --mode passthrough`. If passt
 
 - **[GitHub Discussions](https://github.com/anujkushwaha612/ContextForge/discussions)** — questions, benchmark results, use cases
 - **[Issues](https://github.com/anujkushwaha612/ContextForge/issues)** — bugs (attach `cf doctor --json`) and feature requests
+
+---
+
+## Known Issues
+
+- **False Token Savings on Failed Upstream Requests:** Currently, the proxy logs tokens passed through it as "saved" as long as it compressed the context, regardless of whether the upstream server accepted the request (e.g., 401 Unauthorized errors). This can lead to misleading savings metrics if an invalid API key is used and the CLI automatically retries the request.
 
 ---
 
@@ -699,19 +805,6 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-## Placeholders to Fill Before Launch
-
-Almost everything above is real. The short remaining list:
-
-| Item                   | Where                         | What to do                                                                                                            |
-| ---------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Demo GIF               | below the intro               | Record `cf wrap claude` on a real task (vhs/asciinema) → `docs/images/demo.gif` — re-add the `<img>` block when ready |
-| Benchmark table        | [Real Results](#real-results) | After the next benchmark run, add a with/without comparison from `npm run benchmark`                                  |
-| LICENSE file           | repo root                     | Commit the MIT text (package.json already declares it)                                                                |
-| Good-first-issue links | [Contributing](#contributing) | Open 3–4 real issues and link them                                                                                    |
-| npm badge              | badges block                  | After first publish: `https://img.shields.io/npm/v/contextforge`                                                      |
-
----
 
 <p align="center">
   <i>Stop wasting tokens. Start building faster.</i><br/>

@@ -1,5 +1,7 @@
 /**
  * ContextForge CLI — commander wiring only. All logic lives in commands/ and core/.
+ *
+ * Enhanced with provider validation commands and options.
  */
 
 import { program } from "commander";
@@ -32,9 +34,10 @@ export function run() {
 
   program
     .command("doctor")
-    .description("Diagnose the installation (8 checks)")
+    .description("Diagnose the installation (10 checks)")
     .option("--fix", "auto-fix: re-download corrupt models, clean stale runfiles")
     .option("--json", "machine-readable output")
+    .option("--skip-provider-test", "skip provider connectivity test (faster)")
     .action(lazy(() => import("./commands/doctor.js"), "doctor"));
 
   // ── Core (Step 2/3 — daemon + wrap) ──
@@ -72,6 +75,7 @@ export function run() {
     .description("Show proxy logs")
     .option("-f, --follow", "keep tailing")
     .option("-n, --lines <n>", "number of lines", "50")
+    .option("--search <term>", "filter lines containing search term")
     .action(lazy(() => import("./commands/logs.js"), "logs"));
 
   program
@@ -93,6 +97,16 @@ export function run() {
     .option("--model <name>", "model override for this project")
     .option("--force", "overwrite existing file")
     .action(lazy(() => import("./commands/init.js"), "init"));
+
+  // ── Provider Testing ──
+  program
+    .command("test")
+    .description("Test provider connectivity and validate API key")
+    .option("--provider <name>", "test specific provider (default: current config)")
+    .option("--model <name>", "test with specific model")
+    .option("--timeout <ms>", "connection timeout in milliseconds", "10000")
+    .option("--json", "machine-readable output")
+    .action(lazy(() => import("./commands/test.js"), "test"));
 
   // ── MCP (persistent registration — wrap uses ephemeral config instead) ──
   const mcp = program
@@ -132,6 +146,28 @@ export function run() {
     .description("Set a value in global (or --project) config")
     .option("--project", "write to ./.contextforge.toml instead of global")
     .action(lazy(() => import("./commands/config.js"), "configSet"));
+  config
+    .command("validate")
+    .description("Validate current configuration (provider, API key, etc.)")
+    .option("--json", "machine-readable output")
+    .action(lazy(() => import("./commands/config.js"), "configValidate"));
+
+  // ── Provider Management ──
+  const provider = program
+    .command("provider")
+    .description("Manage upstream providers");
+
+  provider
+    .command("list")
+    .description("List all available providers with their requirements")
+    .option("--json", "machine-readable output")
+    .action(lazy(() => import("./commands/provider.js"), "providerList"));
+
+  provider
+    .command("status")
+    .description("Check current provider connectivity and configuration")
+    .option("--json", "machine-readable output")
+    .action(lazy(() => import("./commands/provider.js"), "providerStatus"));
 
   // ── Global error handling ──
   process.on("uncaughtException", (err) =>

@@ -1026,7 +1026,6 @@ async function handleRequest(req, res, chunks) {
   // countTokens() call. The Infinity override for vault-containing payloads
   // already handles the main correctness case.
   timer.time(STAGES.CCR_PIPELINE, () => {
-    if (process.env.CF_CCR_ENABLED === "false") return;
 
     let ccrBaseline = countTokens(payload); // Use current payload size for accurate CCR ratios
 

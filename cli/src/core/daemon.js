@@ -6,6 +6,8 @@
  *
  * Runfile schema (~/.contextforge/run/proxy-<port>.json):
  *   { pid, port, workspace, provider, mode, managed, version, startedAt, logFile, errFile }
+ *
+ * Enhanced with provider testing for paid API support.
  */
 
 import { spawn } from "node:child_process";
@@ -67,6 +69,210 @@ export async function findRunningProxy() {
     return { ...rf, health: null };
   }
   return null;
+}
+
+// ── Provider Testing ──────────────────────────────────────────────────────────
+
+/**
+ * Test provider connectivity and validate API key.
+ * @param {string} provider - Provider name (ollama, anthropic, openai, groq, gemini)
+ * @param {object} options - Test options
+ * @param {string} options.model - Model to test with (optional)
+ * @param {number} options.timeout - Timeout in ms (default: 10000)
+ * @returns {Promise<{ok: boolean, latency?: number, error?: string, model?: string}>}
+ */
+export async function testProvider(provider, options = {}) {
+  const timeout = options.timeout || 10000;
+  const startTime = Date.now();
+
+  try {
+    if (provider === "ollama") {
+      return await testOllama(timeout);
+    } else if (provider === "anthropic") {
+      return await testAnthropic(options.model, timeout);
+    } else if (provider === "openai") {
+      return await testOpenAI(options.model, timeout);
+    } else if (provider === "groq") {
+      return await testGroq(options.model, timeout);
+    } else if (provider === "gemini") {
+      return await testGemini(options.model, timeout);
+    } else {
+      return { ok: false, error: `Unknown provider: ${provider}` };
+    }
+  } catch (error) {
+    return { ok: false, error: error.message, latency: Date.now() - startTime };
+  }
+}
+
+async function testOllama(timeout) {
+  const startTime = Date.now();
+  
+  // Check if Ollama is running
+  const res = await fetch("http://127.0.0.1:11434/api/tags", {
+    signal: AbortSignal.timeout(timeout),
+  });
+  
+  if (!res.ok) {
+    return { ok: false, error: `Ollama returned HTTP ${res.status}` };
+  }
+  
+  const data = await res.json();
+  const models = data.models || [];
+  const latency = Date.now() - startTime;
+  
+  return {
+    ok: true,
+    latency,
+    models: models.map(m => m.name),
+    provider: "ollama",
+  };
+}
+
+async function testAnthropic(model, timeout) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { ok: false, error: "ANTHROPIC_API_KEY not set" };
+  }
+  
+  const startTime = Date.now();
+  const testModel = model || "claude-3-haiku-20240307";
+  
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: testModel,
+      max_tokens: 10,
+      messages: [{ role: "user", content: "Say 'test successful'" }],
+    }),
+    signal: AbortSignal.timeout(timeout),
+  });
+  
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    const errorMessage = errorData.error?.message || `HTTP ${res.status}`;
+    return { ok: false, error: errorMessage, latency: Date.now() - startTime };
+  }
+  
+  return {
+    ok: true,
+    latency: Date.now() - startTime,
+    model: testModel,
+    provider: "anthropic",
+  };
+}
+
+async function testOpenAI(model, timeout) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return { ok: false, error: "OPENAI_API_KEY not set" };
+  }
+  
+  const startTime = Date.now();
+  const testModel = model || "gpt-4o-mini";
+  
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: testModel,
+      messages: [{ role: "user", content: "Say 'test successful'" }],
+      max_tokens: 10,
+    }),
+    signal: AbortSignal.timeout(timeout),
+  });
+  
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    const errorMessage = errorData.error?.message || `HTTP ${res.status}`;
+    return { ok: false, error: errorMessage, latency: Date.now() - startTime };
+  }
+  
+  return {
+    ok: true,
+    latency: Date.now() - startTime,
+    model: testModel,
+    provider: "openai",
+  };
+}
+
+async function testGroq(model, timeout) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    return { ok: false, error: "GROQ_API_KEY not set" };
+  }
+  
+  const startTime = Date.now();
+  const testModel = model || "llama-3.1-8b-instant";
+  
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: testModel,
+      messages: [{ role: "user", content: "Say 'test successful'" }],
+      max_tokens: 10,
+    }),
+    signal: AbortSignal.timeout(timeout),
+  });
+  
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    const errorMessage = errorData.error?.message || `HTTP ${res.status}`;
+    return { ok: false, error: errorMessage, latency: Date.now() - startTime };
+  }
+  
+  return {
+    ok: true,
+    latency: Date.now() - startTime,
+    model: testModel,
+    provider: "groq",
+  };
+}
+
+async function testGemini(model, timeout) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return { ok: false, error: "GEMINI_API_KEY not set" };
+  }
+  
+  const startTime = Date.now();
+  const testModel = model || "gemini-1.5-flash";
+  
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${testModel}:generateContent?key=${apiKey}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: "Say 'test successful'" }] }],
+      generationConfig: { maxOutputTokens: 10 },
+    }),
+    signal: AbortSignal.timeout(timeout),
+  });
+  
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    const errorMessage = errorData.error?.message || `HTTP ${res.status}`;
+    return { ok: false, error: errorMessage, latency: Date.now() - startTime };
+  }
+  
+  return {
+    ok: true,
+    latency: Date.now() - startTime,
+    model: testModel,
+    provider: "gemini",
+  };
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────

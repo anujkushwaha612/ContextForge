@@ -13,6 +13,8 @@
  *   - ANTHROPIC_API_KEY passthrough is untouched: for ollama upstreams the
  *     key is never used upstream; a placeholder is set if absent so Claude
  *     Code doesn't block on login for local-model usage.
+ *
+ * Enhanced with credential validation for paid API providers.
  */
 
 import { execFileSync } from "node:child_process";

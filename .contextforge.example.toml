@@ -1,23 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────
-# ContextForge configuration — EXAMPLE
-#
-# NOTE: ContextForge uses TOML, not YAML. Two config locations:
-#
-#   Global   (per machine):  ~/.contextforge/config.toml
-#                            (Windows: %APPDATA%\contextforge\config.toml)
-#                            Created by the first-run wizard (`cf setup`).
-#
-#   Project  (per repo):     ./.contextforge.toml
-#                            Created by `cf init`. Overrides global.
-#                            SAFE TO COMMIT — teammates get the same setup.
-#
-# Precedence (highest wins):
-#   CLI flags  >  CF_* env vars  >  ./.contextforge.toml  >  global  >  defaults
-#
-# See every resolved value and where it came from:   cf config
-# Change a value without editing files:               cf config set <key> <value>
-#
-# To use this file: copy to .contextforge.toml and edit.
+# ContextForge Configuration — EXAMPLE
 # ─────────────────────────────────────────────────────────────────────
 
 [proxy]
@@ -25,28 +7,23 @@
 port = 3000
 
 # "full"        = complete pipeline: compression, dedup, graph tools, memory
-# "passthrough" = translate + forward only (debugging / benchmarking baseline)
+# "passthrough" = translate + forward only (use for debugging/benchmarking)
 mode = "full"
 
 [provider]
-# The UPSTREAM provider — where requests are SENT (not where they come from).
-# Claude Code always talks to the proxy in Anthropic format; the proxy
-# translates to this provider's format.
+# The UPSTREAM provider where requests are SENT.
 #   ollama | openai | anthropic | groq | gemini
 name = "ollama"
 
-# Model override sent upstream.
-#   REQUIRED for ollama (it has no default model) — local or cloud tags work:
-#     "qwen2.5-coder:14b"     (local)
-#     "minimax-m3:cloud"      (ollama cloud)
-#   For anthropic: leave unset — Claude Code picks its model via /model.
+# Model name sent to the upstream provider.
+# REQUIRED for ollama. For anthropic, leave unset.
 model_override = "qwen2.5-coder:14b"
 
 [compression]
-# Cognitive Context Routing — background tool-hop interception.
-ccr = true
-
-# Strip Claude Code's native Edit/Read/Update tools so the model uses
-# ContextForge's graph-aware tools exclusively. Recommended: true.
-# (Native Write stays available — it's used for new-file creation.)
+# Recommended: true. Strips native Edit/Read/Update tools so the model 
+# uses ContextForge's graph-aware tools exclusively.
 nudge_tools = true
+
+[logging]
+# Set to true to write detailed proxy logs to ~/.contextforge/logs/
+file = false
