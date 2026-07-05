@@ -67,15 +67,23 @@ function resolveFilePath(filePath) {
   // We need to resolve them back to actual filesystem paths to avoid ENOENT on Linux/macOS
   let p = filePath.replace(/\\/g, "/").replace(/^\.\//, "");
 
-  // Try to resolve through the path case cache
-  // First check if this is already a canonical path (lowercase)
-  const canonicalP = p.toLowerCase();
-  const resolvedFromCache = resolvePathCase(canonicalP);
-
-  // If we got a different path from cache, use it (it has the correct case)
-  if (resolvedFromCache && resolvedFromCache.toLowerCase() === canonicalP) {
-    p = resolvedFromCache;
-  }
+  // BUG A FIX: Always try path case cache — resolvePathCase() maps the
+  // canonical (lowercased) form back to the real filesystem path with
+  // correct case. The old guard (resolvedFromCache.toLowerCase() === canonicalP)
+  // compared an absolute resolved path against a potentially relative
+  // canonical path, so the condition was always false on Linux and the
+  // ENOENT remained. Simply use the resolved path whenever it is available.
+  //
+  // ASSUMPTION: the cache is trusted unconditionally here. This is safe
+  // because (a) registerPathCase() is called for every file during workspace
+  // indexing (workspaceMapper.js → writeFileGraph → graphDb), so the cache
+  // always reflects the files actually present on disk, and (b) clearGraph()
+  // wipes the cache before any re-index, so stale entries from a previous
+  // session cannot linger. If the cache ever returns a wrong path, the
+  // subsequent fs.readFileSync / ensureInsideWorkspace call will surface it
+  // as an explicit ENOENT / containment error rather than silent corruption.
+  const resolvedFromCache = resolvePathCase(p.toLowerCase());
+  if (resolvedFromCache) p = resolvedFromCache;
 
   if (path.isAbsolute(p) || /^[A-Za-z]:\//.test(p)) {
     return p;
@@ -248,7 +256,10 @@ function checkBodyIntegrity(lines, row) {
   const bodyStart = row.body_start_line ?? row.start_line;
   const bodyEnd = row.body_end_line ?? row.end_line;
 
-  if (bodyStart < 1 || bodyEnd >= lines.length) {
+  // BUG D FIX: The old guard used `< 1`, which incorrectly triggered stale
+  // recovery for functions whose body starts at line 0 (zero-indexed, valid).
+  // Changed to `< 0` so only truly out-of-bounds indices cause recovery.
+  if (bodyStart < 0 || bodyEnd >= lines.length) {
     return {
       stale: true,
       reason:

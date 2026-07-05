@@ -941,7 +941,13 @@ export const READ_FILE_CHUNK_TOOL_NAME = "read_file_chunk";
 
 export function isReadFileChunkTool(toolName) {
   if (!toolName) return false;
-  return toolName === READ_FILE_CHUNK_TOOL_NAME || toolName.includes(READ_FILE_CHUNK_TOOL_NAME);
+  if (toolName === READ_FILE_CHUNK_TOOL_NAME) return true;
+  // BUG C FIX: The old code used .includes() which matched ANY tool name
+  // containing "read_file_chunk" as a substring (e.g. "my_read_file_chunk_v2").
+  // Use endsWith('__' + name) to only match legitimate MCP-prefixed aliases
+  // like "mcp__contextforge__read_file_chunk" — the same pattern used by
+  // the GRAPH_TOOL_ALIASES Set for graph tool detection.
+  return toolName.endsWith("__" + READ_FILE_CHUNK_TOOL_NAME);
 }
 
 export function executeReadFileChunk(filePath, startLine, endLine) {

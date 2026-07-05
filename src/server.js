@@ -36,6 +36,12 @@
  *
  *   SV-11: SIGINT handler now calls server.close() for graceful drain with
  *          a 5s force-exit timeout fallback.
+ *
+ *   SV-12: /healthz version field now reads from package.json at startup
+ *          instead of being hardcoded to "1.0.0". The hardcoded string was
+ *          stale on every release (confirmed: reported v1.0.3, healthz said
+ *          v1.0.0). createRequire is already imported; use it once at module
+ *          scope so the JSON is parsed only once, not per request.
  */
 
 import http from "node:http";
@@ -45,6 +51,12 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { writeFileSync, readFileSync, mkdirSync, existsSync } from "node:fs";
 import crypto from "node:crypto";
+
+// BUG B FIX: Read version once from package.json so /healthz always reflects
+// the real npm package version. createRequire is already used elsewhere;
+// JSON imports are synchronous and cached by Node after the first load.
+const _require = createRequire(import.meta.url);
+const _pkgVersion = _require("../package.json").version;
 
 // ── ContextForge core ──
 import { crushJsonToolResults } from "./compression/jsonCrusher.js";
@@ -226,7 +238,7 @@ const readiness = {
   workspace: null,
   indexedFiles: 0,
   startedAt: Date.now(),
-  version: "1.0.0",
+  version: _pkgVersion, // BUG B FIX: was hardcoded "1.0.0"
 };
 
 // ─────────────────────────────────────────────

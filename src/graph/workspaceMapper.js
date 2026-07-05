@@ -44,6 +44,16 @@
  *   WM-12: force defaults to true — stale SQLite entries from previous
  *          sessions caused graph to return outdated symbol locations after
  *          patches. Re-indexing 30 files takes ~200ms, worth the accuracy.
+ *
+ *   WM-13: extractCallEdges now tracks this.method() and ClassName.method()
+ *          calls via a secondary METHOD_CALL_PATTERN. Previously only bare
+ *          function calls (fn()) were tracked; class instance calls and
+ *          static method calls were always missed. (BUG F fix)
+ *
+ *   WM-14: buildRoutePrefixMap now also parses CommonJS require() imports
+ *          alongside the existing ESM import pattern. Projects using
+ *          require('./routes/auth') instead of import syntax had all their
+ *          router files registered without their mount prefix. (BUG E fix)
  */
 
 import fs from "node:fs";
@@ -255,6 +265,12 @@ const BARE_URL_PATTERN = /req\.url\s*(?:===|!==|startsWith\s*\()\s*['"`]([^'"`]+
 const ROUTER_MOUNT_PATTERN =
   /(?:app|server)\s*\.\s*use\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*([a-zA-Z_$][a-zA-Z0-9_$]*)/g;
 const IMPORT_ROUTER_PATTERN = /import\s+(\w+)\s+from\s+['"`]([^'"`]*)['"` ]/g;
+// BUG E FIX: CommonJS require() imports were invisible to buildRoutePrefixMap
+// which only parsed ESM `import`. Projects using `const authRouter = require('./routes/auth')`
+// had all their router files registered without their mount prefix because
+// the importMap was never populated for those files.
+const REQUIRE_ROUTER_PATTERN =
+  /(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"`]([^'"`]*)['"`]\s*\)/g;
 
 // WM-10: routePrefixMap keyed by normalized relPath (not absolute path).
 // Previously keyed by absolute path but queried with relPath — always missed.
@@ -265,6 +281,12 @@ const routePrefixMap = new Map(); // normalized relPath → mount prefix string
 // ─────────────────────────────────────────────
 
 const CALL_EXPRESSION_PATTERN = /\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
+// BUG F FIX: Secondary pattern captures method calls: this.method() and
+// ClassName.method(). The primary pattern only matched bare fn() calls,
+// missing all intra-class and static method calls (analyze_impact returned
+// 0 callers for class methods, show_dependencies missed ClassName.fn).
+const METHOD_CALL_PATTERN =
+  /(?:this|[A-Z][A-Za-z0-9_$]*)\s*\.\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g;
 const CALL_EXCLUSIONS = new Set([
   "if",
   "for",
@@ -335,6 +357,31 @@ function extractCallEdges(source, filePath, nodes, allKnownSymbols) {
     let match;
 
     while ((match = CALL_EXPRESSION_PATTERN.exec(scanText)) !== null) {
+      const callee = match[1];
+      if (
+        callee === node.name ||
+        CALL_EXCLUSIONS.has(callee) ||
+        !knownSymbols.has(callee) ||
+        seenCallees.has(callee)
+      )
+        continue;
+
+      seenCallees.add(callee);
+      callEdges.push({
+        sourceSymbol: node.name,
+        targetSymbol: callee,
+        targetFile: null,
+        relation: "calls",
+        sourceLine: null,
+      });
+    }
+
+    // BUG F FIX: Also scan for this.method() and ClassName.method() calls.
+    // These are missed by CALL_EXPRESSION_PATTERN because the word-boundary
+    // anchor `\b` is preceded by `.`, not a word char, so the pattern never
+    // fires on the method part of a dotted call.
+    METHOD_CALL_PATTERN.lastIndex = 0;
+    while ((match = METHOD_CALL_PATTERN.exec(scanText)) !== null) {
       const callee = match[1];
       if (
         callee === node.name ||
@@ -442,6 +489,26 @@ function buildRoutePrefixMap(allFiles, workspacePath) {
           // Add .js extension if missing
           const withExt = /\.\w{1,4}$/.test(absResolved) ? absResolved : absResolved + ".js";
           // WM-10: store as normalized relPath so lookup matches
+          const relResolved = normalizeKey(path.relative(workspacePath, withExt));
+          importMap.set(varName, relResolved);
+        } catch {
+          /* skip unresolvable imports */
+        }
+      }
+
+      // BUG E FIX (WM-14): Also parse CommonJS require() imports.
+      // `const authRouter = require('./routes/auth')` was completely invisible
+      // to the ESM-only IMPORT_ROUTER_PATTERN, so the importMap was empty for
+      // CJS projects and ROUTER_MOUNT_PATTERN could never resolve var → relPath.
+      REQUIRE_ROUTER_PATTERN.lastIndex = 0;
+      let req;
+      while ((req = REQUIRE_ROUTER_PATTERN.exec(src)) !== null) {
+        const varName = req[1];
+        const importPath = req[2];
+        if (!importPath.startsWith(".")) continue;
+        try {
+          const absResolved = path.resolve(path.dirname(filePath), importPath);
+          const withExt = /\.\w{1,4}$/.test(absResolved) ? absResolved : absResolved + ".js";
           const relResolved = normalizeKey(path.relative(workspacePath, withExt));
           importMap.set(varName, relResolved);
         } catch {
