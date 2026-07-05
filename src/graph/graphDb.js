@@ -89,6 +89,12 @@ const _pathCaseCache = new Map();
  */
 export function registerPathCase(canonicalPath, actualPath) {
   if (!canonicalPath || !actualPath) return;
+  // Don't overwrite a correct case mapping with a lowercase→lowercase no-op.
+  // writeFileGraph canonicalizes (lowercases) the path then calls this with
+  // the canonical form as BOTH arguments, which would overwrite the real
+  // mapping that workspaceMapper set earlier with the original filesystem case.
+  const existing = _pathCaseCache.get(canonicalPath);
+  if (existing && existing !== canonicalPath) return; // already has a real mapping
   _pathCaseCache.set(canonicalPath, actualPath);
 }
 

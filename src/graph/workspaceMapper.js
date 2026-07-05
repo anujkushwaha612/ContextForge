@@ -67,6 +67,7 @@ import {
   getGraphStats,
   getAllNodeNames,
   setWorkspaceRoot,
+  registerPathCase,
 } from "./graphDb.js";
 import {
   extractLiterals,
@@ -281,12 +282,12 @@ const routePrefixMap = new Map(); // normalized relPath → mount prefix string
 // ─────────────────────────────────────────────
 
 const CALL_EXPRESSION_PATTERN = /\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
-// BUG F FIX: Secondary pattern captures method calls: this.method() and
-// ClassName.method(). The primary pattern only matched bare fn() calls,
-// missing all intra-class and static method calls (analyze_impact returned
-// 0 callers for class methods, show_dependencies missed ClassName.fn).
+// BUG F FIX (partial fix completed): Secondary pattern captures all method calls:
+// this.method(), ClassName.method(), and variable.method().
+// The previous pattern restricted the object to 'this' or capitalized names,
+// missing standard variable method calls (e.g. file.softDelete()).
 const METHOD_CALL_PATTERN =
-  /(?:this|[A-Z][A-Za-z0-9_$]*)\s*\.\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g;
+  /(?:[A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g;
 const CALL_EXCLUSIONS = new Set([
   "if",
   "for",
@@ -640,11 +641,19 @@ export async function indexWorkspace(workspacePath, options = {}) {
 
       // WM-9: compute relPath for SQLite key lookup
       // path.relative needs the original casing for Windows fs operations,
-      // then we normalize the result for map lookup
-      const relPath = normalizeKey(path.relative(normalizedWorkspacePath, filePath));
+      // then we normalize the result for map lookup.
+      // BUG A FIX: We preserve the RAW relative path (rawRelPath) with its
+      // original casing to pass to writeFileGraph and extractors, otherwise
+      // graphDb's registerPathCase will just store lowercase -> lowercase.
+      const rawRelPath = normalizeSlashes(path.relative(normalizedWorkspacePath, filePath));
+      const relKey = normalizeKey(rawRelPath);
 
-      if (!force && alreadyIndexed.has(relPath)) {
-        if (Math.abs(alreadyIndexed.get(relPath) - mtime) < 1000) {
+      // Preserve original filesystem case so patchEngine can resolve
+      // lowercase graph paths back to real paths on case-sensitive systems.
+      if (rawRelPath !== relKey) registerPathCase(relKey, rawRelPath);
+
+      if (!force && alreadyIndexed.has(relKey)) {
+        if (Math.abs(alreadyIndexed.get(relKey) - mtime) < 1000) {
           stats.skipped++;
           await new Promise((r) => setImmediate(r));
           continue;
@@ -658,7 +667,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
         continue;
       }
 
-      const { nodes, edges } = extractSymbols(source, relPath);
+      const { nodes, edges } = extractSymbols(source, rawRelPath);
 
       if (process.env.CF_DEBUG_GRAPH === "1") {
         const isSynthetic = nodes.length === 1 && nodes[0].name.startsWith("__module_");
@@ -673,17 +682,17 @@ export async function indexWorkspace(workspacePath, options = {}) {
         }
       }
 
-      const { literals, configRefs } = extractLiterals(source, relPath, nodes);
-      const summaries = buildNodeSummaries(nodes, literals, configRefs, relPath);
-      const retrievalDocs = buildRetrievalDocuments(nodes, literals, configRefs, relPath);
+      const { literals, configRefs } = extractLiterals(source, rawRelPath, nodes);
+      const summaries = buildNodeSummaries(nodes, literals, configRefs, rawRelPath);
+      const retrievalDocs = buildRetrievalDocuments(nodes, literals, configRefs, rawRelPath);
 
       // WM-10: routePrefixMap is now keyed by normalized relPath
-      const mountPrefix = routePrefixMap.get(normalizeKey(relPath)) || "";
-      const routeEdges = extractRouteEdges(source, relPath, mountPrefix);
+      const mountPrefix = routePrefixMap.get(normalizeKey(rawRelPath)) || "";
+      const routeEdges = extractRouteEdges(source, rawRelPath, mountPrefix);
       const pass1Edges = [...edges, ...routeEdges];
 
       writeFileGraph({
-        filePath: relPath,
+        filePath: rawRelPath,
         language: getLanguageForFile(filePath)?.language || "unknown",
         lastModified: mtime,
         nodes,
@@ -703,7 +712,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
         configRefs,
         summaries,
         retrievalDocs,
-        relPath,
+        relPath: rawRelPath,
       });
 
       stats.indexed++;
@@ -712,7 +721,7 @@ export async function indexWorkspace(workspacePath, options = {}) {
         onProgress({
           current: i + 1,
           total: stats.total,
-          file: relPath,
+          file: rawRelPath,
           ...stats,
         });
       }
@@ -853,9 +862,12 @@ export function watchWorkspace(workspacePath) {
 
       try {
         const stat = fs.statSync(filePath);
-        const relPath = normalizeKey(path.relative(normalizedWorkspacePath, filePath));
+        
+        const rawRelPath = normalizeSlashes(path.relative(normalizedWorkspacePath, filePath));
+        const relPath = normalizeKey(rawRelPath);
+        if (rawRelPath !== relPath) registerPathCase(relPath, rawRelPath);
 
-        const { nodes, edges } = extractSymbols(source, relPath);
+        const { nodes, edges } = extractSymbols(source, rawRelPath);
 
         if (process.env.CF_DEBUG_GRAPH === "1") {
           const isSynthetic = nodes.length === 1 && nodes[0].name.startsWith("__module_");
@@ -869,17 +881,17 @@ export function watchWorkspace(workspacePath) {
           }
         }
 
-        const { literals, configRefs } = extractLiterals(source, relPath, nodes);
-        const summaries = buildNodeSummaries(nodes, literals, configRefs, relPath);
-        const callEdges = extractCallEdges(source, relPath, nodes, allKnownSymbols);
+        const { literals, configRefs } = extractLiterals(source, rawRelPath, nodes);
+        const summaries = buildNodeSummaries(nodes, literals, configRefs, rawRelPath);
+        const callEdges = extractCallEdges(source, rawRelPath, nodes, allKnownSymbols);
 
         // WM-10: query with normalized relPath
-        const watchMountPrefix = routePrefixMap.get(normalizeKey(relPath)) || "";
-        const routeEdges = extractRouteEdges(source, relPath, watchMountPrefix);
+        const watchMountPrefix = routePrefixMap.get(normalizeKey(rawRelPath)) || "";
+        const routeEdges = extractRouteEdges(source, rawRelPath, watchMountPrefix);
         const allEdges = [...edges, ...callEdges, ...routeEdges];
 
         writeFileGraph({
-          filePath: relPath,
+          filePath: rawRelPath,
           language: getLanguageForFile(filePath)?.language || "unknown",
           lastModified: stat.mtimeMs,
           nodes,
