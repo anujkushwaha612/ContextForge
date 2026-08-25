@@ -42,6 +42,7 @@
                 "vendor/nlohmann",
                 "vendor/sqlite3",
                 "tree-sitter-src/tree-sitter/lib/include",
+                "tree-sitter-src/tree-sitter/lib/src",
                 "tree-sitter-src/tree-sitter-javascript/src",
                 "tree-sitter-src/tree-sitter-typescript/typescript/src",
                 "tree-sitter-src/tree-sitter-typescript/tsx/src",
