@@ -4,8 +4,8 @@
  * Design:
  *   For each tool result message, compute a SimHash fingerprint.
  *   If we have seen this key before:
- *     - Exact match (FNV-1a)  → replace with vault stub
- *     - Near-duplicate (SimHash distance ≤ threshold) → replace with vault stub
+ *     - Exact match (FNV-1a)  → replace older copy with a visible-copy stub
+ *     - Near-duplicate (SimHash distance ≤ threshold) → replace older copy with a superseded stub
  *     - Too different (distance > threshold) → update registry, pass through
  *   First time seeing this key → register in session, pass through
  *
@@ -48,7 +48,6 @@
  */
 
 import { createRequire } from "module";
-import path from "path";
 import { saveToVault } from "../logging/cacheDb.js";
 import { statsEmitter } from "../proxy/statsEmitter.js";
 import { isRecentToolResult, looksLikeStub } from "./compressionPolicy.js";
@@ -235,31 +234,49 @@ function extractFilename(msg) {
 // normalizeFilePath
 // ─────────────────────────────────────────────
 
-const CWD_PREFIX = path
-  .resolve(process.cwd())
-  .replace(/\\/g, "/")
-  .toLowerCase()
-  .replace(/\/?$/, "/");
-
 const STRIP_PREFIXES = ["src/"];
 
-function normalizeFilePath(rawPath) {
+function normalizePathForComparison(value) {
+  if (!value || typeof value !== "string") return "";
+  return value.trim().replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "").toLowerCase();
+}
+
+function workspaceRootsForDedup() {
+  // ContextForge normally runs from its own repository while indexing a
+  // different target workspace. process.cwd() alone therefore cannot turn
+  // `D:/target/controllers/file.js` into the same key as
+  // `controllers/file.js`. Prefer the explicit workspace root, then retain
+  // cwd as a fallback for direct/local deployments.
+  const roots = [process.env.CF_WORKSPACE_PATH, process.cwd()]
+    .map(normalizePathForComparison)
+    .filter(Boolean);
+  return [...new Set(roots)].sort((a, b) => b.length - a.length);
+}
+
+export function normalizeFilePathForDedup(rawPath) {
   if (!rawPath || typeof rawPath !== "string") return null;
 
   let p = rawPath.trim();
-  if (p.length === 0 || p.length > 300) return null;
+  if (p.length === 0 || p.length > 500) return null;
 
   const extMatch = p.match(/\.(\w+)$/);
   if (!extMatch) return null;
   const ext = extMatch[1].toLowerCase();
   if (!SOURCE_EXTENSIONS.has(ext)) return null;
 
-  p = p.replace(/\\/g, "/").toLowerCase();
+  p = normalizePathForComparison(p);
 
-  if (p.startsWith(CWD_PREFIX)) {
-    p = p.slice(CWD_PREFIX.length);
+  for (const root of workspaceRootsForDedup()) {
+    if (p === root) return null;
+    if (p.startsWith(root + "/")) {
+      p = p.slice(root.length + 1);
+      break;
+    }
   }
 
+  // A Windows drive prefix is only meaningful after workspace stripping.
+  // Removing it here keeps an unmatched absolute path stable without
+  // preventing the normal absolute-vs-relative workspace collapse above.
   p = p.replace(/^[a-z]:\//i, "");
   p = p
     .replace(/^\.\/+/, "")
@@ -274,6 +291,10 @@ function normalizeFilePath(rawPath) {
   }
 
   return p.length > 0 ? p : null;
+}
+
+function normalizeFilePath(rawPath) {
+  return normalizeFilePathForDedup(rawPath);
 }
 
 // ─────────────────────────────────────────────
@@ -459,7 +480,7 @@ async function deduplicateMessage(msg, key) {
         msg: {
           ...msg,
           _cf_deduped: true,
-          content: `[CF_VAULT:${existing.vaultId}] (identical to turn ${existing.turnIndex}, ~${tokensSaved} tokens)`,
+          content: `[CF_DEDUPLICATED] Identical to turn ${existing.turnIndex} (~${tokensSaved} tokens omitted).`,
           _dedupVaultId: existing.vaultId,
           _dedupSimilarity: 100,
         },
@@ -601,7 +622,7 @@ async function deduplicateMessage(msg, key) {
     msg: {
       ...msg,
       _cf_deduped: true,
-      content: `[CF_VAULT:${newVaultId}] (${similarityPct}% similar to turn ${existing.turnIndex})`,
+      content: `[CF_SUPERSEDED] ${similarityPct}% similar to turn ${existing.turnIndex}; current copy retained.`,
       _dedupVaultId: newVaultId,
       _dedupSimilarity: similarityPct,
     },
@@ -760,15 +781,15 @@ export async function applySemanticDedup(payload) {
       return { deduplicated: false, msg };
     }
 
-    // Exact match with the newest copy → stub this older one.
-    // PA-5: the newest hash was precomputed in the pre-pass; and the vault
-    // for byte-identical content is the newest copy's vault — no need to
-    // re-run saveToVault() (full SHA-256 + DB query) to discover the same id.
+    // Exact match with the newest copy → stub this older one. This is not a
+    // retrieval opportunity: the authoritative full copy is already visible
+    // later in the SAME request. Using a CF_VAULT marker here used to make CCR
+    // repeatedly inject contextforge_retrieve for stale/redundant content.
     if (fnv1a64(content) === newest.contentHash) {
       const vaultId = newest.vaultId;
       const stub =
-        `[CF_VAULT:${vaultId}] (identical to the current copy of this file ` +
-        `shown later in this conversation, ~${Math.round(content.length / 4)} tokens)`;
+        `[CF_DEDUPLICATED] Identical to the current copy of this file shown later ` +
+        `in this conversation (~${Math.round(content.length / 4)} tokens omitted).`;
       // A1 (headroom analysis): the exact-dup path accepts content from
       // MIN_EXACT_DEDUP_CHARS (100) — for those, this ~180-char stub can be
       // LARGER than the original in tokens. Char length was never compared
@@ -812,13 +833,15 @@ export async function applySemanticDedup(payload) {
         // this same payload, so no stale-retrieval risk exists.
         if (distance <= threshold) {
           const similarityPct = Math.round(((64 - distance) / 64) * 100);
-          const vaultId = saveToVault(content);
+          // The newer full copy is present in this payload, so retaining a
+          // vault for the older near-duplicate only creates a misleading
+          // retrieve path and unnecessary SQLite work.
+          const vaultId = newest.vaultId;
           const stub =
-            `[CF_VAULT:${vaultId}] (outdated copy — ${similarityPct}% similar to the ` +
-            `current version of this file shown later in this conversation)`;
+            `[CF_SUPERSEDED] Older copy — ${similarityPct}% similar to the current ` +
+            `version of this file shown later in this conversation.`;
           // A1: near-dup requires >= 500 chars so the stub is normally
-          // smaller, but gate on tokens anyway — the vault row is
-          // content-addressed and stays useful if we keep the original.
+          // smaller, but gate on tokens anyway.
           if (!passesTokenGate(content, stub)) {
             return { deduplicated: false, msg };
           }

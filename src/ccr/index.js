@@ -7,6 +7,7 @@ export {
   CCR_TOOL_NAME,
   CCRToolInjector,
   scanForMarkers,
+  hasRetrievableVaultMarker,
   parseCCRToolCall,
 } from "./toolInjection.js";
 export { SessionRegistry, sessionRegistry } from "./sessionRegistry.js";

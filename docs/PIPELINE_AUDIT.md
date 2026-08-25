@@ -266,13 +266,16 @@ Acceptable; full-content FNV would close it at ~µs cost if desired.
 
 ### Stage 9 — SEMANTIC_DEDUP (keep-newest)
 **Purpose:** for each file key, keep exactly one full copy in context (the
-newest); stub older exact/near-duplicates as vault pointers.
+newest); replace older exact/near-duplicates with non-retrievable pointers to
+that visible current copy.
 **Implementation:** `applySemanticDedup` — pre-pass locates newest per key
-(`file:<normalized path>` or type+prefix hash fallback, json excluded);
-main pass compares each older occurrence with FNV-1a-64 (exact) then
-64-bit SimHash + dynamic threshold (near-dup, ≥500 chars both sides);
-session registry (200 LRU entries) persists vault IDs + fingerprints
-across turns; F1 age gate + F3 never-dedup-toward-stub guards.
+(`file:<workspace-relative normalized path>` or type+prefix hash fallback,
+json excluded); main pass compares each older occurrence with FNV-1a-64
+(exact) then 64-bit SimHash + dynamic threshold (near-dup, ≥500 chars both
+sides). The session registry (200 LRU entries) persists vault IDs +
+fingerprints for the newest copy; F1 age gate + F3 never-dedup-toward-stub
+guards remain in force. Dedup stubs intentionally do not carry retrieval
+markers, so they cannot create CCR work for content already visible later.
 **Correctness:** ✅. The F2 rewrite fixed the historic "zero full copies"
 bug; BUG-1 (SimHash blind spot) is safe under keep-newest because the
 authoritative copy is in the same payload.
@@ -288,7 +291,9 @@ once in the pre-pass; older duplicates reuse the precomputed values and the
 newest's vault ID for exact matches. O(occurrences × contentSize) →
 O(contentSize) per key per request. Verified in the smoke test: second
 identical request showed no re-registration and identical stubs.
-**Integration:** ✅ stubs carry real vault IDs (retrieval-verified, §8).
+**Integration:** ✅ real compression stubs carry vault IDs; semantic-dedup
+stubs instead point to the newer full copy already visible in the same payload
+and intentionally do not create retrieval work.
 
 ### Stage 10 — JSON_CRUSH
 **Purpose:** keep signal-bearing items of large JSON arrays inline; vault
@@ -469,6 +474,15 @@ All exhausted budgets produce a terminal client response — no synthetic tool
 result and no further upstream request. UR-9 socket destroy on handler error.
 UR-10 RAG indexing only on final responses.
 **Performance:** 🟡
+- **G-8 context retention hardening:** older broad graph locator results are
+  compacted once two newer graph rounds exist, while `read_function` bodies
+  remain intact. A repeated session-cache result becomes a compact pointer when
+  its full content is already visible. This bounds hidden ghost-history growth
+  without forcing a retrieve loop.
+- **G-9 CCR/dedup separation:** dedup placeholders no longer use retrievable
+  vault markers, and vault discovery is restricted to actual tool-result
+  carriers. This prevents superseded copies and marker-looking prose from
+  repeatedly injecting `contextforge_retrieve`.
 - **F-12 (noted): repeated `interceptAndVaultMassiveToolResults` per hop**
   re-scans all messages; cheap due to guards, acceptable.
 - **F-13 (noted): wire-token accounting differs by mode.** Non-streaming:
@@ -789,7 +803,7 @@ routes, and the mock-upstream conversation shape verified unchanged.
 | **PA-2** | 🟡 performance | `server.js` | `detectMutation` block removed: per-request full `JSON.stringify(payload)` + 3 regex passes + potential full-file read + SHA-256 feeding `invalidateByFile` over `cache_dependencies` — a **table nothing ever populates** (always 0 rows). Its file-op pattern never matched the real patch schema (`create_file`/`file_path` vs `create\|append`/`filename`), and patch-time invalidation is already handled by `postPatchInvalidate`. Repeated no-effect work on every request (re-hashing files whose mutation was processed turns ago). |
 | **PA-3** | 🟡 performance | `astCompressor.js` | Session compress cache (in-memory) checked **before** `lookupVaultByContent` (SHA-256 + SQLite) — re-sent history now hits the Map first. |
 | **PA-4** | 🟡 performance | `astCompressor.js` | Removed `fetchFromVault(vaultId) !== null` existence re-check — a full-text SQLite read per code message per turn that proved nothing (the lookup already proved row existence; sync calls cannot interleave). |
-| **PA-5** | 🔴 performance (O(n²) per request) | `semanticDedup.js` | Newest copy's FNV hash + SimHash fingerprint + vault registration now computed **once per key in the pre-pass** instead of per older duplicate; exact-dup stubs reuse the newest's vault ID (no re-SHA-256/DB). |
+| **PA-5** | 🔴 performance (O(n²) per request) | `semanticDedup.js` | Newest copy's FNV hash + SimHash fingerprint + vault registration now computed **once per key in the pre-pass** instead of per older duplicate; exact-dup visible-copy stubs reuse the newest metadata (no re-SHA-256/DB). |
 | **PA-6** | 🔴 correctness (silent degradation) | `requestPlanner.js` | `searchK(5)` → `searchK(64)`: RAG `IDX_*` documents (one per final assistant response) share the HNSW with PLANNER anchors and crowded all 5 nearest-neighbor slots, silently disabling the semantic intent fallback for the rest of every session. |
 | **PA-7** | 🟢 memory | `cacheAligner.js` | Removed `lastStaticPrefix` retention (full system prompt string stored, never read). |
 | **PA-8** | 🟢 dead code | `vaultRetriever.js` | Removed unreachable "Tier 1b" fallback (`r.text` never exists on C++ results). |

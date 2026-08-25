@@ -59,7 +59,7 @@
 
 import { getGraphToolDefinition, getReadFileChunkToolDefinition } from "../graph/graphTools.js";
 import { getPatchToolDefinition } from "../graph/patchTools.js";
-import { createCCRToolDefinition } from "../ccr/toolInjection.js";
+import { createCCRToolDefinition, hasRetrievableVaultMarker } from "../ccr/toolInjection.js";
 import { getMemoryToolDefinitions, MEMORY_TOOL_NAMES } from "../memory/memoryTools.js";
 
 // ─────────────────────────────────────────────
@@ -94,33 +94,35 @@ const CONTEXTFORGE_TOOL_NAMES = new Set([
 // Payload-derived (sticky) conditions
 // ─────────────────────────────────────────────
 
-const VAULT_MARKER = /\[(?:CF_VAULT:|CF_COMPRESSED_FILE)/;
-
-/** True when the payload carries compression stubs — sticky in history. */
+/** True when the payload carries retrievable compression stubs — sticky in history. */
 export function payloadHasVaultMarker(payload) {
   const messages = payload?.messages;
   if (!Array.isArray(messages)) return false;
+
   for (const msg of messages) {
-    // A2 BUGFIX (found in E2E): system messages are EXCLUDED. The injected
-    // CF rule (injectContextForgeRule) documents the stub syntax in its
-    // workflow guidance — "will fail on compressed file content
-    // ([CF_COMPRESSED_FILE] or [CF_VAULT:...])" — so scanning system
-    // content matched on EVERY CF request and made the retrieve tool
-    // unconditionally always-on. Stubs only exist in tool results (and,
-    // for MCP/gemini synthetic content, user tool_result blocks).
-    if (msg?.role === "system") continue;
-    const content = msg?.content;
-    if (typeof content === "string") {
-      if (VAULT_MARKER.test(content)) return true;
-    } else if (Array.isArray(content)) {
-      for (const block of content) {
+    // Retrieval availability must follow an actual CF-generated tool result,
+    // not arbitrary user/assistant prose that happens to contain a marker.
+    // Otherwise a copied marker, tool documentation, or a dedup explanation
+    // can make contextforge_retrieve sticky for the rest of the session.
+    if (msg?.role === "tool" && typeof msg.content === "string") {
+      if (hasRetrievableVaultMarker(msg.content)) return true;
+      continue;
+    }
+
+    // Anthropic/Gemini tool results are carried in a user message as blocks.
+    if (msg?.role === "user" && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block?.type !== "tool_result") continue;
         const text =
-          typeof block?.text === "string"
-            ? block.text
-            : typeof block?.content === "string"
+          typeof block.content === "string"
+            ? block.content
+            : Array.isArray(block.content)
               ? block.content
+                  .filter((part) => part?.type === "text")
+                  .map((part) => part.text || "")
+                  .join("\n")
               : "";
-        if (text && VAULT_MARKER.test(text)) return true;
+        if (text && hasRetrievableVaultMarker(text)) return true;
       }
     }
   }

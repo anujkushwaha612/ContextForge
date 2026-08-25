@@ -201,7 +201,10 @@ export function isRecentToolResult(messages, index, policy) {
  */
 export function looksLikeStub(content) {
   return typeof content === "string" &&
-    (content.startsWith("[CF_COMPRESSED_FILE") || content.startsWith("[CF_VAULT:"));
+    (content.startsWith("[CF_COMPRESSED_FILE") ||
+      content.startsWith("[CF_VAULT:") ||
+      content.startsWith("[CF_DEDUPLICATED]") ||
+      content.startsWith("[CF_SUPERSEDED]"));
 }
 
 // ─────────────────────────────────────────────

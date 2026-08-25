@@ -94,7 +94,27 @@ const MARKER_PATTERNS = [
   /\[.*?compressed.*?vault[_-]?id[=:]\s*["']?(cf_vault_[a-z0-9_]+)["']?\]/gi,
 ];
 
-function extractVaultIds(text, resultSet) {
+// Semantic dedup used to emit `[CF_VAULT:…]` placeholders for copies that
+// were explicitly redundant because a current full copy remained visible later
+// in the conversation. CCR treated those *non-retrievable* placeholders as
+// real retrieval work, repeatedly injected contextforge_retrieve, and taught
+// the model to open stale copies. Keep compatibility with old histories while
+// excluding them from retrieve discovery.
+const LEGACY_NON_RETRIEVABLE_DEDUP_STUB =
+  /^\[CF_VAULT:cf_vault_[a-z0-9_]+\]\s+\((?:identical to (?:the )?current copy|outdated copy)/i;
+const NON_RETRIEVABLE_DEDUP_STUB = /^\[CF_(?:DEDUPLICATED|SUPERSEDED)\]/i;
+
+export function isNonRetrievableVaultStub(text) {
+  if (typeof text !== "string") return false;
+  const trimmed = text.trimStart();
+  return (
+    NON_RETRIEVABLE_DEDUP_STUB.test(trimmed) || LEGACY_NON_RETRIEVABLE_DEDUP_STUB.test(trimmed)
+  );
+}
+
+export function extractRetrievableVaultIds(text, resultSet = new Set()) {
+  if (typeof text !== "string" || isNonRetrievableVaultStub(text)) return resultSet;
+
   for (const pattern of MARKER_PATTERNS) {
     pattern.lastIndex = 0;
     let match;
@@ -102,6 +122,11 @@ function extractVaultIds(text, resultSet) {
       if (match[1]) resultSet.add(match[1]);
     }
   }
+  return resultSet;
+}
+
+export function hasRetrievableVaultMarker(text) {
+  return extractRetrievableVaultIds(text).size > 0;
 }
 
 /**
@@ -113,25 +138,24 @@ export function scanForMarkers(messages) {
   const detectedVaultIds = new Set();
 
   for (const msg of messages) {
-    const content = msg.content;
+    // CF markers are generated in tool results. Restrict discovery to those
+    // carriers so user prose, assistant explanations, and system guidance do
+    // not accidentally create a retrieve capability loop.
+    if (msg?.role === "tool" && typeof msg.content === "string") {
+      extractRetrievableVaultIds(msg.content, detectedVaultIds);
+      continue;
+    }
 
-    if (typeof content === "string") {
-      extractVaultIds(content, detectedVaultIds);
-    } else if (Array.isArray(content)) {
-      for (const block of content) {
-        if (!block || typeof block !== "object") continue;
-
-        if (block.type === "text" && block.text) {
-          extractVaultIds(block.text, detectedVaultIds);
-        } else if (block.type === "tool_result") {
-          const tc = block.content;
-          if (typeof tc === "string") {
-            extractVaultIds(tc, detectedVaultIds);
-          } else if (Array.isArray(tc)) {
-            for (const c of tc) {
-              if (c?.type === "text" && c.text) {
-                extractVaultIds(c.text, detectedVaultIds);
-              }
+    if (msg?.role === "user" && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block?.type !== "tool_result") continue;
+        const toolContent = block.content;
+        if (typeof toolContent === "string") {
+          extractRetrievableVaultIds(toolContent, detectedVaultIds);
+        } else if (Array.isArray(toolContent)) {
+          for (const contentBlock of toolContent) {
+            if (contentBlock?.type === "text" && contentBlock.text) {
+              extractRetrievableVaultIds(contentBlock.text, detectedVaultIds);
             }
           }
         }

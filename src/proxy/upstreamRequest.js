@@ -50,7 +50,7 @@ import { fileURLToPath } from "node:url";
 
 import { statsEmitter } from "./statsEmitter.js";
 
-import { countTokens } from "../compression/compressionHelper.js";
+import { countTokens, passesTokenGate } from "../compression/compressionHelper.js";
 import { interceptAndVaultMassiveToolResults } from "../compression/fatCatch.js";
 import { retrieveFromVault } from "../vaultRetriever.js";
 import { recordCCRSuccess, SessionRegistry } from "../ccr/index.js";
@@ -275,6 +275,44 @@ function sessionCacheSet(name, argsStr, result) {
     SESSION_TOOL_CACHE.delete(SESSION_TOOL_CACHE.keys().next().value);
   }
   SESSION_TOOL_CACHE.set(key, result);
+}
+
+/**
+ * A cache hit should not inject a second full copy of a result that is already
+ * present in this very ghost conversation. The model still receives a valid
+ * tool result, but it is a compact pointer to the visible earlier response.
+ */
+export function cachedResultIsAlreadyVisible(payload, name, argsStr, cachedResult) {
+  const matchingCallIds = new Set();
+  const wantedKey = _sessionCacheKey(name, argsStr);
+
+  for (const msg of payload?.messages || []) {
+    if (msg.role !== "assistant" || !Array.isArray(msg.tool_calls)) continue;
+    for (const call of msg.tool_calls) {
+      const callName = call?.function?.name;
+      const callArgs = call?.function?.arguments || "{}";
+      if (_sessionCacheKey(callName, callArgs) === wantedKey) matchingCallIds.add(call.id);
+    }
+  }
+
+  if (matchingCallIds.size === 0) return false;
+  return (payload?.messages || []).some(
+    (msg) =>
+      msg.role === "tool" &&
+      matchingCallIds.has(msg.tool_call_id) &&
+      typeof msg.content === "string" &&
+      msg.content === cachedResult
+  );
+}
+
+function compactCachedResultNotice(name) {
+  return JSON.stringify({
+    status: "already_provided",
+    tool: name,
+    hint:
+      "This exact result is already visible earlier in the current conversation. " +
+      "Use that result instead of requesting the same exploration again.",
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -529,7 +567,23 @@ export class ToolInterceptor {
       // ── Session cache ──────────────────────────────────────────────────────
       const cachedResult = sessionCacheGet(name, argsStr);
       if (cachedResult !== null) {
-        results.push({ tool_call_id: tc.id, name, content: cachedResult });
+        const alreadyVisible = cachedResultIsAlreadyVisible(
+          currentPayload,
+          name,
+          argsStr,
+          cachedResult
+        );
+        results.push({
+          tool_call_id: tc.id,
+          name,
+          content: alreadyVisible ? compactCachedResultNotice(name) : cachedResult,
+          ...(alreadyVisible ? { _cf_repeat: true } : {}),
+        });
+        if (alreadyVisible) {
+          console.log(
+            `[Ghost Interceptor] ♻️ Cached ${name} result already visible — sending compact pointer`
+          );
+        }
         continue;
       }
 
@@ -1028,6 +1082,87 @@ function reconcileStableToolsForGhostHop(payload) {
   }
 }
 
+// Locator-style graph outputs are useful to choose the NEXT targeted query,
+// but keeping every old broad result verbatim makes each later ghost hop pay
+// for the same navigation history. Preserve the two most recent graph rounds
+// and all read_function bodies; compact only older locator results.
+const GHOST_GRAPH_HISTORY_KEEP_ROUNDS = 2;
+const COMPACTABLE_GRAPH_QUERY_TYPES = new Set([
+  "find",
+  "find_symbol",
+  "what_does_this_export",
+  "what_does_this_import",
+  "who_imports_this",
+  "who_depends_on_file",
+  "show_callers",
+  "show_dependencies",
+  "analyze_impact",
+  "find_route",
+]);
+
+function graphQueryTypeFromCall(call) {
+  try {
+    return JSON.parse(call?.function?.arguments || "{}").query_type || null;
+  } catch {
+    return null;
+  }
+}
+
+export function compactAgedGhostGraphResults(payload) {
+  const graphRounds = [];
+
+  for (let index = 0; index < (payload.messages?.length || 0); index++) {
+    const message = payload.messages[index];
+    if (message?.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
+
+    const ids = message.tool_calls
+      .filter(
+        (call) =>
+          isGraphToolCall(call.function?.name) &&
+          COMPACTABLE_GRAPH_QUERY_TYPES.has(graphQueryTypeFromCall(call))
+      )
+      .map((call) => call.id)
+      .filter(Boolean);
+    if (ids.length > 0) graphRounds.push(ids);
+  }
+
+  if (graphRounds.length <= GHOST_GRAPH_HISTORY_KEEP_ROUNDS) return;
+  const compactableIds = new Set(graphRounds.slice(0, -GHOST_GRAPH_HISTORY_KEEP_ROUNDS).flat());
+  let compacted = 0;
+  let savedChars = 0;
+
+  const compactedMessages = payload.messages.map((message) => {
+    if (
+      message?.role !== "tool" ||
+      !compactableIds.has(message.tool_call_id) ||
+      message._cf_graph_compacted ||
+      typeof message.content !== "string" ||
+      message.content.length < 300
+    ) {
+      return message;
+    }
+
+    const stub =
+      "[CF_GRAPH_HISTORY] Earlier locator result consumed by later targeted exploration. " +
+      "Use the newer graph/read results already in context; do not repeat this broad lookup unless necessary.";
+    if (!passesTokenGate(message.content, stub)) return message;
+
+    savedChars += message.content.length - stub.length;
+    compacted++;
+    // Preserve countTokens' invalidation contract: a spread creates a fresh
+    // message without the non-enumerable cached-token field.
+    return { ...message, content: stub, _cf_graph_compacted: true };
+  });
+
+  if (compacted > 0) {
+    payload.messages = compactedMessages;
+    console.log(
+      `[Ghost Interceptor] 🧹 Compacted ${compacted} aged graph locator result(s) ` +
+        `(~${Math.floor(savedChars / 4)} tokens)`
+    );
+  }
+}
+
 function appendGhostHistory(currentPayload, { assistantContent = null, toolCalls, results }) {
   currentPayload.messages.push({
     role: "assistant",
@@ -1051,8 +1186,15 @@ function appendGhostHistory(currentPayload, { assistantContent = null, toolCalls
       _cf_type: cfType,
       ...(result._source_file ? { _args: { file_path: result._source_file } } : {}),
       ...(result.__cf_raw ? { __cf_raw: true } : {}),
+      ...(result._cf_repeat ? { _cf_repeat: true } : {}),
     });
   }
+
+  // Compact aged locator output before the next model call. This is deliberately
+  // narrower than the full ingress compression pipeline: fresh read bodies
+  // remain available for patching, while old broad navigation stops inflating
+  // every later ghost request.
+  compactAgedGhostGraphResults(currentPayload);
 
   // Fresh tool results are the one ghost-hop mutation that can introduce a
   // vault marker. Reconcile monotonically so a needed retrieve schema exists

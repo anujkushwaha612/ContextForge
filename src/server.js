@@ -136,6 +136,7 @@ import {
   applyStableToolSet,
   getContextForgeToolPrefix,
   isMcpToolSession,
+  payloadHasVaultMarker,
 } from "./proxy/stableTools.js";
 
 // ── Upstream handler ──
@@ -1062,17 +1063,10 @@ async function handleRequest(req, res, chunks) {
   timer.time(STAGES.CCR_PIPELINE, () => {
     let ccrBaseline = countTokens(payload); // Use current payload size for accurate CCR ratios
 
-    const hasVault = payload.messages?.some((m) => {
-      if (typeof m.content === "string" && m.content.includes("[CF_VAULT:")) return true;
-      if (Array.isArray(m.content)) {
-        return m.content.some(
-          (b) => typeof b.content === "string" && b.content.includes("[CF_VAULT:")
-        );
-      }
-      return false;
-    });
-
-    if (hasVault) ccrBaseline = Infinity;
+    // Use the same strict tool-result-only marker predicate as StableTools.
+    // Semantic-dedup placeholders and marker-looking prose must not force a
+    // retrieve schema onto every subsequent request.
+    if (payloadHasVaultMarker(payload)) ccrBaseline = Infinity;
 
     payload = applyCCRPipeline(payload, ccrBaseline);
   });
