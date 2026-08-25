@@ -54,6 +54,7 @@ const RETRIEVE_TOOL_DEF = {
       },
     },
     required: ["vault_id"],
+    additionalProperties: false,
   },
 };
 

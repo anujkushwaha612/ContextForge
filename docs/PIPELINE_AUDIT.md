@@ -76,8 +76,9 @@ finalTokens = countTokens(payload) → metrics headers
       calls (contextforge_query_graph / patch_ast / retrieve / memory_* /
       read_file_chunk) → execute LOCALLY (graph SQLite, patch engine,
       vault retriever, memory store) → append assistant+tool messages →
-      re-invoke upstream (bounded: 10 failures / 15 hops / 3 read-only
-      rounds) → repeat until final answer
+      re-invoke upstream only after a validated tool result (bounded: 10
+      failures / 15 hops / 8 novel read-only rounds / 3 repeated read-only
+      rounds) → terminal safety response on any exhausted budget
    │
    ▼
 [Stage 19] Metrics: savingsTracker (persisted CF-savings/proxy_savings.json),
@@ -161,15 +162,13 @@ prompts and the repeated skills list.
 **Implementation:** `systemMessages.js`. Sentinel-guarded rule injection
 into first system message; SHA-256 system-prompt dedup; skills-phrase
 boundary cut.
-**Correctness:** ✅. Rule text is static per process (module load).
+**Correctness:** ✅. Rule text is deterministic from the active tool namespace.
 **Performance:** ✅ (µs).
-**Issues:** F-4 (noted): `buildToolGuidance` always references the
-`mcp__contextforge__`-prefixed tool names even for non-MCP clients whose
-injected tools have the bare names (`contextforge_query_graph`, …). The
-model normally follows the actual tools list, so impact is minor, but the
-guidance could steer an MCP-less client toward names the ghost interceptor
-*would not* intercept (`mcp__*` is excluded by `isBackgroundTool`).
-Recommend deriving the prefix from whether the session is MCP-registered.
+**Correctness hardening (G-5):** the rule now derives its prefix from the
+active session mode. Bare ghost-intercepted sessions receive bare tool names;
+MCP-owned sessions receive their advertised MCP namespace. This prevents an
+MCP-less client from being steered toward aliases the Ghost Interceptor
+intentionally does not own.
 
 ### Stage 3 — HISTORY_PRUNE
 **Purpose:** collapse stale `contextforge_retrieve` results from prior turns
@@ -458,13 +457,17 @@ transform; SSE tool-call assembly with held-event gating; local execution:
 graph queries (concept cache, UR-7), read_file_chunk (LRU 100 chunk cache,
 UR-2/3), patches (engine + `postPatchInvalidate` + failure hints after 3),
 vault retrieve (tiered: direct → line-hint slice → hybrid 0.5 → hybrid 0.3),
-memory tools. Circuit breakers: 10 failures, 15 hops, 3 read-only rounds
-(with navigation-timeout hint). Session tool-result cache (200, canonical
-arg keys), stall detection (3 identical calls → loop-break hint).
-**Correctness:** ✅. Retry accounting: `computeNextRetry` (UR-8) respects
-`x-cf-max-retries`; circuit-breaker trips append a SYSTEM_ERROR tool result
-and one final hop — no recursion beyond the bounds. UR-9 socket destroy on
-handler error. UR-10 RAG indexing only on final responses.
+memory tools. Safety budgets: 10 failures, 15 total hops, 8 novel
+read-only rounds, and 3 repeated read-only rounds. The tool-result cache uses
+canonical argument keys; identical calls are counted before a cache hit can
+be replayed.
+**Correctness hardening (G-1–G-7):** streamed calls are assembled by ID first,
+ambiguous anonymous parallel calls are rejected, complete merged JSON objects
+are repaired only when the exact active tool name is provable, and every
+background call is schema-validated before it can enter assistant history.
+All exhausted budgets produce a terminal client response — no synthetic tool
+result and no further upstream request. UR-9 socket destroy on handler error.
+UR-10 RAG indexing only on final responses.
 **Performance:** 🟡
 - **F-12 (noted): repeated `interceptAndVaultMassiveToolResults` per hop**
   re-scans all messages; cheap due to guards, acceptable.
@@ -493,7 +496,8 @@ to the client in the client's wire format.
 writes, queued), `statsEmitter` (SSE snapshots, `.unref()`'d heartbeat,
 SE-1/2/3 fixes), `/v1/stats`, `/v1/savings`, dashboard.
 **Correctness:** ✅. Negative savings preserved and displayed honestly
-(ST-1). Ghost retries counted per request and lifetime. **One caveat
+(ST-1). Extra ghost hops are counted per request and lifetime (the persisted
+field remains `ghost_retries` for compatibility). **One caveat
 (verified, by design):** `savingsTracker` records the *wire* tokens
 (actual bytes sent upstream across all hops) vs the *baseline* (the client
 request as received) — so a 2-hop ghost request can show negative savings
@@ -708,10 +712,11 @@ simply go unused. Correct by construction.
   returns the original message object unchanged when it decides not to
   transform, and a failed native `compress()` leaves `kept: text`.
   Verified by code review of all stage fallthroughs. ✅
-- **Retry safety:** ghost breakers (10/15/3) + per-request budget
-  (x-cf-max-retries, UR-8) + stall detection (3 identical calls) +
-  read-only-round breaker. No recursive-retry path (hops bounded,
-  `retryCount` monotonic on failure). ✅
+- **Retry safety:** ghost budgets (10 failures / 15 hops / 8 novel reads /
+  3 repeated reads) + per-request `x-cf-max-retries` + identical-call stall
+  detection (3 calls). Every breaker is terminal: malformed calls and budget
+  exhaustion never enter assistant history or trigger another upstream hop.
+  Successful action tools reset the transient failure counter. ✅
 - **Partial state after failure:** vault writes are content-addressed
   (idempotent re-vault OR-IGNORE, CD-2/4); patch engine applies in a
   transaction with pre-read verification; graph writes per-file
@@ -796,7 +801,7 @@ routes, and the mock-upstream conversation shape verified unchanged.
 | F-1 | 🟢 | translator `_msgCache` head/tail fingerprint can collide for text blocks | full-content FNV (µs) if ever observed |
 | F-2 | 🟢 | `_translateMessages` stable-prefix logic is dead (fresh ctx per request) | delete in cleanup pass |
 | F-3 | 🟡 | OpenAI-format streaming clients get no ghost interception | documented design boundary; if needed, parse SSE tool deltas for openai adapter |
-| F-4 | 🟡 | CF rule guidance always uses `mcp__contextforge__` prefixes, even for bare-name (non-MCP) injection | derive prefix from session type |
+| F-4 | ✅ fixed | CF rule guidance could use MCP aliases in bare-tool sessions | rule now derives the prefix from the active session type |
 | F-5 | 🟢 | (superseded by PA-6) | — |
 | F-6 | 🟢 | contentDetector cache key blind to content middle (graceful: misclassification only) | include full-content FNV if desired |
 | F-7/F-9 | 🟢 | JS language-mismatch retry in `compressCodeOutput` is dead under C++ AC-9 | delete in cleanup pass |

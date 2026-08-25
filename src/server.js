@@ -63,11 +63,7 @@ import { crushJsonToolResults } from "./compression/jsonCrusher.js";
 import { alignCachePrefix } from "./compression/cacheAligner.js";
 import { detectAdapter } from "./adapters/index.js";
 import { ProviderFactory } from "./providers/index.js";
-import {
-  fetchFromVault,
-  fetchVaultTextConcatenated,
-  resetEntireCache,
-} from "./logging/cacheDb.js";
+import { fetchFromVault, fetchVaultTextConcatenated, resetEntireCache } from "./logging/cacheDb.js";
 import { countTokens } from "./compression/compressionHelper.js";
 
 import { applySemanticDedup } from "./compression/semanticDedup.js";
@@ -136,7 +132,11 @@ import {
 import { initPlanner, planPipeline } from "./proxy/requestPlanner.js";
 
 // ── A2: deterministic stable tool set ──
-import { applyStableToolSet, isMcpToolSession } from "./proxy/stableTools.js";
+import {
+  applyStableToolSet,
+  getContextForgeToolPrefix,
+  isMcpToolSession,
+} from "./proxy/stableTools.js";
 
 // ── Upstream handler ──
 import { createUpstreamHandler } from "./proxy/upstreamRequest.js";
@@ -778,6 +778,12 @@ async function handleRequest(req, res, chunks) {
   // TOOL_FOLLOWUP turns where bypass:true would otherwise skip stripping.
   payload = applyToolPolicy(payload);
 
+  // The guidance namespace must match the actual tool namespace. Determine
+  // client ownership before injecting the rule and reuse the same answer when
+  // applying the stable bare-tool set below.
+  const inboundToolPrefix = getContextForgeToolPrefix(payload.tools);
+  const inboundMcpSession = isMcpToolSession(payload.tools);
+
   const isAnthropic = clientAdapter.name === "anthropic";
   const clientModel = payload.model || "unknown";
 
@@ -855,7 +861,10 @@ async function handleRequest(req, res, chunks) {
 
   // ── Always-on stages ──
   timer.time(STAGES.DEDUPLICATE, () => {
-    payload = injectContextForgeRule(payload);
+    payload = injectContextForgeRule(payload, {
+      mcpSession: inboundMcpSession,
+      toolPrefix: inboundToolPrefix || undefined,
+    });
     payload = deduplicateSystemMessages(payload);
     if (payload._cf_sysPromptTokensSaved) {
       timer.recordTokenSavings(STAGES.DEDUPLICATE, payload._cf_sysPromptTokensSaved);
@@ -911,7 +920,7 @@ async function handleRequest(req, res, chunks) {
     // RQ-7 guard preserved: mcp__-aliased sessions already have their
     // tools from the MCP server and must not get a second set.
     const { added } = applyStableToolSet(payload, {
-      mcpSession: isMcpToolSession(payload.tools),
+      mcpSession: inboundMcpSession,
     });
     if (added.length > 0) {
       console.log(`[StableTools] ✅ +${added.join(", ")}`);
@@ -1051,7 +1060,6 @@ async function handleRequest(req, res, chunks) {
   // countTokens() call. The Infinity override for vault-containing payloads
   // already handles the main correctness case.
   timer.time(STAGES.CCR_PIPELINE, () => {
-
     let ccrBaseline = countTokens(payload); // Use current payload size for accurate CCR ratios
 
     const hasVault = payload.messages?.some((m) => {

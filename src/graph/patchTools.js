@@ -39,6 +39,7 @@ import { statsEmitter } from "../proxy/statsEmitter.js";
 // Dynamic import() still hits the cache but creates a Promise and goes
 // through the microtask queue on every call — unnecessary overhead.
 import { executeReadFileChunk } from "./graphTools.js";
+import { isExactToolAlias } from "../proxy/toolCallSafety.js";
 
 export const PATCH_TOOL_NAME = "contextforge_patch_ast";
 
@@ -68,7 +69,7 @@ export function getPatchToolDefinition() {
         "There is NO 'replace' or 'edit' operation — using either will be rejected. " +
         "\n\n⚠️ REQUIRED FIELDS: `file_path` and `operation` are ALWAYS required. " +
         "`replace_string` ALSO requires both `search_string` AND `replacement_string` " +
-        "(pass replacement_string: \"\" to delete matched text — omitting it entirely is an error). " +
+        '(pass replacement_string: "" to delete matched text — omitting it entirely is an error). ' +
         "\n\nMANDATORY WORKFLOW — follow this sequence exactly: " +
         "Step 1: call contextforge_query_graph(find_symbol, 'functionName') to get location (file + line numbers). " +
         "Step 2: call contextforge_query_graph(read_function, 'functionName') to get the full body. " +
@@ -173,7 +174,6 @@ export function getPatchToolDefinition() {
   return _toolDef;
 }
 
-
 export function isPatchToolCall(toolName) {
   if (!toolName) return false;
   return PATCH_TOOL_ALIASES.has(toolName) || normalizePatchToolName(toolName) === PATCH_TOOL_NAME;
@@ -181,8 +181,10 @@ export function isPatchToolCall(toolName) {
 
 export function normalizePatchToolName(name) {
   if (!name) return name;
-  const match = name.match(/(?:mcp__\w+__|[\w]+__)?(contextforge_patch_ast)$/);
-  return match ? match[1] : name;
+  // Do not accept a valid suffix inside a corrupted concatenated name. Only
+  // the exact bare tool name or a properly delimited ContextForge/MCP alias
+  // may be normalized to the patch tool.
+  return isExactToolAlias(name, PATCH_TOOL_NAME) ? PATCH_TOOL_NAME : name;
 }
 
 // ─────────────────────────────────────────────
@@ -253,10 +255,9 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
   }
 
   if (!args.file_path || !args.operation) {
-    const missing = [
-      !args.file_path && "file_path",
-      !args.operation && "operation",
-    ].filter(Boolean);
+    const missing = [!args.file_path && "file_path", !args.operation && "operation"].filter(
+      Boolean
+    );
     return JSON.stringify({
       success: false,
       error:
@@ -268,7 +269,15 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
 
   // BUG-5 FIX: Early validation of common LLM mistakes — catches errors BEFORE
   // calling patchEngine, giving faster, clearer feedback that reduces retries.
-  const VALID_OPERATIONS = ["replace_body", "insert_after", "insert_before", "delete", "replace_string", "insert_at_line", "create_file"];
+  const VALID_OPERATIONS = [
+    "replace_body",
+    "insert_after",
+    "insert_before",
+    "delete",
+    "replace_string",
+    "insert_at_line",
+    "create_file",
+  ];
   if (!VALID_OPERATIONS.includes(args.operation)) {
     return JSON.stringify({
       success: false,
@@ -282,7 +291,11 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
 
   // Early check: replace_string requires both search_string AND replacement_string
   if (args.operation === "replace_string") {
-    if (!args.search_string || typeof args.search_string !== "string" || !args.search_string.trim()) {
+    if (
+      !args.search_string ||
+      typeof args.search_string !== "string" ||
+      !args.search_string.trim()
+    ) {
       return JSON.stringify({
         success: false,
         error:
@@ -304,8 +317,10 @@ export async function executePatchToolCall(toolArgsJson, semanticCache = null) {
 
   // Early check: operations that require target_symbol
   if (
-    (args.operation === "insert_after" || args.operation === "insert_before" ||
-     args.operation === "replace_body" || args.operation === "delete") &&
+    (args.operation === "insert_after" ||
+      args.operation === "insert_before" ||
+      args.operation === "replace_body" ||
+      args.operation === "delete") &&
     !args.target_symbol
   ) {
     return JSON.stringify({

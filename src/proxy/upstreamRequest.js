@@ -66,6 +66,14 @@ import { isPatchToolCall, executePatchToolCall, PATCH_TOOL_NAME } from "../graph
 import { hasMemoryToolCalls, executeMemoryToolCalls } from "../memory/memoryTools.js";
 import { normalizeConceptKey } from "../graph/semanticResolver.js";
 import { DEFAULT_MEMORY_USER_ID } from "./memoryDecision.js";
+import { applyStableToolSet, isMcpToolSession } from "./stableTools.js";
+import {
+  StreamToolCallAssembler,
+  activeToolSchemas,
+  hasFatalAssemblyIssues,
+  repairMergedToolCalls,
+  validateActiveToolCall,
+} from "./toolCallSafety.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -88,7 +96,11 @@ function normalizePathForCache(filePath) {
 }
 
 const MAX_GHOST_RETRIES = 10;
-const MAX_GRAPH_ONLY_ROUNDS = 3;
+// A broad multi-file task legitimately needs several distinct reads. Stop
+// repeated navigation quickly, while still giving a bounded budget to novel
+// read-only exploration.
+const MAX_REPEATED_READ_ONLY_ROUNDS = 3;
+const MAX_NOVEL_READ_ONLY_ROUNDS = 8;
 const MAX_HOP_COUNT = 15;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -325,19 +337,23 @@ export function invalidateCacheForFile(filePath) {
 // ToolInterceptor
 // ─────────────────────────────────────────────────────────────────────────────
 
-class ToolInterceptor {
+export class ToolInterceptor {
   constructor(ctx) {
     this.semanticCache = ctx.semanticCache;
     this.hybridRetriever = ctx.hybridRetriever;
     this.memoryHandler = ctx.memoryHandler;
     this.req = ctx.req;
 
-    this._graphOnlyRounds = 0;
+    this._readOnlyRounds = 0;
+    this._repeatedReadOnlyRounds = 0;
+    this._seenReadOnlyCalls = new Set();
     this._retrievedVaultIds = new Set();
     this._resolvedConcepts = new Map();
     this._consecutivePatchFailures = 0;
     this._callFrequency = new Map();
     this._MAX_IDENTICAL_CALLS = 3;
+    this._maxFailureRetries =
+      Number.isInteger(ctx.maxRetries) && ctx.maxRetries >= 0 ? ctx.maxRetries : MAX_GHOST_RETRIES;
   }
 
   _checkAndRecordCall(name, argsStr) {
@@ -362,6 +378,71 @@ class ToolInterceptor {
     return { isStall: false, count, hintMessage: null };
   }
 
+  _terminal(reason, message, toolCalls = []) {
+    return {
+      intercepted: true,
+      terminal: true,
+      terminalReason: reason,
+      terminalMessage: message,
+      toolCalls,
+      madeForwardProgress: false,
+      hadFailure: false,
+    };
+  }
+
+  _isReadOnlyTool(name) {
+    return (
+      (isGraphToolCall(name) && !String(name).includes("contextforge_retrieve")) ||
+      isReadFileChunkTool(name)
+    );
+  }
+
+  _checkReadOnlyBudget(backgroundCalls) {
+    const allAreReadOnly = backgroundCalls.every((tc) => this._isReadOnlyTool(tc.function?.name));
+    if (!allAreReadOnly) {
+      this._readOnlyRounds = 0;
+      this._repeatedReadOnlyRounds = 0;
+      // A patch/retrieve/memory action changes the task state. A targeted
+      // verification read after that action is new navigation, not a repeat
+      // of the pre-action exploration phase.
+      this._seenReadOnlyCalls.clear();
+      return null;
+    }
+
+    this._readOnlyRounds++;
+    const keys = backgroundCalls.map((tc) =>
+      _sessionCacheKey(tc.function?.name, tc.function?.arguments)
+    );
+    const hasNovelCall = keys.some((key) => !this._seenReadOnlyCalls.has(key));
+    for (const key of keys) this._seenReadOnlyCalls.add(key);
+
+    if (hasNovelCall) this._repeatedReadOnlyRounds = 0;
+    else this._repeatedReadOnlyRounds++;
+
+    if (
+      this._repeatedReadOnlyRounds > MAX_REPEATED_READ_ONLY_ROUNDS ||
+      this._readOnlyRounds > MAX_NOVEL_READ_ONLY_ROUNDS
+    ) {
+      const repeated = this._repeatedReadOnlyRounds > MAX_REPEATED_READ_ONLY_ROUNDS;
+      const limit = repeated ? MAX_REPEATED_READ_ONLY_ROUNDS : MAX_NOVEL_READ_ONLY_ROUNDS;
+      const observed = repeated ? this._repeatedReadOnlyRounds : this._readOnlyRounds;
+      const kind = repeated ? "repeated" : "read-only";
+      console.warn(
+        `[Ghost Interceptor] ⛔ Exploration budget exhausted ` +
+          `(${observed} ${kind} rounds > ${limit} max) — terminating ghost loop`
+      );
+      return this._terminal(
+        "exploration_budget",
+        `ContextForge stopped an internal exploration loop after ${this._readOnlyRounds} read-only ` +
+          `round(s), including ${this._repeatedReadOnlyRounds} repeated round(s). ` +
+          `No additional upstream request was sent. Retry with a narrower task or use an explicit action.`,
+        backgroundCalls
+      );
+    }
+
+    return null;
+  }
+
   isBackgroundTool(name) {
     if (!name) return false;
     if (name.startsWith("mcp__")) return false;
@@ -382,12 +463,17 @@ class ToolInterceptor {
   }
 
   async process(toolCalls, currentPayload, retryCount, hopCount = 0) {
-    if (retryCount >= MAX_GHOST_RETRIES) {
+    if (this._maxFailureRetries > 0 && retryCount >= this._maxFailureRetries) {
       console.warn(
         `[Ghost Interceptor] ⛔ Failure circuit breaker tripped ` +
-          `(${retryCount} failures >= ${MAX_GHOST_RETRIES} max)`
+          `(${retryCount} failures >= ${this._maxFailureRetries} max)`
       );
-      return { intercepted: true, circuitBreakerTripped: true, toolCalls };
+      return this._terminal(
+        "failure_budget",
+        `ContextForge stopped after ${retryCount} failed background recovery attempt(s). ` +
+          `No additional upstream request was sent.`,
+        toolCalls
+      );
     }
 
     if (hopCount >= MAX_HOP_COUNT) {
@@ -395,56 +481,23 @@ class ToolInterceptor {
         `[Ghost Interceptor] ⛔ Hop circuit breaker tripped ` +
           `(${hopCount} hops >= ${MAX_HOP_COUNT} max)`
       );
-      return { intercepted: true, circuitBreakerTripped: true, toolCalls };
+      return this._terminal(
+        "hop_budget",
+        `ContextForge stopped after ${hopCount} total internal hops. ` +
+          `No additional upstream request was sent.`,
+        toolCalls
+      );
     }
 
     const backgroundCalls = toolCalls.filter((tc) => this.isBackgroundTool(tc.function?.name));
     if (backgroundCalls.length === 0) return { intercepted: false };
 
-    const allAreReadOnly = backgroundCalls.every((tc) => {
-      const n = tc.function?.name || "";
-      return (
-        (isGraphToolCall(n) && !normalizeGraphToolName(n).includes("contextforge_retrieve")) ||
-        isReadFileChunkTool(n)
-      );
-    });
-
-    if (allAreReadOnly) {
-      this._graphOnlyRounds++;
-      if (this._graphOnlyRounds > MAX_GRAPH_ONLY_ROUNDS) {
-        console.warn(
-          `[Ghost Interceptor] ⚠️ Exploration loop detected ` +
-            `(${this._graphOnlyRounds} read-only rounds > ${MAX_GRAPH_ONLY_ROUNDS} max) ` +
-            `— injecting navigation-timeout hint`
-        );
-        const timeoutResults = backgroundCalls.map((tc) => ({
-          tool_call_id: tc.id,
-          name: tc.function.name,
-          content: JSON.stringify({
-            error: "NAVIGATION_TIMEOUT",
-            hint:
-              `You have spent ${this._graphOnlyRounds} consecutive rounds on read-only exploration ` +
-              `(graph queries and file reads) without taking any action. ` +
-              `You have enough context to proceed. ` +
-              `Stop exploring and either: (1) apply a patch with contextforge_patch_ast, ` +
-              `(2) create the file directly, or (3) report what you found.`,
-          }),
-        }));
-        return {
-          intercepted: true,
-          results: timeoutResults,
-          toolCalls: backgroundCalls,
-          madeForwardProgress: false,
-          hadFailure: true,
-        };
-      }
-    } else {
-      this._graphOnlyRounds = 0;
-    }
+    const readOnlyStop = this._checkReadOnlyBudget(backgroundCalls);
+    if (readOnlyStop) return readOnlyStop;
 
     console.log(
       `\n[Ghost Interceptor] 🔍 Intercepted ${backgroundCalls.length} background tool(s) ` +
-        `(retry ${retryCount}/${MAX_GHOST_RETRIES})`
+        `(retry ${retryCount}/${this._maxFailureRetries})`
     );
 
     const results = [];
@@ -455,6 +508,24 @@ class ToolInterceptor {
       const name = tc.function.name;
       const argsStr = tc.function.arguments || "{}";
 
+      // ── Stall detection ────────────────────────────────────────────────────
+      // Count BEFORE consulting the cache. Previously cached reads skipped this
+      // check forever, so the proxy replayed the same result and paid another
+      // LLM hop on every repeat.
+      const stallCheck = this._checkAndRecordCall(name, argsStr);
+      if (stallCheck.isStall) {
+        console.warn(
+          `[Ghost Interceptor] ⛔ Stall detected: ${name} called ${stallCheck.count}x ` +
+            `with identical args — terminating ghost loop`
+        );
+        return this._terminal(
+          "identical_call_stall",
+          `ContextForge stopped because ${name} was requested ${stallCheck.count} times with ` +
+            `identical arguments. The result cannot change, so no additional upstream request was sent.`,
+          backgroundCalls
+        );
+      }
+
       // ── Session cache ──────────────────────────────────────────────────────
       const cachedResult = sessionCacheGet(name, argsStr);
       if (cachedResult !== null) {
@@ -462,38 +533,22 @@ class ToolInterceptor {
         continue;
       }
 
-      // ── Stall detection ────────────────────────────────────────────────────
-      const stallCheck = this._checkAndRecordCall(name, argsStr);
-      if (stallCheck.isStall) {
-        console.warn(
-          `[Ghost Interceptor] 🔁 Stall detected: ${name} called ${stallCheck.count}x ` +
-            `with identical args — injecting loop-break hint`
-        );
-        results.push({
-          tool_call_id: tc.id,
-          name,
-          content: stallCheck.hintMessage,
-        });
-        hadFailure = true;
-        continue;
-      }
-
       let args = {};
       try {
         args = JSON.parse(argsStr);
       } catch (err) {
+        // This is defense in depth. All public call sites preflight arguments
+        // before invoking process(), but a malformed call must still never be
+        // appended to assistant history if a new path bypasses that boundary.
         console.error(
-          `[Ghost Interceptor] ⚠️ Args JSON malformed for ${name}: "${argsStr.slice(0, 120)}"`
+          `[Ghost Interceptor] ⛔ Args JSON malformed for ${name}: "${argsStr.slice(0, 120)}"`
         );
-        results.push({
-          tool_call_id: tc.id,
-          name,
-          content: JSON.stringify({
-            error: `Malformed JSON arguments: ${err.message}`,
-          }),
-        });
-        hadFailure = true;
-        continue;
+        return this._terminal(
+          "malformed_arguments",
+          `ContextForge rejected malformed arguments for ${name} before replaying the tool call upstream. ` +
+            `No additional upstream request was sent.`,
+          backgroundCalls
+        );
       }
 
       let content = "";
@@ -743,10 +798,21 @@ class ToolInterceptor {
 // ignored, making the per-request x-cf-max-retries header a no-op.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function computeNextRetry(result, retryCount, maxRetries = MAX_GHOST_RETRIES) {
-  if (result.madeForwardProgress) return retryCount;
-  if (result.hadFailure) return Math.min(retryCount + 1, maxRetries);
+export function computeNextRetry(result, retryCount, maxRetries = MAX_GHOST_RETRIES) {
+  const limit = Number.isInteger(maxRetries) && maxRetries >= 0 ? maxRetries : MAX_GHOST_RETRIES;
+  // A successful action is a real state transition, so prior transient
+  // failures must not poison the rest of the request's failure budget.
+  if (result.madeForwardProgress) return 0;
+  if (result.hadFailure) return Math.min(retryCount + 1, limit);
   return retryCount;
+}
+
+function failureBudgetWouldBeExhausted(result, retryCount, maxRetries = MAX_GHOST_RETRIES) {
+  const limit = Number.isInteger(maxRetries) && maxRetries >= 0 ? maxRetries : MAX_GHOST_RETRIES;
+  // A completed action is the same forward-progress reset used by
+  // computeNextRetry(). Do not terminate a mixed batch that actually made a
+  // durable change merely because another action in that batch failed.
+  return !result.madeForwardProgress && Boolean(result.hadFailure) && retryCount + 1 >= limit;
 }
 
 import {
@@ -819,100 +885,236 @@ function normalizeUsage(rawUsage) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// G-2/G-3: tool-call argument repair + interceptability
+// Tool-call safety boundary
 //
-// Safety net for upstreams that stream parallel tool calls in a way the
-// assembler can't disambiguate (G-1 handles the common Ollama pattern at
-// assembly time; these guards cover whatever slips through). A tool call
-// whose arguments are N concatenated JSON objects is split back into N
-// calls; anything unrepairable is NOT intercepted and NOT appended to
-// history — appending a corrupted tool call to the assistant message makes
-// the next upstream hop 400 with "invalid tool call arguments" (observed
-// dead loop), while passing the stream through lets the model see the
-// failed call on its next turn and redo it cleanly.
+// A background call is only allowed into ghost history after all of these are
+// true: stream assembly had a stable identity, its name exactly matches an
+// active ContextForge schema, and its decoded arguments satisfy that schema.
+// This is intentionally stricter than `JSON.parse()` alone.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Split a string into its top-level {...} JSON object segments. */
-function splitTopLevelJsonObjects(str) {
-  const parts = [];
-  let depth = 0;
-  let start = -1;
-  let inStr = false;
-  let esc = false;
-  for (let i = 0; i < str.length; i++) {
-    const c = str[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (c === "\\") esc = true;
-      else if (c === '"') inStr = false;
-      continue;
-    }
-    if (c === '"') { inStr = true; continue; }
-    if (c === "{") {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (c === "}") {
-      depth--;
-      if (depth === 0 && start !== -1) {
-        parts.push(str.slice(start, i + 1));
-        start = -1;
-      }
-    }
-  }
-  return parts;
+function toInternalToolCalls(calls) {
+  return (calls || [])
+    .filter((call) => call && (call.function?.name || call.name))
+    .map((call) => {
+      const rawArguments = call.function?.arguments ?? call.arguments ?? "";
+      const argumentsText =
+        typeof rawArguments === "string"
+          ? rawArguments
+          : rawArguments && typeof rawArguments === "object" && !Array.isArray(rawArguments)
+            ? JSON.stringify(rawArguments)
+            : "";
+      return {
+        id: call.id,
+        type: call.type || "function",
+        function: {
+          name: call.function?.name || call.name,
+          arguments: argumentsText,
+        },
+        ...(call.extra_content !== undefined ? { extra_content: call.extra_content } : {}),
+      };
+    });
 }
 
-function callArgumentsParse(tc) {
-  try { JSON.parse(tc.arguments || "{}"); return true; } catch { return false; }
-}
-
-/** G-3: every call must have parseable arguments before we intercept. */
-function allCallsInterceptable(calls) {
-  return calls.length > 0 && calls.every((tc) => callArgumentsParse(tc));
+function looksLikeContextForgeTool(name) {
+  if (typeof name !== "string") return false;
+  return (
+    name.includes("contextforge_") || name.includes("read_file_chunk") || name.includes("memory_")
+  );
 }
 
 /**
- * G-2: split tool calls whose assembled arguments are a concatenation of
- * multiple top-level JSON objects (parallel calls merged by the upstream).
- * The name may have been concatenated the same way (base name × N).
- * Returns a new array; unrepairable calls pass through unchanged.
+ * Normalize, repair, and validate a provider response before interception.
+ * `passthrough` means no proxy history mutation; `rejected` is a terminal
+ * safety response and likewise never appends the offending tool call.
  */
-function repairMergedToolCalls(calls) {
-  const out = [];
-  for (const tc of calls) {
-    if (callArgumentsParse(tc)) {
-      out.push(tc);
-      continue;
+export function prepareGhostToolCalls(
+  rawCalls,
+  currentPayload,
+  interceptor,
+  { assemblyIssues = [] } = {}
+) {
+  const activeSchemas = activeToolSchemas(currentPayload);
+  const originalCalls = toInternalToolCalls(rawCalls);
+  const isKnownActiveBackgroundTool = (name) =>
+    activeSchemas.has(name) && interceptor.isBackgroundTool(name);
+
+  const repair = repairMergedToolCalls(originalCalls, {
+    isKnownToolName: isKnownActiveBackgroundTool,
+  });
+  const hasFatalAssemblyIssue = hasFatalAssemblyIssues(assemblyIssues);
+  const calls = repair.calls;
+  const backgroundCalls = calls.filter((call) => interceptor.isBackgroundTool(call.function?.name));
+  const hasPotentialContextForgeCall = calls.some((call) =>
+    looksLikeContextForgeTool(call.function?.name)
+  );
+  const hasInactiveBareContextForgeCall = calls.some((call) => {
+    const name = call.function?.name;
+    return (
+      looksLikeContextForgeTool(name) &&
+      !String(name).startsWith("mcp__") &&
+      !activeSchemas.has(name)
+    );
+  });
+
+  if (backgroundCalls.length === 0) {
+    // This includes genuine client-owned calls. Do not consume or rewrite a
+    // mixed/client response in the proxy.
+    if (
+      hasInactiveBareContextForgeCall ||
+      ((hasFatalAssemblyIssue || repair.issues.length > 0) && hasPotentialContextForgeCall)
+    ) {
+      return {
+        kind: "rejected",
+        reason: "ambiguous_tool_stream",
+        message:
+          "ContextForge rejected an ambiguous or malformed background tool stream before it could be replayed upstream.",
+        calls,
+      };
     }
-    const segments = splitTopLevelJsonObjects(tc.arguments || "");
-    const allValid =
-      segments.length >= 2 && segments.every((s) => { try { JSON.parse(s); return true; } catch { return false; } });
-    if (allValid) {
-      const n = segments.length;
-      let base = tc.name;
-      if (tc.name && tc.name.length % n === 0) {
-        const cand = tc.name.slice(0, tc.name.length / n);
-        if (cand.repeat(n) === tc.name) base = cand;
-      }
-      for (let i = 0; i < n; i++) {
-        out.push({
-          ...tc,
-          id: tc.id ? (n === 1 ? tc.id : `${tc.id}_${i + 1}`) : `call_cf_split_${i}`,
-          name: base,
-          arguments: segments[i],
-        });
-      }
-      console.warn(
-        `[Ghost Interceptor] 🔧 Repaired merged tool call "${tc.name}" → ${n} parallel calls ` +
-          `(upstream streamed them without index/id)`
-      );
-      continue;
-    }
-    out.push(tc); // unrepairable — caller must NOT intercept
+    return { kind: "passthrough", calls };
   }
-  return out;
+
+  // Never drop client-owned tool calls from a mixed batch. The old behavior
+  // intercepted only the CF subset, silently losing the client-owned calls.
+  if (backgroundCalls.length !== calls.length) {
+    console.warn(
+      "[Ghost Interceptor] ↪ Mixed background/client tool batch — passing through without ghost interception"
+    );
+    return { kind: "passthrough", calls };
+  }
+
+  if (hasFatalAssemblyIssue || repair.issues.length > 0) {
+    return {
+      kind: "rejected",
+      reason: "ambiguous_tool_stream",
+      message:
+        "ContextForge rejected an ambiguous background tool stream before it could be replayed upstream.",
+      calls,
+    };
+  }
+
+  for (const call of backgroundCalls) {
+    const validation = validateActiveToolCall(call, activeSchemas);
+    if (!validation.ok) {
+      console.warn(`[Ghost Interceptor] ⛔ Tool preflight rejected: ${validation.error}`);
+      return {
+        kind: "rejected",
+        reason: "invalid_tool_call",
+        message:
+          `ContextForge rejected an invalid background tool call: ${validation.error}. ` +
+          "The call was not appended to history and no recovery hop was sent.",
+        calls,
+      };
+    }
+    call.function.arguments = validation.normalizedArguments;
+  }
+
+  if (calls.length !== originalCalls.length) {
+    console.warn(
+      `[Ghost Interceptor] 🔧 Repaired merged tool call into ${calls.length} independently validated call(s)`
+    );
+  }
+
+  return { kind: "ready", calls };
 }
 
+function reconcileStableToolsForGhostHop(payload) {
+  const { added } = applyStableToolSet(payload, {
+    mcpSession: isMcpToolSession(payload.tools),
+  });
+  if (added.length > 0) {
+    console.log(`[StableTools] ✅ Ghost-hop +${added.join(", ")}`);
+  }
+}
+
+function appendGhostHistory(currentPayload, { assistantContent = null, toolCalls, results }) {
+  currentPayload.messages.push({
+    role: "assistant",
+    content: assistantContent,
+    tool_calls: toolCalls,
+  });
+
+  for (const result of results) {
+    let cfType = "text";
+    if (result.__cf_raw) cfType = "code";
+    else if (String(result.name || "").endsWith("contextforge_retrieve")) cfType = "code";
+    else if (typeof result.content === "string" && result.content.trimStart().startsWith("{")) {
+      cfType = "json";
+    }
+
+    currentPayload.messages.push({
+      role: "tool",
+      tool_call_id: result.tool_call_id,
+      name: result.name,
+      content: result.content,
+      _cf_type: cfType,
+      ...(result._source_file ? { _args: { file_path: result._source_file } } : {}),
+      ...(result.__cf_raw ? { __cf_raw: true } : {}),
+    });
+  }
+
+  // Fresh tool results are the one ghost-hop mutation that can introduce a
+  // vault marker. Reconcile monotonically so a needed retrieve schema exists
+  // before the next outbound request; existing schemas are never removed.
+  interceptAndVaultMassiveToolResults(currentPayload);
+  reconcileStableToolsForGhostHop(currentPayload);
+}
+
+function makeTerminalAssistantText(reason, detail) {
+  return (
+    `ContextForge stopped its internal background-tool loop (${reason}). ` +
+    `${detail} No additional upstream request was sent.`
+  );
+}
+
+function writeTerminalAssistantResponse({ res, clientAdapter, isStreamRequest, messageId, text }) {
+  const response = {
+    id: `msg_forge_safety_${Date.now()}`,
+    object: "chat.completion",
+    model: "contextforge",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: text },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+
+  if (!isStreamRequest) {
+    const { body, statusCode } = clientAdapter.fromInternal(response, 200);
+    if (!res.headersSent) res.writeHead(statusCode, clientAdapter.responseHeaders(false));
+    res.end(body);
+    return;
+  }
+
+  if (!res.headersSent) res.writeHead(200, clientAdapter.responseHeaders(true));
+
+  const terminalState = {
+    inToolCall: false,
+    inTextBlock: false,
+    toolIndex: 0,
+    nextBlockIndex: undefined,
+    textBlockIndex: -1,
+    currentToolIndex: -1,
+  };
+  const chunks = [
+    JSON.stringify({ choices: [{ index: 0, delta: { content: text }, finish_reason: null }] }),
+    JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+    "[DONE]",
+  ];
+  let first = true;
+  for (const chunk of chunks) {
+    const events = clientAdapter.fromInternalSSE(chunk, messageId, first, terminalState);
+    first = false;
+    for (const event of events) res.write(event);
+  }
+  res.end();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 // Upstream Handler Factory
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1079,9 +1281,7 @@ export function createUpstreamHandler(ctx) {
         outboundBody = JSON.stringify(currentPayload);
         outboundHeaders = provider.transformHeaders(req.headers);
         outboundPath =
-          typeof provider.transformPath === "function"
-            ? provider.transformPath(req.url)
-            : req.url;
+          typeof provider.transformPath === "function" ? provider.transformPath(req.url) : req.url;
       }
       outboundHeaders["content-length"] = Buffer.byteLength(outboundBody);
 
@@ -1109,21 +1309,16 @@ export function createUpstreamHandler(ctx) {
         let sseBuffer = "";
         const responseChunks = [];
 
-        // PC-3: native egress streaming state. Raw chunks are held verbatim
-        // (byte-exact passthrough on flush); the assembler sees the decoded
-        // lines so the Ghost Interceptor can detect background tool_use.
-        // Forwarding unlocks as soon as it is provably safe (a text block
-        // started and no tool block has been seen yet); once any tool_use
-        // block starts, everything is held until message_stop (same
-        // hold-until-classification design as the OpenAI path).
+        // Native egress holds a complete response until classification. A text
+        // block can be followed by a background tool_use later in the same
+        // message, so forwarding early is not actually safe: it prevents a
+        // clean terminal response when a tool stream is malformed or budgeted.
+        // Raw chunks are still forwarded verbatim after a safe classification.
         const nativeAssembler = nativeMode ? new NativeSSEAssembler() : null;
         if (nativeAssembler) {
-          nativeAssembler.backgroundChecker = (name) =>
-            interceptor.isBackgroundTool(name);
+          nativeAssembler.backgroundChecker = (name) => interceptor.isBackgroundTool(name);
         }
         const nativeHeld = nativeMode ? [] : null;
-        let nativeForwarding = false;
-        let nativeSawToolBlock = false;
 
         let toolState = {
           inToolCall: false,
@@ -1138,6 +1333,10 @@ export function createUpstreamHandler(ctx) {
         let isFirstChunk = true;
         let fullStreamedText = "";
         let toolCalls = [];
+        const streamToolCallAssembler = new StreamToolCallAssembler({
+          knownToolNames: [...activeToolSchemas(currentPayload).keys()],
+          idPrefix: `call_cf_${Date.now()}`,
+        });
         let hasSeenToolCall = false;
         let heldEvents = [];
         let isStandardToolStream = false;
@@ -1151,128 +1350,87 @@ export function createUpstreamHandler(ctx) {
         // sequences across chunks.
         const sseDecoder = new StringDecoder("utf-8");
 
-          const processSSELine = (line) => {
-            if (!line.startsWith("data: ")) return;
-            let openAiData = line.substring(6).trim();
-            if (!openAiData) return;
+        const processSSELine = (line) => {
+          if (!line.startsWith("data: ")) return;
+          let openAiData = line.substring(6).trim();
+          if (!openAiData) return;
 
-            try {
-              if (openAiData !== "[DONE]") {
-                const parsed = JSON.parse(openAiData);
-                const delta = parsed.choices?.[0]?.delta;
+          try {
+            if (openAiData !== "[DONE]") {
+              const parsed = JSON.parse(openAiData);
+              const delta = parsed.choices?.[0]?.delta;
 
-                if (delta?.tool_calls) {
-                  for (const tc of delta.tool_calls) {
-                    delete tc.extra_content;
-                  }
-                  openAiData = JSON.stringify(parsed);
+              if (delta?.tool_calls) {
+                for (const tc of delta.tool_calls) {
+                  delete tc.extra_content;
                 }
+                openAiData = JSON.stringify(parsed);
+              }
 
-                if (delta?.reasoning || delta?.content) {
-                  fullStreamedText += (delta.reasoning || "") + (delta.content || "");
-                }
+              if (delta?.reasoning || delta?.content) {
+                fullStreamedText += (delta.reasoning || "") + (delta.content || "");
+              }
 
-                if (delta?.tool_calls) {
-                  hasSeenToolCall = true;
-                  for (const tc of delta.tool_calls) {
-                    let idx;
-                    if (typeof tc.index === "number") {
-                      idx = tc.index;
-                    } else if (tc.id) {
-                      const existingIdx = toolCalls.findIndex((t) => t?.id === tc.id);
-                      idx = existingIdx !== -1 ? existingIdx : toolCalls.length;
-                    } else if (tc.function?.name) {
-                      // G-1 FIX: a NAME arrives without index and without id.
-                      // If the last call is already COMPLETE (its arguments
-                      // parse as JSON), this delta must start a NEW parallel
-                      // call — upstreams (observed with Ollama) stream the
-                      // 2nd+ parallel tool call without index/id, and the old
-                      // fallback (toolCalls.length - 1) MERGED it into the
-                      // last call: name doubled
-                      // ("contextforge_query_graphcontextforge_query_graph"),
-                      // arguments concatenated (two JSON objects) →
-                      // unparseable, and the corrupted call was then appended
-                      // to history, making the next hop 400 with "invalid
-                      // tool call arguments" (dead loop). Otherwise treat it
-                      // as a name fragment of the in-progress last call.
-                      const last = toolCalls[toolCalls.length - 1];
-                      let lastComplete = false;
-                      if (last && last.arguments) {
-                        try { JSON.parse(last.arguments); lastComplete = true; } catch { /* in progress */ }
-                      }
-                      idx = lastComplete ? toolCalls.length : Math.max(0, toolCalls.length - 1);
-                    } else {
-                      idx = Math.max(0, toolCalls.length - 1);
+              if (delta?.tool_calls) {
+                hasSeenToolCall = true;
+                // IDs are primary identities; ambiguous anonymous parallel
+                // streams are marked unsafe instead of being concatenated.
+                streamToolCallAssembler.addAll(delta.tool_calls);
+                toolCalls = streamToolCallAssembler.calls;
+              }
+            }
+          } catch {
+            /* ignore malformed partial chunks */
+          }
+
+          const translatedEvents = clientAdapter.fromInternalSSE(
+            openAiData,
+            messageId,
+            isFirstChunk,
+            toolState
+          );
+
+          if (clientAdapter.name === "anthropic" || clientAdapter.name === "gemini") {
+            if (hasSeenToolCall && process.env.CF_MODE !== "passthrough") {
+              if (!isStandardToolStream) {
+                const allNamesComplete =
+                  toolCalls.length > 0 &&
+                  toolCalls.every((tc) => tc.arguments && tc.arguments.length > 0);
+                if (allNamesComplete && !hasFatalAssemblyIssues(streamToolCallAssembler.issues)) {
+                  const hasBackgroundTool = toolCalls.some((tc) =>
+                    interceptor.isBackgroundTool(tc.name)
+                  );
+                  if (!hasBackgroundTool) {
+                    isStandardToolStream = true;
+                    if (!res.headersSent) {
+                      res.writeHead(proxyRes.statusCode, clientAdapter.responseHeaders(true));
                     }
-
-                    if (!toolCalls[idx]) {
-                      toolCalls[idx] = {
-                        id: tc.id || `call_cf_${Date.now()}_${idx}`,
-                        name: "",
-                        arguments: "",
-                        extra_content: null,
-                      };
+                    if (heldEvents.length > 0) {
+                      for (const event of heldEvents) res.write(event);
+                      heldEvents = [];
                     }
-                    if (tc.id) toolCalls[idx].id = tc.id;
-                    if (tc.function?.name) toolCalls[idx].name += tc.function.name;
-                    if (tc.function?.arguments) toolCalls[idx].arguments += tc.function.arguments;
-                    if (tc.extra_content) toolCalls[idx].extra_content = tc.extra_content;
                   }
                 }
               }
-            } catch {
-              /* ignore malformed partial chunks */
-            }
 
-            const translatedEvents = clientAdapter.fromInternalSSE(
-              openAiData,
-              messageId,
-              isFirstChunk,
-              toolState
-            );
-
-            if (clientAdapter.name === "anthropic" || clientAdapter.name === "gemini") {
-              if (hasSeenToolCall && process.env.CF_MODE !== "passthrough") {
-                if (!isStandardToolStream) {
-                  const allNamesComplete =
-                    toolCalls.length > 0 &&
-                    toolCalls.every((tc) => tc.arguments && tc.arguments.length > 0);
-                  if (allNamesComplete) {
-                    const hasBackgroundTool = toolCalls.some((tc) =>
-                      interceptor.isBackgroundTool(tc.name)
-                    );
-                    if (!hasBackgroundTool) {
-                      isStandardToolStream = true;
-                      if (!res.headersSent) {
-                        res.writeHead(proxyRes.statusCode, clientAdapter.responseHeaders(true));
-                      }
-                      if (heldEvents.length > 0) {
-                        for (const event of heldEvents) res.write(event);
-                        heldEvents = [];
-                      }
-                    }
-                  }
+              if (!isStandardToolStream) {
+                if (translatedEvents.length > 0) {
+                  isFirstChunk = false;
+                  heldEvents.push(...translatedEvents);
                 }
-
-                if (!isStandardToolStream) {
-                  if (translatedEvents.length > 0) {
-                    isFirstChunk = false;
-                    heldEvents.push(...translatedEvents);
-                  }
-                  return;
-                }
+                return;
               }
             }
+          }
 
-            if (!res.headersSent) {
-              res.writeHead(proxyRes.statusCode, clientAdapter.responseHeaders(true));
-            }
-            if (translatedEvents.length > 0) {
-              isFirstChunk = false;
-              for (const event of translatedEvents) res.write(event);
-            }
-          };
-
+          if (!res.headersSent) {
+            res.writeHead(proxyRes.statusCode, clientAdapter.responseHeaders(true));
+          }
+          if (translatedEvents.length > 0) {
+            isFirstChunk = false;
+            for (const event of translatedEvents) res.write(event);
+          }
+        };
 
         proxyRes.on("data", (chunk) => {
           responseChunks.push(chunk);
@@ -1286,36 +1444,14 @@ export function createUpstreamHandler(ctx) {
           const rawSseText = sseDecoder.write(chunk);
           sseBuffer += rawSseText;
 
-          // PC-3: native Anthropic streaming — hold raw bytes verbatim,
-          // feed the assembler, and forward live once provably safe.
+          // Native Anthropic streaming — keep raw bytes until message_stop so
+          // tool classification and terminal safety handling remain possible.
           if (nativeMode) {
-            const prevToolBlocks = nativeAssembler.toolBlocksSeen;
             sseLineBuffer += rawSseText;
             const nativeLines = sseLineBuffer.split("\n");
             sseLineBuffer = nativeLines.pop() ?? "";
             for (const line of nativeLines) nativeAssembler.processLine(line);
-            if (nativeAssembler.toolBlocksSeen > prevToolBlocks) nativeSawToolBlock = true;
-
-            if (nativeForwarding) {
-              if (!res.headersSent) res.writeHead(proxyRes.statusCode, proxyRes.headers);
-              res.write(chunk);
-            } else {
-              nativeHeld.push(chunk);
-              // Unlock: a content block has started, no tool block seen
-              // yet, and no background tool was flagged. Text-only and
-              // client-native-tool responses stream live from here;
-              // background-tool responses stay held for interception.
-              if (
-                nativeAssembler.sawAnyBlock &&
-                !nativeSawToolBlock &&
-                !nativeAssembler.hadBackgroundTool
-              ) {
-                nativeForwarding = true;
-                if (!res.headersSent) res.writeHead(proxyRes.statusCode, proxyRes.headers);
-                for (const b of nativeHeld) res.write(b);
-                nativeHeld.length = 0;
-              }
-            }
+            nativeHeld.push(chunk);
             return;
           }
 
@@ -1329,12 +1465,34 @@ export function createUpstreamHandler(ctx) {
           const lines = sseLineBuffer.split("\n");
           sseLineBuffer = lines.pop() ?? "";
 
-
           for (const line of lines) processSSELine(line);
         });
 
         proxyRes.on("end", async () => {
           const hopEndTime = performance.now();
+
+          const finishTerminalGhostStop = (outcome) => {
+            const text = makeTerminalAssistantText(
+              outcome.terminalReason || outcome.reason || "safety_stop",
+              outcome.terminalMessage ||
+                outcome.message ||
+                "ContextForge stopped the background tool operation."
+            );
+            if (!res.headersSent) {
+              res.setHeader(
+                "x-cf-ghost-stop",
+                outcome.terminalReason || outcome.reason || "safety_stop"
+              );
+            }
+            writeTerminalAssistantResponse({
+              res,
+              clientAdapter,
+              isStreamRequest,
+              messageId,
+              text,
+            });
+            resolve({ hopEndTime, ...acc });
+          };
 
           // S-2: end of stream — flush bytes still held by the UTF-8
           // decoder and process the final SSE line even when it arrived
@@ -1357,7 +1515,9 @@ export function createUpstreamHandler(ctx) {
                 for (const line of finalLines) processSSELine(line);
               }
             }
-          } catch { /* ignored — see comment above */ }
+          } catch {
+            /* ignored — see comment above */
+          }
 
           try {
             if (proxyRes.statusCode >= 400) {
@@ -1391,16 +1551,14 @@ export function createUpstreamHandler(ctx) {
               // client surfaces a clean, retryable error. Only when nothing
               // was flushed to the client yet (otherwise the stream format
               // is already in flight and raw passthrough is the best option).
-              if (
-                isStreamRequest &&
-                !res.headersSent &&
-                clientAdapter.name === "anthropic"
-              ) {
+              if (isStreamRequest && !res.headersSent && clientAdapter.name === "anthropic") {
                 let errMsg = `Upstream error ${proxyRes.statusCode}`;
                 try {
                   const errObj = JSON.parse(fullResponseBuf.toString("utf-8"));
                   errMsg = errObj?.error?.message || errObj?.message || errMsg;
-                } catch { /* keep generic message */ }
+                } catch {
+                  /* keep generic message */
+                }
                 res.writeHead(proxyRes.statusCode, clientAdapter.responseHeaders(true));
                 res.write(
                   `event: message_start\ndata: ${JSON.stringify({
@@ -1474,78 +1632,55 @@ export function createUpstreamHandler(ctx) {
                   resolve({ hopEndTime, ...acc });
                   return;
                 }
-                const bgCalls = assembled.toolCalls.filter((tc) =>
-                  interceptor.isBackgroundTool(tc.name)
-                );
-                if (bgCalls.length > 0 && process.env.CF_MODE !== "passthrough") {
-                  const toolCallsNative = bgCalls.map((tc) => ({
-                    id: tc.id,
-                    type: "function",
-                    function: { name: tc.name, arguments: tc.arguments },
-                  }));
-                  const result = await interceptor.process(
-                    toolCallsNative,
+                if (assembled.toolCalls.length > 0 && process.env.CF_MODE !== "passthrough") {
+                  const prepared = prepareGhostToolCalls(
+                    assembled.toolCalls.map((tc) => ({
+                      id: tc.id,
+                      type: "function",
+                      function: { name: tc.name, arguments: tc.arguments },
+                    })),
                     currentPayload,
-                    retryCount,
-                    acc.hopCount
+                    interceptor
                   );
-                  if (result.intercepted) {
-                    if (result.circuitBreakerTripped) {
-                      currentPayload.messages.push(
-                        {
-                          role: "assistant",
-                          content: assembled.text || null,
-                          tool_calls: result.toolCalls,
-                        },
-                        ...result.toolCalls.map((tc) => ({
-                          role: "tool",
-                          tool_call_id: tc.id,
-                          name: tc.function.name,
-                          content:
-                            `SYSTEM_ERROR: Background tool budget exhausted ` +
-                            `(${MAX_GHOST_RETRIES} hops used). Do not retry this tool. ` +
-                            `Summarise what you have found so far and proceed using only standard file tools.`,
-                        }))
-                      );
-                      executeUpstreamRequest(currentPayload, 0, acc).then(resolve).catch(reject);
-                      return;
-                    }
 
-                    currentPayload.messages.push({
-                      role: "assistant",
-                      content: assembled.text || null,
-                      tool_calls: result.toolCalls,
-                    });
-
-                    for (const r of result.results) {
-                      let cfType = "text";
-                      if (r.__cf_raw) cfType = "code";
-                      else if (r.name === "contextforge_retrieve") cfType = "code";
-                      else if (
-                        typeof r.content === "string" &&
-                        r.content.trimStart().startsWith("{")
-                      )
-                        cfType = "json";
-
-                      currentPayload.messages.push({
-                        role: "tool",
-                        tool_call_id: r.tool_call_id,
-                        name: r.name,
-                        content: r.content,
-                        _cf_type: cfType,
-                        ...(r._source_file ? { _args: { file_path: r._source_file } } : {}),
-                        ...(r.__cf_raw ? { __cf_raw: true } : {}),
-                      });
-                    }
-
-                    interceptAndVaultMassiveToolResults(currentPayload);
-                    const nextRetry = computeNextRetry(result, retryCount, maxRetries);
-                    executeUpstreamRequest(currentPayload, nextRetry, acc)
-                      .then(resolve)
-                      .catch(reject);
+                  if (prepared.kind === "rejected") {
+                    finishTerminalGhostStop(prepared);
                     return;
                   }
-                  // Not intercepted (unexpected — fall through to flush).
+
+                  if (prepared.kind === "ready") {
+                    const result = await interceptor.process(
+                      prepared.calls,
+                      currentPayload,
+                      retryCount,
+                      acc.hopCount
+                    );
+                    if (result.terminal) {
+                      finishTerminalGhostStop(result);
+                      return;
+                    }
+                    if (result.intercepted) {
+                      if (failureBudgetWouldBeExhausted(result, retryCount, maxRetries)) {
+                        finishTerminalGhostStop({
+                          reason: "failure_budget",
+                          message:
+                            "ContextForge reached its failed-background-call budget before retrying the request.",
+                        });
+                        return;
+                      }
+
+                      appendGhostHistory(currentPayload, {
+                        assistantContent: assembled.text || null,
+                        toolCalls: result.toolCalls,
+                        results: result.results,
+                      });
+                      const nextRetry = computeNextRetry(result, retryCount, maxRetries);
+                      executeUpstreamRequest(currentPayload, nextRetry, acc)
+                        .then(resolve)
+                        .catch(reject);
+                      return;
+                    }
+                  }
                 }
 
                 // Passthrough: flush any remaining held bytes verbatim
@@ -1580,103 +1715,43 @@ export function createUpstreamHandler(ctx) {
               }
 
               if (hasSeenToolCall && process.env.CF_MODE !== "passthrough") {
-                const validToolCalls = toolCalls
-                  .filter((tc) => tc.name)
-                  .map((tc) => {
-                    const call = {
-                      id: tc.id,
-                      type: "function",
-                      function: { name: tc.name, arguments: tc.arguments },
-                    };
-                    if (tc.extra_content) call.extra_content = tc.extra_content;
-                    return call;
-                  });
+                const prepared = prepareGhostToolCalls(toolCalls, currentPayload, interceptor, {
+                  assemblyIssues: streamToolCallAssembler.issues,
+                });
 
-                // G-2: split back any parallel calls the upstream streamed
-                // merged (name doubled / concatenated JSON arguments).
-                const repairedCalls = repairMergedToolCalls(validToolCalls);
+                if (prepared.kind === "rejected") {
+                  finishTerminalGhostStop(prepared);
+                  return;
+                }
 
-                // Only background calls get intercepted and appended to
-                // history, so only their parse-ability gates interception.
-                const bgStreamCalls = repairedCalls.filter((tc) =>
-                  interceptor.isBackgroundTool(tc.function?.name)
-                );
-
-                // G-3: if a BACKGROUND call is STILL unparseable after
-                // repair, do NOT intercept it and do NOT append it to
-                // history. Appending a corrupted tool call to the assistant
-                // message makes the next upstream hop 400 with "invalid tool
-                // call arguments" (a dead loop — the model never gets to
-                // see/redo the call). Instead let the stream fall through to
-                // the client: the model sees the failed tool call on its next
-                // turn and redoes it cleanly.
-                if (validToolCalls.length > 0 && bgStreamCalls.length > 0 && !allCallsInterceptable(bgStreamCalls)) {
-                  console.warn(
-                    `[Ghost Interceptor] ⚠️ Unparseable tool-call arguments (unrepairable) — ` +
-                      `passing stream through to client instead of intercepting`
-                  );
-                  // Fall through to _replayAndEnd() below: flush held events,
-                  // no interception, no history mutation.
-                } else if (validToolCalls.length > 0) {
+                if (prepared.kind === "ready") {
                   const result = await interceptor.process(
-                    repairedCalls,
+                    prepared.calls,
                     currentPayload,
                     retryCount,
                     acc.hopCount
                   );
 
+                  if (result.terminal) {
+                    finishTerminalGhostStop(result);
+                    return;
+                  }
+
                   if (result.intercepted) {
-                    if (result.circuitBreakerTripped) {
-                      currentPayload.messages.push(
-                        {
-                          role: "assistant",
-                          content: null,
-                          tool_calls: repairedCalls,
-                        },
-                        ...repairedCalls.map((tc) => ({
-                          role: "tool",
-                          tool_call_id: tc.id,
-                          name: tc.function.name,
-                          content:
-                            `SYSTEM_ERROR: Background tool budget exhausted ` +
-                            `(${MAX_GHOST_RETRIES} hops used). Do not retry this tool. ` +
-                            `Summarise what you have found so far and proceed using only standard file tools.`,
-                        }))
-                      );
-                      executeUpstreamRequest(currentPayload, 0, acc).then(resolve).catch(reject);
+                    if (failureBudgetWouldBeExhausted(result, retryCount, maxRetries)) {
+                      finishTerminalGhostStop({
+                        reason: "failure_budget",
+                        message:
+                          "ContextForge reached its failed-background-call budget before retrying the request.",
+                      });
                       return;
                     }
 
-                    currentPayload.messages.push({
-                      role: "assistant",
-                      content: fullStreamedText.length > 0 ? fullStreamedText : null,
-                      tool_calls: result.toolCalls,
+                    appendGhostHistory(currentPayload, {
+                      assistantContent: fullStreamedText.length > 0 ? fullStreamedText : null,
+                      toolCalls: result.toolCalls,
+                      results: result.results,
                     });
-
-                    for (const r of result.results) {
-                      let cfType = "text";
-                      if (r.__cf_raw) cfType = "code";
-                      else if (r.name === "contextforge_retrieve") cfType = "code";
-                      else if (
-                        typeof r.content === "string" &&
-                        r.content.trimStart().startsWith("{")
-                      )
-                        cfType = "json";
-
-                      currentPayload.messages.push({
-                        role: "tool",
-                        tool_call_id: r.tool_call_id,
-                        name: r.name,
-                        content: r.content,
-                        _cf_type: cfType,
-                        ...(r._source_file ? { _args: { file_path: r._source_file } } : {}),
-                        ...(r.__cf_raw ? { __cf_raw: true } : {}),
-                      });
-                    }
-
-                    interceptAndVaultMassiveToolResults(currentPayload);
-
-                    // UR-8 FIX: pass maxRetries so per-request budget applies
                     const nextRetry = computeNextRetry(result, retryCount, maxRetries);
                     executeUpstreamRequest(currentPayload, nextRetry, acc)
                       .then(resolve)
@@ -1763,85 +1838,51 @@ export function createUpstreamHandler(ctx) {
                 acc.accumulatedCacheReadTokens += internal.usage.cacheRead;
               }
 
-              const bgCallsNative = internal.toolCalls.filter((tc) =>
-                interceptor.isBackgroundTool(tc.function?.name)
-              );
-              if (
-                bgCallsNative.length > 0 &&
-                process.env.CF_MODE !== "passthrough" &&
-                allCallsInterceptable(bgCallsNative)
-              ) {
-                const result = await interceptor.process(
+              if (internal.toolCalls.length > 0 && process.env.CF_MODE !== "passthrough") {
+                const prepared = prepareGhostToolCalls(
                   internal.toolCalls,
                   currentPayload,
-                  retryCount,
-                  acc.hopCount
+                  interceptor
                 );
-                if (result.intercepted) {
-                  if (result.circuitBreakerTripped) {
-                    currentPayload.messages.push(
-                      {
-                        role: "assistant",
-                        content: internal.content ?? null,
-                        tool_calls: result.toolCalls,
-                      },
-                      ...result.toolCalls.map((tc) => ({
-                        role: "tool",
-                        tool_call_id: tc.id,
-                        name: tc.function.name,
-                        content:
-                          `SYSTEM_ERROR: Background tool budget exhausted ` +
-                          `(${MAX_GHOST_RETRIES} hops used). Do not retry this tool. ` +
-                          `Summarise what you have found so far and proceed using only standard file tools.`,
-                      }))
-                    );
-                    executeUpstreamRequest(currentPayload, 0, acc).then(resolve).catch(reject);
-                    return;
-                  }
 
-                  currentPayload.messages.push({
-                    role: "assistant",
-                    content: internal.content ?? null,
-                    tool_calls: result.toolCalls,
-                  });
-
-                  for (const r of result.results) {
-                    let cfType = "text";
-                    if (r.__cf_raw) cfType = "code";
-                    else if (r.name === "contextforge_retrieve") cfType = "code";
-                    else if (
-                      typeof r.content === "string" &&
-                      r.content.trimStart().startsWith("{")
-                    )
-                      cfType = "json";
-
-                    currentPayload.messages.push({
-                      role: "tool",
-                      tool_call_id: r.tool_call_id,
-                      name: r.name,
-                      content: r.content,
-                      _cf_type: cfType,
-                      ...(r._source_file ? { _args: { file_path: r._source_file } } : {}),
-                      ...(r.__cf_raw ? { __cf_raw: true } : {}),
-                    });
-                  }
-
-                  interceptAndVaultMassiveToolResults(currentPayload);
-                  const nextRetry = computeNextRetry(result, retryCount, maxRetries);
-                  executeUpstreamRequest(currentPayload, nextRetry, acc)
-                    .then(resolve)
-                    .catch(reject);
+                if (prepared.kind === "rejected") {
+                  finishTerminalGhostStop(prepared);
                   return;
                 }
-                // Not intercepted — fall through to verbatim passthrough.
-              } else if (
-                bgCallsNative.length > 0 &&
-                !allCallsInterceptable(bgCallsNative)
-              ) {
-                console.warn(
-                  "[Ghost Interceptor] ⚠️ Unparseable native tool-call arguments — " +
-                    "passing response through instead of intercepting (G-3)"
-                );
+
+                if (prepared.kind === "ready") {
+                  const result = await interceptor.process(
+                    prepared.calls,
+                    currentPayload,
+                    retryCount,
+                    acc.hopCount
+                  );
+                  if (result.terminal) {
+                    finishTerminalGhostStop(result);
+                    return;
+                  }
+                  if (result.intercepted) {
+                    if (failureBudgetWouldBeExhausted(result, retryCount, maxRetries)) {
+                      finishTerminalGhostStop({
+                        reason: "failure_budget",
+                        message:
+                          "ContextForge reached its failed-background-call budget before retrying the request.",
+                      });
+                      return;
+                    }
+
+                    appendGhostHistory(currentPayload, {
+                      assistantContent: internal.content ?? null,
+                      toolCalls: result.toolCalls,
+                      results: result.results,
+                    });
+                    const nextRetry = computeNextRetry(result, retryCount, maxRetries);
+                    executeUpstreamRequest(currentPayload, nextRetry, acc)
+                      .then(resolve)
+                      .catch(reject);
+                    return;
+                  }
+                }
               }
 
               // Passthrough: forward the native JSON verbatim.
@@ -1895,93 +1936,59 @@ export function createUpstreamHandler(ctx) {
 
             const message = jsonResponse.choices?.[0]?.message;
 
-            // G-2: repair merged parallel calls (same safety net as the
-            // streaming path — non-streaming bodies usually carry proper
-            // arrays, but a concatenated-arguments string is legal JSON
-            // text and would otherwise poison the next hop).
-            const repairedToolCalls = repairMergedToolCalls(message?.tool_calls ?? []);
-            const bgCalls = repairedToolCalls.filter((tc) =>
-              interceptor.isBackgroundTool(tc.function?.name)
-            );
-
-            if (
-              message?.tool_calls &&
-              message.tool_calls.length > 0 &&
-              process.env.CF_MODE !== "passthrough" &&
-              // G-3: a background call whose arguments are unparseable after
-              // repair must NOT be intercepted — intercepting appends the
-              // corrupted call to history and the next hop 400s with
-              // "invalid tool call arguments". Pass the response through;
-              // the model redoes the call on its next turn.
-              (bgCalls.length === 0 || allCallsInterceptable(bgCalls))
-            ) {
-              const result = await interceptor.process(
-              repairedToolCalls,
+            if (message?.tool_calls?.length > 0 && process.env.CF_MODE !== "passthrough") {
+              const prepared = prepareGhostToolCalls(
+                message.tool_calls,
                 currentPayload,
-                retryCount,
-                acc.hopCount
+                interceptor
               );
 
-              if (result.intercepted) {
-                if (result.circuitBreakerTripped) {
-                  currentPayload.messages.push(
-                    {
-                      role: "assistant",
-                      content: message.content ?? null,
-                      tool_calls: repairedToolCalls,
-                    },
-                    ...repairedToolCalls.map((tc) => ({
-                      role: "tool",
-                      tool_call_id: tc.id,
-                      name: tc.function.name,
-                      content:
-                        `SYSTEM_ERROR: Background tool budget exhausted ` +
-                        `(${MAX_GHOST_RETRIES} hops used). Do not retry this tool. ` +
-                        `Summarise what you have found so far and proceed using only standard file tools.`,
-                    }))
-                  );
-                  executeUpstreamRequest(currentPayload, 0, acc).then(resolve).catch(reject);
+              if (prepared.kind === "rejected") {
+                finishTerminalGhostStop(prepared);
+                return;
+              }
+
+              if (prepared.kind === "ready") {
+                const result = await interceptor.process(
+                  prepared.calls,
+                  currentPayload,
+                  retryCount,
+                  acc.hopCount
+                );
+
+                if (result.terminal) {
+                  finishTerminalGhostStop(result);
                   return;
                 }
 
-                const toolCallsWithMeta = result.toolCalls.map((tc) => {
-                  const original = message.tool_calls.find((orig) => orig.id === tc.id);
-                  if (original?.extra_content) {
-                    return { ...tc, extra_content: original.extra_content };
+                if (result.intercepted) {
+                  if (failureBudgetWouldBeExhausted(result, retryCount, maxRetries)) {
+                    finishTerminalGhostStop({
+                      reason: "failure_budget",
+                      message:
+                        "ContextForge reached its failed-background-call budget before retrying the request.",
+                    });
+                    return;
                   }
-                  return tc;
-                });
 
-                currentPayload.messages.push({
-                  role: "assistant",
-                  content: message.content ?? null,
-                  tool_calls: toolCallsWithMeta,
-                });
-
-                for (const r of result.results) {
-                  let cfType = "text";
-                  if (r.__cf_raw) cfType = "code";
-                  else if (r.name === "contextforge_retrieve") cfType = "code";
-                  else if (typeof r.content === "string" && r.content.trimStart().startsWith("{"))
-                    cfType = "json";
-
-                  currentPayload.messages.push({
-                    role: "tool",
-                    tool_call_id: r.tool_call_id,
-                    name: r.name,
-                    content: r.content,
-                    _cf_type: cfType,
-                    ...(r._source_file ? { _args: { file_path: r._source_file } } : {}),
-                    ...(r.__cf_raw ? { __cf_raw: true } : {}),
+                  const toolCallsWithMeta = result.toolCalls.map((tc) => {
+                    const original = message.tool_calls.find((orig) => orig.id === tc.id);
+                    return original?.extra_content
+                      ? { ...tc, extra_content: original.extra_content }
+                      : tc;
                   });
+
+                  appendGhostHistory(currentPayload, {
+                    assistantContent: message.content ?? null,
+                    toolCalls: toolCallsWithMeta,
+                    results: result.results,
+                  });
+                  const nextRetry = computeNextRetry(result, retryCount, maxRetries);
+                  executeUpstreamRequest(currentPayload, nextRetry, acc)
+                    .then(resolve)
+                    .catch(reject);
+                  return;
                 }
-
-                interceptAndVaultMassiveToolResults(currentPayload);
-
-                // UR-8 FIX: consistent with streaming path
-                const nextRetry = computeNextRetry(result, retryCount, maxRetries);
-                executeUpstreamRequest(currentPayload, nextRetry, acc).then(resolve).catch(reject);
-                return;
               }
             }
 

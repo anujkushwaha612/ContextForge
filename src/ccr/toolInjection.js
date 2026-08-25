@@ -46,6 +46,7 @@ export function createCCRToolDefinition(provider = "anthropic") {
           },
         },
         required: ["vault_id"],
+        additionalProperties: false,
       },
     };
   } else {
@@ -67,6 +68,7 @@ export function createCCRToolDefinition(provider = "anthropic") {
             },
           },
           required: ["vault_id"],
+          additionalProperties: false,
         },
       },
     };

@@ -51,6 +51,7 @@ import { statsEmitter } from "../proxy/statsEmitter.js";
 import fs from "node:fs";
 import path from "node:path";
 import { planRetrieval } from "./retrievalPlanner.js";
+import { isExactToolAlias } from "../proxy/toolCallSafety.js";
 
 export { getWorkspaceRoot } from "./graphDb.js";
 
@@ -64,8 +65,11 @@ const GRAPH_TOOL_ALIASES = new Set([
 
 export function normalizeGraphToolName(name) {
   if (!name) return name;
-  const match = name.match(/(?:mcp__\w+__|[\w]+__)?(contextforge_query_graph)$/);
-  return match ? match[1] : name;
+  // A tool name must be an exact bare name or a properly delimited CF/MCP
+  // alias. The previous suffix-only regex accepted corrupted names such as
+  // `contextforge_query_graphcontextforge_query_graph`, which let a merged
+  // stream fragment enter the Ghost Interceptor as if it were valid.
+  return isExactToolAlias(name, GRAPH_TOOL_NAME) ? GRAPH_TOOL_NAME : name;
 }
 
 // ─────────────────────────────────────────────
@@ -940,14 +944,10 @@ export function injectGraphTool(tools) {
 export const READ_FILE_CHUNK_TOOL_NAME = "read_file_chunk";
 
 export function isReadFileChunkTool(toolName) {
-  if (!toolName) return false;
-  if (toolName === READ_FILE_CHUNK_TOOL_NAME) return true;
-  // BUG C FIX: The old code used .includes() which matched ANY tool name
-  // containing "read_file_chunk" as a substring (e.g. "my_read_file_chunk_v2").
-  // Use endsWith('__' + name) to only match legitimate MCP-prefixed aliases
-  // like "mcp__contextforge__read_file_chunk" — the same pattern used by
-  // the GRAPH_TOOL_ALIASES Set for graph tool detection.
-  return toolName.endsWith("__" + READ_FILE_CHUNK_TOOL_NAME);
+  // Exact alias matching mirrors graph/patch tools. In particular, a name
+  // that merely ends in the tool name must not be accepted after a malformed
+  // stream merge.
+  return isExactToolAlias(toolName, READ_FILE_CHUNK_TOOL_NAME);
 }
 
 export function executeReadFileChunk(filePath, startLine, endLine) {

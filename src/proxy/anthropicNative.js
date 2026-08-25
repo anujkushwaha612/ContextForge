@@ -74,7 +74,7 @@
  * instability: the client's marked prefix bytes are never touched.
  */
 
-import { CF_RULE_BARE } from "./systemMessages.js";
+import { getContextForgeRule } from "./systemMessages.js";
 
 // ─────────────────────────────────────────────
 // Mode gate
@@ -115,7 +115,8 @@ function toToolResultContent(content) {
   if (Array.isArray(content)) {
     const blocks = [];
     for (const b of content) {
-      if (b?.type === "text" && typeof b.text === "string") blocks.push({ type: "text", text: b.text });
+      if (b?.type === "text" && typeof b.text === "string")
+        blocks.push({ type: "text", text: b.text });
     }
     return blocks.length ? blocks : "";
   }
@@ -148,10 +149,7 @@ export function internalToAnthropicMessages(messages) {
     const last = out[out.length - 1];
     if (last && last.role === "user") {
       if (typeof last.content === "string") {
-        last.content = [
-          { type: "text", text: last.content },
-          block,
-        ];
+        last.content = [{ type: "text", text: last.content }, block];
       } else {
         last.content.push(block);
       }
@@ -164,7 +162,9 @@ export function internalToAnthropicMessages(messages) {
     const last = out[out.length - 1];
     if (last && last.role === "assistant") {
       if (typeof last.content === "string") {
-        last.content = blocks.length ? [{ type: "text", text: last.content }, ...blocks] : [{ type: "text", text: last.content }];
+        last.content = blocks.length
+          ? [{ type: "text", text: last.content }, ...blocks]
+          : [{ type: "text", text: last.content }];
       } else {
         last.content.push(...blocks);
       }
@@ -188,7 +188,8 @@ export function internalToAnthropicMessages(messages) {
 
     if (m.role === "assistant") {
       const blocks = [];
-      if (typeof m.content === "string" && m.content) blocks.push({ type: "text", text: m.content });
+      if (typeof m.content === "string" && m.content)
+        blocks.push({ type: "text", text: m.content });
       if (Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {
           blocks.push({
@@ -269,6 +270,29 @@ function toolNameOf(t) {
   return t?.function?.name || t?.name || "";
 }
 
+function clientContextForgeToolPrefix(tools) {
+  const CF_BARE_NAMES = new Set([
+    "contextforge_query_graph",
+    "contextforge_patch_ast",
+    "read_file_chunk",
+    "contextforge_retrieve",
+    "memory_save",
+    "memory_search",
+    "memory_update",
+    "memory_delete",
+    "memory_list",
+  ]);
+  for (const tool of tools || []) {
+    const name = toolNameOf(tool);
+    if (!name || !name.includes("__")) continue;
+    const bare = name.slice(name.lastIndexOf("__") + 2);
+    if (!CF_BARE_NAMES.has(bare)) continue;
+    const prefix = name.slice(0, name.length - bare.length);
+    if (prefix === "contextforge__" || prefix.startsWith("mcp__")) return prefix;
+  }
+  return "";
+}
+
 /**
  * Convert a ContextForge (internal OpenAI-shape) tool definition to the
  * Anthropic wire shape. Client tools are forwarded verbatim in their
@@ -297,6 +321,8 @@ export function buildNativeBody({ clientOriginal, internalPayload }) {
   const clientSystem = systemToBlocks(clientOriginal?.system);
   const clientTools = Array.isArray(clientOriginal?.tools) ? clientOriginal.tools : [];
   const clientToolNames = new Set(clientTools.map(toolNameOf));
+  const toolPrefix = clientContextForgeToolPrefix(clientTools);
+  const mcpSession = toolPrefix.startsWith("mcp__");
 
   // ContextForge's own tools: everything in the internal payload's tools
   // that the client did not send (stable set + CCR retrieve + memory tools),
@@ -310,7 +336,13 @@ export function buildNativeBody({ clientOriginal, internalPayload }) {
     stream: Boolean(clientOriginal?.stream ?? internalPayload.stream),
     // Client system blocks VERBATIM (cache_control markers included), then
     // our rule appended AFTER them — outside the client's marked prefix.
-    system: [...clientSystem, { type: "text", text: CF_RULE_BARE }],
+    system: [
+      ...clientSystem,
+      {
+        type: "text",
+        text: getContextForgeRule({ mcpSession, toolPrefix: toolPrefix || undefined }),
+      },
+    ],
     // Client tools VERBATIM (tool-level cache_control included), then ours
     // (converted to Anthropic wire shape — ours are internal OpenAI shape).
     tools: [...clientTools, ...cfTools.map(toAnthropicTool)],
@@ -341,7 +373,9 @@ export function buildNativeHeaders(incomingHeaders) {
   const key =
     process.env.ANTHROPIC_API_KEY ||
     incomingHeaders["x-api-key"] ||
-    (incomingHeaders["authorization"] ? incomingHeaders["authorization"].replace(/^Bearer\s+/i, "") : null);
+    (incomingHeaders["authorization"]
+      ? incomingHeaders["authorization"].replace(/^Bearer\s+/i, "")
+      : null);
   if (key) out["x-api-key"] = key;
   // Bearer is also accepted natively; keep both for gateway compatibility.
   if (key) out["authorization"] = `Bearer ${key}`;
@@ -379,6 +413,7 @@ export class NativeSSEAssembler {
     this.error = null;
     this.done = false;
     this.sawAnyBlock = false;
+    this.toolBlocksSeen = 0;
     this.hadBackgroundTool = false;
     this.backgroundChecker = (name) => false; // set by caller
   }
@@ -425,7 +460,8 @@ export class NativeSSEAssembler {
         if (!b) break;
         const d = evt.delta || {};
         if (d.type === "text_delta" && typeof d.text === "string") b.text += d.text;
-        else if (d.type === "input_json_delta" && typeof d.partial_json === "string") b.inputJson += d.partial_json;
+        else if (d.type === "input_json_delta" && typeof d.partial_json === "string")
+          b.inputJson += d.partial_json;
         // thinking_delta / signature_delta: deliberately dropped — replaying
         // extended-thinking blocks natively requires the original signature,
         // which we do not preserve; they are not needed for interception.

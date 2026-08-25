@@ -6,6 +6,9 @@
  * Fixes:
  *   ST-1: Multi-hop negative tokensSaved values are preserved and displayed
  *         honestly. getSummary now clarifies negative = multi-hop overhead.
+ *   ST-3: Persisted `ghost_retries` remains backward-compatible, but display
+ *         labels call these ghost hops: successful internal tool continuations
+ *         are not failures or retries.
  *
  *   ST-2: History trimming unchanged — documented that file can reach
  *         ~500KB for heavy usage at default maxHistoryPoints=5000.
@@ -249,10 +252,12 @@ export class SavingsTracker {
     const ratio =
       lt.tokens_before > 0 ? ((lt.tokens_saved / lt.tokens_before) * 100).toFixed(1) : "0.0";
 
-    const retryRate =
+    // Field names retain their on-disk v1 compatibility, but each count is an
+    // extra ghost hop regardless of whether the tool execution succeeded.
+    const hopRate =
       lt.requests > 0 ? ((lt.requests_with_retries / lt.requests) * 100).toFixed(1) : "0.0";
 
-    const avgRetries =
+    const avgHops =
       lt.requests_with_retries > 0
         ? (lt.ghost_retries / lt.requests_with_retries).toFixed(2)
         : "0.00";
@@ -282,9 +287,9 @@ export class SavingsTracker {
 │ Tokens Saved  (est)│ ${savedLabel}
 │ Compression Ratio  │ ${pad(ratio + "%")} │${cacheRow}
 ├────────────────────┼──────────────────────┤
-│ Ghost Retries      │ ${pad(lt.ghost_retries.toLocaleString())} │
-│ Retry Rate         │ ${pad(retryRate + "%")} │
-│ Avg Retries/Req    │ ${pad(avgRetries)} │
+│ Ghost Hops         │ ${pad(lt.ghost_retries.toLocaleString())} │
+│ Hop Rate           │ ${pad(hopRate + "%")} │
+│ Avg Hops/Req       │ ${pad(avgHops)} │
 └────────────────────┴──────────────────────┘
   Note: Token counts are estimates (cl100k_base ≈ Claude tokenizer ±15%)`;
   }

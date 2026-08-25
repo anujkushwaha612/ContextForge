@@ -77,6 +77,10 @@ test-*
 # benchmarks/results/
 tests/*
 !tests/cache-audit/
+# Keep focused regression tests under version control; broad fixture output
+# remains ignored by default.
+!tests/unit/
+!tests/unit/*.test.js
 benchmarks/
 
 

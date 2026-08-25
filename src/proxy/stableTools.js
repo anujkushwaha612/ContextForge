@@ -57,16 +57,10 @@
  * availability removes that failure mode.
  */
 
-import {
-  getGraphToolDefinition,
-  getReadFileChunkToolDefinition,
-} from "../graph/graphTools.js";
+import { getGraphToolDefinition, getReadFileChunkToolDefinition } from "../graph/graphTools.js";
 import { getPatchToolDefinition } from "../graph/patchTools.js";
 import { createCCRToolDefinition } from "../ccr/toolInjection.js";
-import {
-  getMemoryToolDefinitions,
-  MEMORY_TOOL_NAMES,
-} from "../memory/memoryTools.js";
+import { getMemoryToolDefinitions, MEMORY_TOOL_NAMES } from "../memory/memoryTools.js";
 
 // ─────────────────────────────────────────────
 // Canonical availability (fixed order — the ONLY order we ever emit)
@@ -87,6 +81,14 @@ const MEMORY_TOOLS = getMemoryToolDefinitions().map((t) => ({
   name: t.function?.name || t.name,
   def: t,
 }));
+
+const CONTEXTFORGE_TOOL_NAMES = new Set([
+  "contextforge_query_graph",
+  "contextforge_patch_ast",
+  "read_file_chunk",
+  "contextforge_retrieve",
+  ...MEMORY_TOOL_NAMES,
+]);
 
 // ─────────────────────────────────────────────
 // Payload-derived (sticky) conditions
@@ -250,19 +252,22 @@ export function applyStableToolSet(payload, { mcpSession = false } = {}) {
  * mcp__-prefixed (or contextforge__-prefixed) alias — i.e. the MCP server
  * owns tool availability for this session.
  */
-export function isMcpToolSession(tools) {
-  if (!Array.isArray(tools)) return false;
-  const CF_NAMES = new Set([
-    "contextforge_query_graph",
-    "contextforge_patch_ast",
-    "read_file_chunk",
-    "contextforge_retrieve",
-    ...MEMORY_TOOL_NAMES,
-  ]);
-  return tools.some((t) => {
-    const name = toolNameOf(t);
-    if (!name || !name.includes("__")) return false;
+export function getContextForgeToolPrefix(tools) {
+  if (!Array.isArray(tools)) return "";
+  for (const tool of tools) {
+    const name = toolNameOf(tool);
+    if (!name || !name.includes("__")) continue;
     const bare = name.slice(name.lastIndexOf("__") + 2);
-    return CF_NAMES.has(bare);
-  });
+    if (!CONTEXTFORGE_TOOL_NAMES.has(bare)) continue;
+
+    const prefix = name.slice(0, name.length - bare.length);
+    // Only known namespace forms are client-owned aliases. Do not let an
+    // arbitrary tool ending in a CF-looking suffix suppress bare injection.
+    if (prefix === "contextforge__" || prefix.startsWith("mcp__")) return prefix;
+  }
+  return "";
+}
+
+export function isMcpToolSession(tools) {
+  return Boolean(getContextForgeToolPrefix(tools));
 }

@@ -32,10 +32,9 @@ import { passesTokenGate } from "../compression/compressionHelper.js";
 
 const CF_SENTINEL = "[CF_INJECTED_RULE]";
 
-const CF_NOTICE =
+const CF_NOTICE_PREFIX =
   "[CF_INJECTED_RULE]\n\nYou are operating behind ContextForge. " +
-  "File contents may be structurally compressed to save context. " +
-  "You have access to ContextForge's native repository intelligence tools via MCP.";
+  "File contents may be structurally compressed to save context. ";
 
 const SKILLS_PHRASE = "The following skills are available for use with the Skill tool:";
 
@@ -122,24 +121,40 @@ If you see compressed content, retrieve the full source first with
 }
 
 const MCP_PREFIX = "mcp__contextforge__";
+const BARE_PREFIX = "";
 
-const CF_RULE = CF_NOTICE + buildToolGuidance(MCP_PREFIX) + buildPatchGuidance(MCP_PREFIX);
+function buildContextForgeRule({ mcpSession = true, toolPrefix = undefined } = {}) {
+  const prefix = toolPrefix ?? (mcpSession ? MCP_PREFIX : BARE_PREFIX);
+  const access = String(prefix).startsWith("mcp__")
+    ? "You have access to ContextForge's native repository intelligence tools via MCP."
+    : "You have access to ContextForge's native repository intelligence tools directly through this proxy.";
+  return CF_NOTICE_PREFIX + access + buildToolGuidance(prefix) + buildPatchGuidance(prefix);
+}
 
-/**
- * PC-3 (provider-cache audit): the bare-name variant of the CF rule for the
- * native Anthropic egress, where ContextForge appends its own tool
- * definitions (bare names — the Ghost Interceptor intercepts bare names,
- * and MCP sessions do not use the native egress path). Same single source
- * of truth as CF_RULE, with the MCP alias prefix removed.
- */
-export const CF_RULE_BARE = CF_RULE.replace(/mcp__contextforge__/g, "");
+// Keep exported constants for native egress and existing consumers. The
+// ingress injector chooses between them from the actual active session mode.
+const CF_RULE = buildContextForgeRule({ mcpSession: true });
+export const CF_RULE_BARE = buildContextForgeRule({ mcpSession: false });
+
+export function getContextForgeRule({ mcpSession = false, toolPrefix = undefined } = {}) {
+  if (toolPrefix !== undefined) {
+    return buildContextForgeRule({ mcpSession, toolPrefix });
+  }
+  return mcpSession ? CF_RULE : CF_RULE_BARE;
+}
 
 // ─────────────────────────────────────────────
 // injectContextForgeRule
 // ─────────────────────────────────────────────
 
-export function injectContextForgeRule(payload) {
+export function injectContextForgeRule(
+  payload,
+  { mcpSession = false, toolPrefix = undefined } = {}
+) {
   if (!payload.messages || !Array.isArray(payload.messages)) return payload;
+
+  const rule = getContextForgeRule({ mcpSession, toolPrefix });
+  const alternateRules = [CF_RULE, CF_RULE_BARE].filter((candidate) => candidate !== rule);
 
   for (let i = 0; i < payload.messages.length; i++) {
     const msg = payload.messages[i];
@@ -147,12 +162,27 @@ export function injectContextForgeRule(payload) {
     if (msg.role !== "system") continue;
     if (typeof msg.content !== "string") continue;
 
-    if (msg.content.includes(CF_SENTINEL)) return payload;
+    if (msg.content.includes(CF_SENTINEL)) {
+      // A conversation can cross a transport boundary (for example, a direct
+      // proxy call followed by an MCP-enabled client). Keep the one injected
+      // rule but align its tool names with the active tool namespace instead
+      // of preserving stale MCP aliases in a bare-tool session.
+      const alternateRule = alternateRules.find((candidate) => msg.content.includes(candidate));
+      if (alternateRule) {
+        const newMessages = [...payload.messages];
+        newMessages[i] = {
+          ...msg,
+          content: msg.content.replace(alternateRule, rule),
+        };
+        return { ...payload, messages: newMessages };
+      }
+      return payload;
+    }
 
     const newMessages = [...payload.messages];
     newMessages[i] = {
       ...msg,
-      content: msg.content + CF_RULE,
+      content: msg.content + rule,
     };
 
     return { ...payload, messages: newMessages };
@@ -160,7 +190,7 @@ export function injectContextForgeRule(payload) {
 
   return {
     ...payload,
-    messages: [{ role: "system", content: CF_RULE.trim() }, ...payload.messages],
+    messages: [{ role: "system", content: rule.trim() }, ...payload.messages],
   };
 }
 
