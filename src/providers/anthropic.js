@@ -15,9 +15,16 @@
  * PA-2 FIX: the compat endpoint authenticates with
  * Authorization: Bearer <key> (standard OpenAI SDK style), not x-api-key.
  *
- * ⚠ Documented limitation (Anthropic OpenAI-SDK-compat docs): prompt
- * caching is NOT supported on the compat endpoint. cache_control support
- * requires a native /v1/messages egress translator — post-v1 work.
+ * PC-3 (provider-cache audit): the compat endpoint does NOT support
+ * Anthropic's prompt caching — a Claude Code session behind ContextForge
+ * got zero cache hits while paying full input price every turn. Set
+ * CF_ANTHROPIC_NATIVE=1 to enable the native /v1/messages egress
+ * (see src/proxy/anthropicNative.js): the client's original system
+ * blocks and tools — including every cache_control breakpoint — are
+ * forwarded byte-verbatim, ContextForge appends its own rule/tools
+ * AFTER the client's marked prefix, and responses (including native
+ * usage with cache_read_input_tokens) pass through verbatim. The
+ * default stays compat so existing gateway setups are not broken.
  */
 
 export const AnthropicAdapter = {
@@ -54,6 +61,16 @@ export const AnthropicAdapter = {
     delete outgoing["content-length"];
     delete outgoing["accept-encoding"];
     delete outgoing["connection"];
+
+    // HA-1 (headroom analysis): never leak ContextForge's own proxy
+    // fingerprint headers upstream (x-cf-dry-run, x-cf-max-retries,
+    // x-cf-mock-port, x-contextforge-user-id, x-contextforge-workspace).
+    // Same bug class headroom documented in their own audit (P5-49/50/51:
+    // "X-Headroom-* request headers leak upstream") — provider-side
+    // fingerprinting of proxy traffic is a subscription-revocation risk.
+    for (const h of Object.keys(outgoing)) {
+      if (h.startsWith("x-cf-") || h.startsWith("x-contextforge-")) delete outgoing[h];
+    }
 
     return outgoing;
   },

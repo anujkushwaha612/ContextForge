@@ -26,6 +26,16 @@ export const OllamaAdapter = {
     delete outgoing["accept-encoding"];
     delete outgoing["connection"];
 
+    // HA-1 (headroom analysis): never leak ContextForge's own proxy
+    // fingerprint headers upstream (x-cf-dry-run, x-cf-max-retries,
+    // x-cf-mock-port, x-contextforge-user-id, x-contextforge-workspace).
+    // Same bug class headroom documented in their own audit (P5-49/50/51:
+    // "X-Headroom-* request headers leak upstream") — provider-side
+    // fingerprinting of proxy traffic is a subscription-revocation risk.
+    for (const h of Object.keys(outgoing)) {
+      if (h.startsWith("x-cf-") || h.startsWith("x-contextforge-")) delete outgoing[h];
+    }
+
     return outgoing;
   },
 
