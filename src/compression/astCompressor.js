@@ -1,6 +1,7 @@
 import { createRequire } from "module";
-import { saveToVault, lookupVaultByContent, fetchFromVault } from "../logging/cacheDb.js";
+import { saveToVault, lookupVaultByContent } from "../logging/cacheDb.js";
 import { isRecentToolResult } from "./compressionPolicy.js";
+import { passesTokenGate } from "./compressionHelper.js";
 
 const require = createRequire(import.meta.url);
 
@@ -193,6 +194,21 @@ export function compressCodeOutput(text, languageHint = "", policy = null, fileP
 
       const finalKept = compressionHeader + keptWithVaultId;
 
+      // A1 (headroom analysis): token-validation gate. The line-based
+      // reductionRatio check above can pass while the skeleton GROWS in
+      // tokens (minified/dense source: ~1 token per 2-3 chars vs the
+      // skeleton's prose header + kept lines at ~1 per 4-5). Never ship a
+      // replacement that is not strictly smaller in tokens. The vault row
+      // already exists (content-addressed, reused if a future turn
+      // compresses the same content), so falling back costs nothing.
+      if (!passesTokenGate(text, finalKept)) {
+        console.log(
+          `[AST Compressor] ⏭️ Token gate: skeleton ${text.length} chars → ` +
+            `${finalKept.length} chars would not reduce cl100k tokens — kept original`
+        );
+        return { kept: text, vaulted: false };
+      }
+
       console.log(
         `[AST Compressor] ✅ Compressed: ${result.originalLines} → ` +
           `${result.compressedLines} lines ` +
@@ -219,7 +235,17 @@ export function compressCodeOutput(text, languageHint = "", policy = null, fileP
   }
 
   console.warn("[AST Compressor] Using regex fallback — build native for best results");
-  return regexFallbackCompress(text);
+  const fallback = regexFallbackCompress(text);
+  // A1: same token gate as the native path — the fallback's own check is
+  // char-based (removedChars < 20%) and can still grow the block in tokens.
+  if (fallback.vaulted && !passesTokenGate(text, fallback.kept)) {
+    console.log(
+      `[AST Compressor] ⏭️ Token gate (fallback): ${text.length} chars → ` +
+        `${fallback.kept.length} chars would not reduce cl100k tokens — kept original`
+    );
+    return { kept: text, vaulted: false };
+  }
+  return fallback;
 }
 
 // BUG-8 FIX: Two setImmediate yields for large files to give the event loop
@@ -401,44 +427,14 @@ export async function compressCodeToolResults(payload) {
         continue;
       }
 
-      // BUG-10 FIX: Vault pre-check BEFORE line count guard.
-      // Short files that were previously compressed (e.g. a 25-line utility
-      // read multiple times) benefit from the O(1) vault lookup.
-      // Previously the line count guard fired first and skipped the lookup.
-      // In compressCodeToolResults, replace the lookupVaultByContent block:
-      const existingVaultId = lookupVaultByContent(msg.content);
-      if (existingVaultId) {
-        // ✅ Issue 1 FIX: Verify vault still exists before embedding its ID
-        // in a stub. The prune_vault row persists across server restarts but
-        // the session registry resets — a stub could reference a vault whose
-        // row was wiped by fullReset() or a DB migration.
-        const vaultStillExists = fetchFromVault(existingVaultId) !== null;
-        if (vaultStillExists) {
-          const fileRef = (msg._filename ?? "this file").replace(/\\/g, "/");
-          const stub =
-            `[CF_COMPRESSED_FILE vault_id:"${existingVaultId}"]\n` +
-            `⚠️  Previously compressed — content unchanged from prior turn.\n` +
-            `To read the full source: use tool call contextforge_retrieve with vault_id="${existingVaultId}".\n` +
-            `To explore without reading the full file:\n` +
-            `  - what_does_this_export("${fileRef}") — list all exports\n` +
-            `  - find_symbol("functionName") — get a specific function body directly\n`;
-
-          newMessages.push({
-            ...msg,
-            content: stub,
-            _compressedVaultId: existingVaultId,
-          });
-          stats.compressed++;
-          stats.vaults++;
-          stats.charsSaved += msg.content.length - stub.length;
-          continue;
-        }
-        // Vault gone — fall through to re-compress fresh
-        console.log(`[AST Compressor] ⚠️ Vault ${existingVaultId} missing — re-compressing`);
-      }
-
       // BUG-7 FIX: Session compression cache — skip tree-sitter if we've
       // already compressed this exact content this session.
+      //
+      // PA-3 FIX (pipeline audit): this check runs BEFORE the vault lookup.
+      // The session cache is an in-memory Map hit; lookupVaultByContent is
+      // a full SHA-256 over the content plus an indexed SQLite query. On a
+      // re-sent history (every turn of every session) the session cache
+      // already answers the question, so the expensive path is pure waste.
       const contentHash = quickHash(msg.content);
       const cachedCompression = SESSION_COMPRESS_CACHE.get(contentHash);
       if (cachedCompression) {
@@ -446,6 +442,52 @@ export async function compressCodeToolResults(payload) {
         stats.compressed++;
         stats.vaults++;
         stats.charsSaved += msg.content.length - cachedCompression.content.length;
+        continue;
+      }
+
+      // BUG-10 FIX: Vault pre-check BEFORE line count guard.
+      // Short files that were previously compressed (e.g. a 25-line utility
+      // read multiple times) benefit from the O(1) vault lookup.
+      // Previously the line count guard fired first and skipped the lookup.
+      const existingVaultId = lookupVaultByContent(msg.content);
+      if (existingVaultId) {
+        // PA-4 FIX (pipeline audit): the explicit fetchFromVault() existence
+        // re-check is removed. lookupVaultByContent() selects the row by
+        // content_hash — if it returned a vault_id, the prune_vault row
+        // exists RIGHT NOW. Both calls are synchronous better-sqlite3
+        // operations on the same connection with no await between them, so
+        // no interleaving (including fullReset) can delete the row in the
+        // gap. The old check paid for it a FULL TABLE READ of the stored
+        // text (potentially 100KB+) per code message per turn — measured
+        // waste with zero correctness value.
+        const fileRef = (msg._filename ?? "this file").replace(/\\/g, "/");
+        const stub =
+          `[CF_COMPRESSED_FILE vault_id:"${existingVaultId}"]\n` +
+          `⚠️  Previously compressed — content unchanged from prior turn.\n` +
+          `To read the full source: use tool call contextforge_retrieve with vault_id="${existingVaultId}".\n` +
+          `To explore without reading the full file:\n` +
+          `  - what_does_this_export("${fileRef}") — list all exports\n` +
+          `  - find_symbol("functionName") — get a specific function body directly\n`;
+
+        // A1: the vault pre-check intentionally runs BEFORE the minLines
+        // guard (BUG-10), so SHORT previously-vaulted files reach this
+        // stub — and for them the ~450-char stub can be LARGER than the
+        // original in tokens. The char-based comparison below used to be
+        // the only check; the token gate is what actually protects short
+        // blocks.
+        if (!passesTokenGate(msg.content, stub)) {
+          newMessages.push(msg);
+          continue;
+        }
+
+        newMessages.push({
+          ...msg,
+          content: stub,
+          _compressedVaultId: existingVaultId,
+        });
+        stats.compressed++;
+        stats.vaults++;
+        stats.charsSaved += msg.content.length - stub.length;
         continue;
       }
 

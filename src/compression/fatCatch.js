@@ -40,6 +40,7 @@
 import { saveToVault } from "../logging/cacheDb.js";
 import { isShellToolResult } from "./toolScrubber.js";
 import { isRecentToolResult } from "./compressionPolicy.js";
+import { passesTokenGate } from "./compressionHelper.js";
 
 // ─────────────────────────────────────────────
 // Junk classifiers (FC-1)
@@ -135,10 +136,18 @@ export function interceptAndVaultMassiveToolResults(payload, charThreshold = 150
     const junkKind = classifyJunk(content, msgType, filename);
     if (junkKind && content.length > junkThreshold) {
       const vaultId = saveToVault(content);
+      const stub = buildStub(content, vaultId, { kind: `${junkKind[0].toUpperCase()}${junkKind.slice(1)}`, filename });
+      // A1 (headroom analysis): token-validation gate — the threshold is
+      // char-based; the stub must actually be smaller in tokens before we
+      // replace (today always true at these thresholds, but the gate is
+      // what keeps that true if junkThreshold ever drops).
+      if (!passesTokenGate(content, stub)) {
+        return content;
+      }
       console.log(
         `[Fat Catch] 🗑️  ${junkKind} (${content.length} chars) → vaulted ${vaultId}`
       );
-      return buildStub(content, vaultId, { kind: `${junkKind[0].toUpperCase()}${junkKind.slice(1)}`, filename });
+      return stub;
     }
 
     // ── FC-3: age gate for legitimate content — never rip away something
@@ -157,11 +166,16 @@ export function interceptAndVaultMassiveToolResults(payload, charThreshold = 150
 
     if (content.length > threshold) {
       const vaultId = saveToVault(content);
+      const stub = buildStub(content, vaultId, { kind: "Oversized tool result", filename });
+      // A1: same token-validation gate as the junk path.
+      if (!passesTokenGate(content, stub)) {
+        return content;
+      }
       console.log(
         `[Fat Catch] 🕸️  Massive ${msgType || "unknown"} result (${content.length} chars) ` +
           `→ vaulted ${vaultId} [threshold=${threshold}]`
       );
-      return buildStub(content, vaultId, { kind: "Oversized tool result", filename });
+      return stub;
     }
 
     return content;

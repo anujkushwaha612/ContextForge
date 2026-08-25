@@ -283,27 +283,12 @@ export async function retrieveFromVault(
             return headerLine + text;
           }
 
-          // Fallback: use inline text from results if chunk DB missed
-          if (results.some((r) => r.text)) {
-            const fallbackPieces = results
-              .filter((r) => r.text)
-              .map(
-                (r, i) =>
-                  `[Chunk ${i + 1} (score: ${(r.combinedScore * 100).toFixed(0)}%)]\n${r.text}`
-              );
-            if (fallbackPieces.length > 0) {
-              console.log(
-                `[Hybrid RAG] ⚡ Tier 1b: ${fallbackPieces.length} HNSW text snippets`
-              );
-              const text = fallbackPieces.join("\n" + "=".repeat(50) + "\n");
-              statsEmitter.recordCacheHit("ragRetrieval", true);
-              statsEmitter.recordVaultRetrieval(
-                vaultId ?? "hybrid_search_inline",
-                text.length
-              );
-              return text;
-            }
-          }
+          // PA-8 FIX (pipeline audit): removed the old "Tier 1b inline text"
+          // fallback — it tested `results.some((r) => r.text)`, but the C++
+          // HybridSearch only ever returns {id, combinedScore, denseScore,
+          // sparseScore} (no text field), so the branch was unreachable dead
+          // code. Chunk text always comes from vault_chunks via
+          // fetchChunksByIds.
         } else {
           statsEmitter.recordCacheHit("ragRetrieval", false);
         }

@@ -135,6 +135,52 @@ export function countTokens(payload) {
 }
 
 // ─────────────────────────────────────────────
+// countStringTokens — raw string token count (no per-message overhead)
+//
+// A1 (headroom analysis): the primitive behind passesTokenGate(). Char and
+// line counts are cheap but can LIE about token size: 200 chars of
+// minified JS (~1 token per 2-3 chars) can be MORE tokens than a 300-char
+// prose stub (~1 token per 4-5 chars), and dense-unicode content inverts
+// it the other way. Any stage that replaces content must be gated on THIS
+// counter, not on .length or line counts.
+// ─────────────────────────────────────────────
+
+export function countStringTokens(text) {
+  if (typeof text !== "string" || text.length === 0) return 0;
+  return getEncoder().encode(text).length;
+}
+
+// ─────────────────────────────────────────────
+// passesTokenGate — the token-validation gate (A1)
+//
+// Headroom gates every compression with a real tokenizer and falls back to
+// the original when compressed.tokens >= original.tokens (their Phase B
+// PR-B4 invariant). ContextForge historically gated on chars/lines (AST
+// "reduction < 20%", jsonCrush "save >= 30% of chars", dedup/prune/fatCatch
+// stub length) — a char-cheeky replacement can still GROW the payload in
+// tokens, and the model pays for that.
+//
+// Contract: a replacement is accepted only when it is STRICTLY smaller in
+// cl100k tokens than the original. Equality is not a win (we add markers,
+// vault IDs and stage overhead without saving anything), so equality falls
+// back to the original.
+//
+// Both sides are counted as bare strings — same tokenizer, same domain, no
+// per-message overhead constants — so the comparison is exact.
+//
+// @param {string} originalText  the content as received
+// @param {string} replacedText  the proposed replacement
+// @returns {boolean} true when replacedText may replace originalText
+// ─────────────────────────────────────────────
+
+export function passesTokenGate(originalText, replacedText) {
+  if (typeof originalText !== "string" || typeof replacedText !== "string") {
+    return false;
+  }
+  return countStringTokens(replacedText) < countStringTokens(originalText);
+}
+
+// ─────────────────────────────────────────────
 // countMessageTokens — single message
 //
 // Caches result on the message object as a non-enumerable property.

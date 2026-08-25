@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { passesTokenGate } from "../compression/compressionHelper.js";
 
 // ========================================================
 // 1. INBOUND TRANSLATION: Anthropic JSON -> OpenAI JSON
@@ -604,6 +605,16 @@ export function minimizeToolSchemas(payload) {
       newFn.description = truncateSemantic(newFn.description, MAX_TOOL_DESCRIPTION_CHARS);
     }
     if (newFn.parameters) minimizeSchema(newFn.parameters, isProtected);
+
+    // A1 (headroom analysis): token-validation gate, per tool. Truncation
+    // adds a " …" ellipsis and enum caps append an explanatory sentence —
+    // on a short description the "minimized" schema can be LARGER in
+    // tokens than the original. Char-length was never compared here at
+    // all; never ship a tool schema the gate rejects (also keeps
+    // protected/unchanged tools returning the original object).
+    if (!passesTokenGate(JSON.stringify(fn), JSON.stringify(newFn))) {
+      return tool;
+    }
 
     const result = { type: "function", function: newFn };
     _toolSchemaCacheMap.set(key, result);

@@ -100,7 +100,6 @@ function _getState(clientName) {
     _clientState.set(clientName, {
       lastStaticHash: null,
       lastStaticTokens: 0,
-      lastStaticPrefix: "", // FIX 2: Track old prefix for diagnostic logging
       consecutiveHits: 0,
       totalAlignments: 0,
       totalHits: 0, // FIX 3: Track total hits separately for accurate hit rate
@@ -334,7 +333,10 @@ export function alignCachePrefix(payload, clientName = "anthropic") {
     state.consecutiveHits = 1;
     state.lastStaticHash = staticHash;
     state.lastStaticTokens = Math.round(staticPrefix.length / 4);
-    state.lastStaticPrefix = staticPrefix; // FIX 2: Store new prefix for future comparisons
+    // PA-7 FIX (pipeline audit): lastStaticPrefix assignment removed. The
+    // full static prefix string (kilobytes, system-prompt sized) was stored
+    // on every change but NEVER READ — pure memory retention with no
+    // consumer. The hash (lastStaticHash) is what all comparisons use.
   }
 
   // ── Step 6: Assemble aligned messages ──

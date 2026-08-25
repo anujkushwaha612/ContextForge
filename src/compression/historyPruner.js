@@ -37,6 +37,8 @@
  *   - Short results under 500 chars (not worth pruning)
  */
 
+import { passesTokenGate } from "./compressionHelper.js";
+
 const PRUNE_THRESHOLD_CHARS = 500;
 
 const PRUNE_STUB =
@@ -241,6 +243,14 @@ export function pruneStaleToolResults(payload) {
     }
 
     // ── Prune this message ────────────────────────────────────────────────
+    // A1 (headroom analysis): token-validation gate. The 500-char floor
+    // above usually guarantees the ~200-char stub wins, but the stub can
+    // still grow a short/dense retrieve result in tokens; char length was
+    // the only comparison before.
+    if (!passesTokenGate(msg.content, PRUNE_STUB)) {
+      newMessages.push(msg);
+      continue;
+    }
     const originalLen = msg.content.length;
     charsSaved += originalLen - PRUNE_STUB.length;
     prunedCount++;

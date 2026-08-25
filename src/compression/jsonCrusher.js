@@ -37,6 +37,7 @@
 import { saveToVault } from "../logging/cacheDb.js";
 import { isRecentToolResult } from "./compressionPolicy.js";
 import { isShellToolResult } from "./toolScrubber.js";
+import { passesTokenGate } from "./compressionHelper.js";
 
 // ─────────────────────────────────────────────
 // Tunables
@@ -372,6 +373,14 @@ export function crushJsonContent(content, queryTerms) {
   // Not worth it → leave original untouched (and the vault entry is
   // content-hash-dedup'd, so an unused save costs one idempotent row).
   if (savedChars < MIN_SAVINGS_CHARS || savedChars / content.length < MIN_SAVINGS_RATIO) {
+    return null;
+  }
+
+  // A1 (headroom analysis): token-validation gate. The char-ratio check
+  // above can pass while the JSON re-serialization GROWS the block in
+  // tokens (compact source with long numeric/string literals vs the
+  // dropped-items note + JSON re-encoding overhead). Never ship that.
+  if (!passesTokenGate(content, crushed)) {
     return null;
   }
 

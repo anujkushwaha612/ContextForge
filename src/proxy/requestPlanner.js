@@ -513,7 +513,20 @@ async function semanticLookup(message) {
       new Promise((_, reject) => setTimeout(() => reject(new Error("embed timeout")), 2000)),
     ]);
 
-    const hits = _plannerCache.searchK(queryVec, 5);
+    // PA-6 FIX (pipeline audit): the planner anchors share this HNSW index
+    // with the RAG document stream — upstreamRequest.js inserts an IDX_*
+    // vector for EVERY final assistant response (≥50 tokens) into the same
+    // SemanticCache via hybridRetriever.addDocumentWithEmbedding(). The old
+    // searchK(5) took only the 5 globally-nearest vectors and then filtered
+    // to namespace === "PLANNER": after a handful of hops, the assistant's
+    // own responses (topically the closest text to the user's message)
+    // occupied all 5 slots, plannerHits was empty, and the semantic intent
+    // fallback silently degraded to pure regex for the rest of the session.
+    // Widening the candidate pool to 64 keeps anchors in view; the HNSW
+    // search cost is still O(log n) and negligible next to the embed call
+    // above it. (The structural fix — a separate index for RAG docs — is
+    // documented in the pipeline audit report.)
+    const hits = _plannerCache.searchK(queryVec, 64);
     if (!hits || hits.length === 0) return null;
 
     const plannerHits = hits.filter((h) => h.namespace === "PLANNER");

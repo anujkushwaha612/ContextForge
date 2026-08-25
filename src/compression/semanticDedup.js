@@ -49,9 +49,10 @@
 
 import { createRequire } from "module";
 import path from "path";
-import { saveToVault, fetchFromVault } from "../logging/cacheDb.js";
+import { saveToVault } from "../logging/cacheDb.js";
 import { statsEmitter } from "../proxy/statsEmitter.js";
 import { isRecentToolResult, looksLikeStub } from "./compressionPolicy.js";
+import { passesTokenGate } from "./compressionHelper.js";
 
 const require = createRequire(import.meta.url);
 let native;
@@ -671,21 +672,59 @@ export async function applySemanticDedup(payload) {
     return false;
   }
 
+  // ── F2 pre-pass: locate the NEWEST occurrence of each dedup key ─────────
+  // (iterating forward and overwriting leaves the last occurrence in the map)
+  //
+  // PA-5 FIX (pipeline audit): each key's newest copy is hashed, fingerprinted
+  // AND registered EXACTLY ONCE, here. The old code deferred registration to
+  // the main loop and — worse — recomputed fnv1a64(newest.content) and
+  // computeFingerprint(newest.content) inside dedupKeepNewest() for EVERY
+  // older duplicate of the key. A file read 8 times in history meant 8 full
+  // FNV passes + 8 native SimHash passes over the same newest content per
+  // request (O(occurrences × contentSize)), plus a saveToVault (full SHA-256
+  // + SQLite round-trip) per exact duplicate even though the newest copy's
+  // vault already holds byte-identical content. All of that is now O(1) per
+  // key: the pre-pass result carries {contentHash, fingerprint, vaultId}.
   const newestByKey = new Map();
   for (let mi = 0; mi < payload.messages.length; mi++) {
     const m = payload.messages[mi];
     if (m.role === "tool" && typeof m.content === "string" && isDedupableType(m)) {
       const k = buildMessageKey(m);
-      if (k) newestByKey.set(k, { mi, bi: -1, content: m.content });
+      if (k) newestByKey.set(k, { mi, bi: -1, msg: m });
     } else if (m.role === "user" && Array.isArray(m.content)) {
       for (let bi = 0; bi < m.content.length; bi++) {
         const b = m.content[bi];
         if (b?.type === "tool_result" && typeof b.content === "string" && isDedupableType(b)) {
           const k = buildMessageKey(b);
-          if (k) newestByKey.set(k, { mi, bi, content: b.content });
+          if (k) newestByKey.set(k, { mi, bi, msg: b });
         }
       }
     }
+  }
+
+  // Register each newest copy once (vault reuse + cross-request registry).
+  for (const [key, entry] of newestByKey) {
+    const content = entry.msg.content;
+    const contentHash = fnv1a64(content);
+    const existing = sessionRegistry.get(key);
+    if (existing && existing.contentHash === contentHash) {
+      // Unchanged since the previous turn — reuse its vault + fingerprint.
+      entry.contentHash = contentHash;
+      entry.vaultId = existing.vaultId;
+      entry.fingerprint = existing.fingerprint;
+      continue;
+    }
+    const vaultId = saveToVault(content); // content-hash dedup inside
+    const fingerprint =
+      content.length >= MIN_NEARDUP_DEDUP_CHARS ? computeFingerprint(content) : null;
+    sessionRegistry.set(key, { fingerprint, contentHash, vaultId, contentLength: content.length });
+    entry.contentHash = contentHash;
+    entry.vaultId = vaultId;
+    entry.fingerprint = fingerprint;
+    console.log(
+      `[SemanticDedup] 📝 Registered: ${key} ` +
+        `(${Math.round(content.length / 4)} tokens → vault ${vaultId})`
+    );
   }
 
   /**
@@ -696,28 +735,13 @@ export async function applySemanticDedup(payload) {
    *   - F3: if the newest copy is itself a stub, nothing dedups against it
    *   - older occurrences stub only on exact/near match with the newest
    */
-  async function dedupKeepNewest(msg, key, msgIndex, blockIndex = -1) {
+  function dedupKeepNewest(msg, key, msgIndex, blockIndex = -1) {
     const newest = newestByKey.get(key);
     const isNewest = newest && newest.mi === msgIndex && newest.bi === blockIndex;
 
-    // Register the newest copy in the session registry (vault reuse + stats).
+    // PA-5: newest copies are already registered in the pre-pass — nothing
+    // to do here anymore.
     if (isNewest) {
-      const existing = sessionRegistry.get(key);
-      const contentHash = fnv1a64(msg.content);
-      if (!existing || existing.contentHash !== contentHash) {
-        const vaultId = saveToVault(msg.content); // content-hash dedup inside
-        sessionRegistry.set(key, {
-          fingerprint:
-            msg.content.length >= MIN_NEARDUP_DEDUP_CHARS ? computeFingerprint(msg.content) : null,
-          contentHash,
-          vaultId,
-          contentLength: msg.content.length,
-        });
-        console.log(
-          `[SemanticDedup] 📝 Registered: ${key} ` +
-            `(${Math.round(msg.content.length / 4)} tokens → vault ${sessionRegistry.get(key).vaultId})`
-        );
-      }
       return { deduplicated: false, msg };
     }
 
@@ -727,7 +751,7 @@ export async function applySemanticDedup(payload) {
     }
 
     // F3: never dedup toward a stub — the pointer would dangle.
-    if (!newest || looksLikeStub(newest.content)) {
+    if (!newest || looksLikeStub(newest.msg.content)) {
       return { deduplicated: false, msg };
     }
 
@@ -737,17 +761,32 @@ export async function applySemanticDedup(payload) {
     }
 
     // Exact match with the newest copy → stub this older one.
-    if (fnv1a64(content) === fnv1a64(newest.content)) {
-      const vaultId = saveToVault(content);
+    // PA-5: the newest hash was precomputed in the pre-pass; and the vault
+    // for byte-identical content is the newest copy's vault — no need to
+    // re-run saveToVault() (full SHA-256 + DB query) to discover the same id.
+    if (fnv1a64(content) === newest.contentHash) {
+      const vaultId = newest.vaultId;
+      const stub =
+        `[CF_VAULT:${vaultId}] (identical to the current copy of this file ` +
+        `shown later in this conversation, ~${Math.round(content.length / 4)} tokens)`;
+      // A1 (headroom analysis): the exact-dup path accepts content from
+      // MIN_EXACT_DEDUP_CHARS (100) — for those, this ~180-char stub can be
+      // LARGER than the original in tokens. Char length was never compared
+      // here at all; the token gate is the only real protection.
+      if (!passesTokenGate(content, stub)) {
+        console.log(
+          `[SemanticDedup] ⏭️ Token gate: ${content.length}-char copy would be replaced ` +
+            `by a ${stub.length}-char stub that is NOT smaller in cl100k tokens — kept original`
+        );
+        return { deduplicated: false, msg };
+      }
       statsEmitter.recordCacheHit("semanticDedup", true);
       return {
         deduplicated: true,
         msg: {
           ...msg,
           _cf_deduped: true,
-          content:
-            `[CF_VAULT:${vaultId}] (identical to the current copy of this file ` +
-            `shown later in this conversation, ~${Math.round(content.length / 4)} tokens)`,
+          content: stub,
           _dedupVaultId: vaultId,
           _dedupSimilarity: 100,
         },
@@ -756,12 +795,14 @@ export async function applySemanticDedup(payload) {
 
     // Near-dup with the newest copy → stub; the newest (still full) is the
     // authoritative version, so pointing at it is always safe.
+    // PA-5: only the CURRENT occurrence is fingerprinted now — the newest
+    // copy's fingerprint came from the pre-pass.
     if (
       content.length >= MIN_NEARDUP_DEDUP_CHARS &&
-      newest.content.length >= MIN_NEARDUP_DEDUP_CHARS
+      newest.msg.content.length >= MIN_NEARDUP_DEDUP_CHARS
     ) {
       const fp = computeFingerprint(content);
-      const newestFp = computeFingerprint(newest.content);
+      const newestFp = newest.fingerprint;
       if (fp !== null && newestFp !== null) {
         const distance = fingerprintDistance(fp, newestFp);
         const threshold = getDynamicThreshold({ contentLength: content.length });
@@ -772,6 +813,15 @@ export async function applySemanticDedup(payload) {
         if (distance <= threshold) {
           const similarityPct = Math.round(((64 - distance) / 64) * 100);
           const vaultId = saveToVault(content);
+          const stub =
+            `[CF_VAULT:${vaultId}] (outdated copy — ${similarityPct}% similar to the ` +
+            `current version of this file shown later in this conversation)`;
+          // A1: near-dup requires >= 500 chars so the stub is normally
+          // smaller, but gate on tokens anyway — the vault row is
+          // content-addressed and stays useful if we keep the original.
+          if (!passesTokenGate(content, stub)) {
+            return { deduplicated: false, msg };
+          }
           console.log(
             `[SemanticDedup] 🎯 Superseded: ${key} ` +
               `(older copy, ${similarityPct}% similar to the current version below)`
@@ -782,9 +832,7 @@ export async function applySemanticDedup(payload) {
             msg: {
               ...msg,
               _cf_deduped: true,
-              content:
-                `[CF_VAULT:${vaultId}] (outdated copy — ${similarityPct}% similar to the ` +
-                `current version of this file shown later in this conversation)`,
+              content: stub,
               _dedupVaultId: vaultId,
               _dedupSimilarity: similarityPct,
             },
