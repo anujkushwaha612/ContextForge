@@ -75,7 +75,8 @@ test-*
 # benchmarks/fixtures/prompts/
 # benchmarks/fixtures/sessions/
 # benchmarks/results/
-tests/
+tests/*
+!tests/cache-audit/
 benchmarks/
 
 

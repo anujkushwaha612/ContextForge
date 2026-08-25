@@ -44,6 +44,7 @@ import http from "node:http";
 import https from "node:https";
 import path from "node:path";
 import crypto from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -52,7 +53,7 @@ import { statsEmitter } from "./statsEmitter.js";
 import { countTokens } from "../compression/compressionHelper.js";
 import { interceptAndVaultMassiveToolResults } from "../compression/fatCatch.js";
 import { retrieveFromVault } from "../vaultRetriever.js";
-import { recordCCRSuccess } from "../ccr/index.js";
+import { recordCCRSuccess, SessionRegistry } from "../ccr/index.js";
 import {
   isGraphToolCall,
   executeGraphQuery,
@@ -748,6 +749,47 @@ function computeNextRetry(result, retryCount, maxRetries = MAX_GHOST_RETRIES) {
   return retryCount;
 }
 
+import {
+  isNativeAnthropicEgress,
+  buildNativeBody,
+  buildNativeHeaders,
+  NATIVE_PATH,
+  NativeSSEAssembler,
+  nativeMessageToInternal,
+} from "./anthropicNative.js";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A2.3 (headroom analysis): prompt_cache_key for OpenAI-wire upstreams
+//
+// OpenAI's automatic prompt caching is keyed per (route, prompt_cache_key):
+// a stable key per session lets consecutive turns of the same session hit
+// the same cache bucket instead of a rolling best-effort match. We derive
+// the key from SessionRegistry.deriveSessionId — the same stable-text hash
+// (first real user message, system-reminders stripped) that scopes the CCR
+// session, so it is constant for the whole session and changes only when
+// the conversation truly starts over.
+//
+// Injected only for providers that speak the OpenAI wire format (openai,
+// and the anthropic provider's OpenAI-compat endpoint). Ollama/Gemini don't
+// consume the field; leaving it out keeps their payloads minimal.
+//
+// The field is stable across ghost hops (same payload object, same key) and
+// is invisible to countTokens (which counts system/messages/tools only), so
+// it adds ~25 stable bytes to the wire without skewing the savings math.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PROMPT_CACHE_KEY_PROVIDERS = new Set(["openai", "anthropic"]);
+
+function derivePromptCacheKey(payload) {
+  const messages = payload?.messages;
+  // deriveSessionId falls back to a RANDOM id when no user message exists —
+  // a per-request random key would defeat the cache, so skip in that case.
+  if (!Array.isArray(messages) || !messages.some((m) => m.role === "user")) {
+    return null;
+  }
+  return `cf-${SessionRegistry.deriveSessionId(payload)}`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Usage normalizer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -774,6 +816,101 @@ function normalizeUsage(rawUsage) {
   }
 
   return { input: 0, cacheRead: 0, output: 0 };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// G-2/G-3: tool-call argument repair + interceptability
+//
+// Safety net for upstreams that stream parallel tool calls in a way the
+// assembler can't disambiguate (G-1 handles the common Ollama pattern at
+// assembly time; these guards cover whatever slips through). A tool call
+// whose arguments are N concatenated JSON objects is split back into N
+// calls; anything unrepairable is NOT intercepted and NOT appended to
+// history — appending a corrupted tool call to the assistant message makes
+// the next upstream hop 400 with "invalid tool call arguments" (observed
+// dead loop), while passing the stream through lets the model see the
+// failed call on its next turn and redo it cleanly.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Split a string into its top-level {...} JSON object segments. */
+function splitTopLevelJsonObjects(str) {
+  const parts = [];
+  let depth = 0;
+  let start = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === "}") {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        parts.push(str.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return parts;
+}
+
+function callArgumentsParse(tc) {
+  try { JSON.parse(tc.arguments || "{}"); return true; } catch { return false; }
+}
+
+/** G-3: every call must have parseable arguments before we intercept. */
+function allCallsInterceptable(calls) {
+  return calls.length > 0 && calls.every((tc) => callArgumentsParse(tc));
+}
+
+/**
+ * G-2: split tool calls whose assembled arguments are a concatenation of
+ * multiple top-level JSON objects (parallel calls merged by the upstream).
+ * The name may have been concatenated the same way (base name × N).
+ * Returns a new array; unrepairable calls pass through unchanged.
+ */
+function repairMergedToolCalls(calls) {
+  const out = [];
+  for (const tc of calls) {
+    if (callArgumentsParse(tc)) {
+      out.push(tc);
+      continue;
+    }
+    const segments = splitTopLevelJsonObjects(tc.arguments || "");
+    const allValid =
+      segments.length >= 2 && segments.every((s) => { try { JSON.parse(s); return true; } catch { return false; } });
+    if (allValid) {
+      const n = segments.length;
+      let base = tc.name;
+      if (tc.name && tc.name.length % n === 0) {
+        const cand = tc.name.slice(0, tc.name.length / n);
+        if (cand.repeat(n) === tc.name) base = cand;
+      }
+      for (let i = 0; i < n; i++) {
+        out.push({
+          ...tc,
+          id: tc.id ? (n === 1 ? tc.id : `${tc.id}_${i + 1}`) : `call_cf_split_${i}`,
+          name: base,
+          arguments: segments[i],
+        });
+      }
+      console.warn(
+        `[Ghost Interceptor] 🔧 Repaired merged tool call "${tc.name}" → ${n} parallel calls ` +
+          `(upstream streamed them without index/id)`
+      );
+      continue;
+    }
+    out.push(tc); // unrepairable — caller must NOT intercept
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -886,12 +1023,67 @@ export function createUpstreamHandler(ctx) {
         console.log("\n[Wire Inspector] Transmitting payload...");
       }
 
-      const outboundBody = JSON.stringify(currentPayload);
-      const outboundHeaders = provider.transformHeaders(req.headers);
-      outboundHeaders["content-length"] = Buffer.byteLength(outboundBody);
+      // PC-3: native Anthropic egress — the client's original system/tools
+      // (with their cache_control markers) are forwarded verbatim and our
+      // additions are appended after them, so Anthropic's prompt caching is
+      // preserved instead of destroyed. Off by default (CF_ANTHROPIC_NATIVE=1).
+      // Requires: the client's original body captured by the caller (ctx).
+      const nativeMode =
+        Boolean(ctx.clientOriginalBody) &&
+        isNativeAnthropicEgress({
+          providerName: provider.name,
+          clientAdapterName: clientAdapter.name,
+        });
 
-      const outboundPath =
-        typeof provider.transformPath === "function" ? provider.transformPath(req.url) : req.url;
+      // A2.3: stable per-session prompt_cache_key (OpenAI-wire providers).
+      // Idempotent — ghost hops reuse the same payload object and key.
+      // A client-sent key is always preserved (the !check above); we only
+      // fill in when absent.
+      //
+      // PC-2 (provider-cache audit): prompt_cache_retention. OpenAI's
+      // default cache retention is ~5-10 min idle; "24h" (long retention)
+      // is available for workloads with long gaps between turns. A
+      // client-sent value is preserved; otherwise CF_PROMPT_CACHE_RETENTION
+      // opts in for the whole proxy ("5m" | "24h").
+      // OpenAI-wire only — the native Anthropic body carries none of these
+      // (it keys caching on cache_control markers, not prompt_cache_key).
+      if (PROMPT_CACHE_KEY_PROVIDERS.has(provider.name) && !nativeMode) {
+        if (!currentPayload.prompt_cache_key) {
+          const key = derivePromptCacheKey(currentPayload);
+          if (key) currentPayload.prompt_cache_key = key;
+        }
+        if (
+          !currentPayload.prompt_cache_retention &&
+          (process.env.CF_PROMPT_CACHE_RETENTION === "5m" ||
+            process.env.CF_PROMPT_CACHE_RETENTION === "24h")
+        ) {
+          currentPayload.prompt_cache_retention = process.env.CF_PROMPT_CACHE_RETENTION;
+        }
+      }
+
+      // PC-3: native vs OpenAI-wire request construction (nativeMode is
+      // declared above, before the prompt_cache_key block that reads it).
+      let outboundBody;
+      let outboundHeaders;
+      let outboundPath;
+      if (nativeMode) {
+        outboundBody = JSON.stringify(
+          buildNativeBody({
+            clientOriginal: ctx.clientOriginalBody,
+            internalPayload: currentPayload,
+          })
+        );
+        outboundHeaders = buildNativeHeaders(req.headers);
+        outboundPath = NATIVE_PATH;
+      } else {
+        outboundBody = JSON.stringify(currentPayload);
+        outboundHeaders = provider.transformHeaders(req.headers);
+        outboundPath =
+          typeof provider.transformPath === "function"
+            ? provider.transformPath(req.url)
+            : req.url;
+      }
+      outboundHeaders["content-length"] = Buffer.byteLength(outboundBody);
 
       const targetPort = ctx.mockUpstreamPort || provider.port;
       const targetHost = ctx.mockUpstreamPort ? "127.0.0.1" : provider.hostname;
@@ -917,6 +1109,22 @@ export function createUpstreamHandler(ctx) {
         let sseBuffer = "";
         const responseChunks = [];
 
+        // PC-3: native egress streaming state. Raw chunks are held verbatim
+        // (byte-exact passthrough on flush); the assembler sees the decoded
+        // lines so the Ghost Interceptor can detect background tool_use.
+        // Forwarding unlocks as soon as it is provably safe (a text block
+        // started and no tool block has been seen yet); once any tool_use
+        // block starts, everything is held until message_stop (same
+        // hold-until-classification design as the OpenAI path).
+        const nativeAssembler = nativeMode ? new NativeSSEAssembler() : null;
+        if (nativeAssembler) {
+          nativeAssembler.backgroundChecker = (name) =>
+            interceptor.isBackgroundTool(name);
+        }
+        const nativeHeld = nativeMode ? [] : null;
+        let nativeForwarding = false;
+        let nativeSawToolBlock = false;
+
         let toolState = {
           inToolCall: false,
           inTextBlock: false,
@@ -935,32 +1143,18 @@ export function createUpstreamHandler(ctx) {
         let isStandardToolStream = false;
         let sseLineBuffer = "";
 
-        proxyRes.on("data", (chunk) => {
-          responseChunks.push(chunk);
+        // S-1: stateful UTF-8 decoder for the SSE byte stream. The old
+        // chunk.toString("utf-8") decoded each TCP chunk independently: a
+        // multi-byte character (CJK, emoji) split across a chunk boundary
+        // became U+FFFD, the affected data line's JSON.parse failed, and
+        // that delta was silently dropped. StringDecoder carries partial
+        // sequences across chunks.
+        const sseDecoder = new StringDecoder("utf-8");
 
-          if (proxyRes.statusCode >= 400) {
-            console.error(`\n[Upstream Error ${proxyRes.statusCode}] ->`, chunk.toString("utf-8"));
-          }
-
-          if (!isStreamRequest) return;
-
-          const rawSseText = chunk.toString("utf-8");
-          sseBuffer += rawSseText;
-
-          if (clientAdapter.name === "openai") {
-            if (!res.headersSent) res.writeHead(proxyRes.statusCode, proxyRes.headers);
-            res.write(chunk);
-            return;
-          }
-
-          sseLineBuffer += rawSseText;
-          const lines = sseLineBuffer.split("\n");
-          sseLineBuffer = lines.pop() ?? "";
-
-          for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
+          const processSSELine = (line) => {
+            if (!line.startsWith("data: ")) return;
             let openAiData = line.substring(6).trim();
-            if (!openAiData) continue;
+            if (!openAiData) return;
 
             try {
               if (openAiData !== "[DONE]") {
@@ -987,6 +1181,26 @@ export function createUpstreamHandler(ctx) {
                     } else if (tc.id) {
                       const existingIdx = toolCalls.findIndex((t) => t?.id === tc.id);
                       idx = existingIdx !== -1 ? existingIdx : toolCalls.length;
+                    } else if (tc.function?.name) {
+                      // G-1 FIX: a NAME arrives without index and without id.
+                      // If the last call is already COMPLETE (its arguments
+                      // parse as JSON), this delta must start a NEW parallel
+                      // call — upstreams (observed with Ollama) stream the
+                      // 2nd+ parallel tool call without index/id, and the old
+                      // fallback (toolCalls.length - 1) MERGED it into the
+                      // last call: name doubled
+                      // ("contextforge_query_graphcontextforge_query_graph"),
+                      // arguments concatenated (two JSON objects) →
+                      // unparseable, and the corrupted call was then appended
+                      // to history, making the next hop 400 with "invalid
+                      // tool call arguments" (dead loop). Otherwise treat it
+                      // as a name fragment of the in-progress last call.
+                      const last = toolCalls[toolCalls.length - 1];
+                      let lastComplete = false;
+                      if (last && last.arguments) {
+                        try { JSON.parse(last.arguments); lastComplete = true; } catch { /* in progress */ }
+                      }
+                      idx = lastComplete ? toolCalls.length : Math.max(0, toolCalls.length - 1);
                     } else {
                       idx = Math.max(0, toolCalls.length - 1);
                     }
@@ -1045,7 +1259,7 @@ export function createUpstreamHandler(ctx) {
                     isFirstChunk = false;
                     heldEvents.push(...translatedEvents);
                   }
-                  continue;
+                  return;
                 }
               }
             }
@@ -1057,11 +1271,93 @@ export function createUpstreamHandler(ctx) {
               isFirstChunk = false;
               for (const event of translatedEvents) res.write(event);
             }
+          };
+
+
+        proxyRes.on("data", (chunk) => {
+          responseChunks.push(chunk);
+
+          if (proxyRes.statusCode >= 400) {
+            console.error(`\n[Upstream Error ${proxyRes.statusCode}] ->`, chunk.toString("utf-8"));
           }
+
+          if (!isStreamRequest) return;
+
+          const rawSseText = sseDecoder.write(chunk);
+          sseBuffer += rawSseText;
+
+          // PC-3: native Anthropic streaming — hold raw bytes verbatim,
+          // feed the assembler, and forward live once provably safe.
+          if (nativeMode) {
+            const prevToolBlocks = nativeAssembler.toolBlocksSeen;
+            sseLineBuffer += rawSseText;
+            const nativeLines = sseLineBuffer.split("\n");
+            sseLineBuffer = nativeLines.pop() ?? "";
+            for (const line of nativeLines) nativeAssembler.processLine(line);
+            if (nativeAssembler.toolBlocksSeen > prevToolBlocks) nativeSawToolBlock = true;
+
+            if (nativeForwarding) {
+              if (!res.headersSent) res.writeHead(proxyRes.statusCode, proxyRes.headers);
+              res.write(chunk);
+            } else {
+              nativeHeld.push(chunk);
+              // Unlock: a content block has started, no tool block seen
+              // yet, and no background tool was flagged. Text-only and
+              // client-native-tool responses stream live from here;
+              // background-tool responses stay held for interception.
+              if (
+                nativeAssembler.sawAnyBlock &&
+                !nativeSawToolBlock &&
+                !nativeAssembler.hadBackgroundTool
+              ) {
+                nativeForwarding = true;
+                if (!res.headersSent) res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                for (const b of nativeHeld) res.write(b);
+                nativeHeld.length = 0;
+              }
+            }
+            return;
+          }
+
+          if (clientAdapter.name === "openai") {
+            if (!res.headersSent) res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            res.write(chunk);
+            return;
+          }
+
+          sseLineBuffer += rawSseText;
+          const lines = sseLineBuffer.split("\n");
+          sseLineBuffer = lines.pop() ?? "";
+
+
+          for (const line of lines) processSSELine(line);
         });
 
         proxyRes.on("end", async () => {
           const hopEndTime = performance.now();
+
+          // S-2: end of stream — flush bytes still held by the UTF-8
+          // decoder and process the final SSE line even when it arrived
+          // without a trailing newline. Previously that line stayed in
+          // sseLineBuffer and was silently dropped (a truncated final
+          // tool-call argument delta loses its tail). A malformed tail
+          // must never break the end path — G-3 guards history.
+          try {
+            const tail = sseDecoder.end();
+            if (tail) {
+              sseBuffer += tail;
+              sseLineBuffer += tail;
+            }
+            if (sseLineBuffer) {
+              const finalLines = sseLineBuffer.split("\n");
+              sseLineBuffer = "";
+              if (nativeMode) {
+                for (const line of finalLines) nativeAssembler.processLine(line);
+              } else {
+                for (const line of finalLines) processSSELine(line);
+              }
+            }
+          } catch { /* ignored — see comment above */ }
 
           try {
             if (proxyRes.statusCode >= 400) {
@@ -1070,6 +1366,68 @@ export function createUpstreamHandler(ctx) {
                 `\n[Upstream Error] Upstream rejected request (HTTP ${proxyRes.statusCode}):`
               );
               console.error(fullResponseBuf.toString("utf-8"));
+
+              // PC-3: native egress — the error body is already in native
+              // Anthropic error format ({"type":"error","error":{...}}),
+              // which the Anthropic client speaks natively. Forward it
+              // verbatim with its status; no reformatting.
+              if (nativeMode) {
+                if (!res.headersSent) {
+                  res.writeHead(proxyRes.statusCode, {
+                    "Content-Type": "application/json",
+                  });
+                }
+                res.end(fullResponseBuf);
+                resolve({ hopEndTime, ...acc });
+                return;
+              }
+
+              // G-4 FIX: a STREAMING client (Claude Code) expects an SSE
+              // stream. Forwarding the raw JSON error body made Claude Code
+              // report "Streaming response ended before any complete data
+              // was received. Retrying without streaming." — and the
+              // non-streaming retry can hit the same 400. Emit a
+              // well-formed Anthropic SSE error sequence instead so the
+              // client surfaces a clean, retryable error. Only when nothing
+              // was flushed to the client yet (otherwise the stream format
+              // is already in flight and raw passthrough is the best option).
+              if (
+                isStreamRequest &&
+                !res.headersSent &&
+                clientAdapter.name === "anthropic"
+              ) {
+                let errMsg = `Upstream error ${proxyRes.statusCode}`;
+                try {
+                  const errObj = JSON.parse(fullResponseBuf.toString("utf-8"));
+                  errMsg = errObj?.error?.message || errObj?.message || errMsg;
+                } catch { /* keep generic message */ }
+                res.writeHead(proxyRes.statusCode, clientAdapter.responseHeaders(true));
+                res.write(
+                  `event: message_start\ndata: ${JSON.stringify({
+                    type: "message_start",
+                    message: {
+                      id: messageId,
+                      type: "message",
+                      role: "assistant",
+                      content: [],
+                      model: "contextforge",
+                      stop_reason: null,
+                      stop_sequence: null,
+                      usage: { input_tokens: 0, output_tokens: 0 },
+                    },
+                  })}\n\n`
+                );
+                res.write(
+                  `event: error\ndata: ${JSON.stringify({
+                    type: "error",
+                    error: { type: "upstream_error", message: String(errMsg).slice(0, 500) },
+                  })}\n\n`
+                );
+                res.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
+                res.end();
+                resolve({ hopEndTime, ...acc });
+                return;
+              }
 
               if (!res.headersSent) {
                 res.writeHead(proxyRes.statusCode, {
@@ -1094,6 +1452,133 @@ export function createUpstreamHandler(ctx) {
             // STREAMING: GHOST INTERCEPTOR
             // ═══════════════════════════════════════════════════════════════
             if (isStreamRequest) {
+              // PC-3: native egress — flush verbatim, or ghost-intercept
+              // background tool_use calls (then re-hop natively).
+              if (nativeMode) {
+                const assembled = nativeAssembler.result();
+                if (assembled.usage.input || assembled.usage.cacheRead || assembled.usage.output) {
+                  acc.accumulatedInputTokens -= hopTokens;
+                  acc.accumulatedInputTokens += assembled.usage.input + assembled.usage.cacheRead;
+                  acc.accumulatedCacheReadTokens += assembled.usage.cacheRead;
+                }
+                if (assembled.error) {
+                  if (!res.headersSent) {
+                    res.writeHead(500, { "Content-Type": "application/json" });
+                  }
+                  res.end(
+                    JSON.stringify({
+                      type: "error",
+                      error: { type: "api_error", message: String(assembled.error).slice(0, 500) },
+                    })
+                  );
+                  resolve({ hopEndTime, ...acc });
+                  return;
+                }
+                const bgCalls = assembled.toolCalls.filter((tc) =>
+                  interceptor.isBackgroundTool(tc.name)
+                );
+                if (bgCalls.length > 0 && process.env.CF_MODE !== "passthrough") {
+                  const toolCallsNative = bgCalls.map((tc) => ({
+                    id: tc.id,
+                    type: "function",
+                    function: { name: tc.name, arguments: tc.arguments },
+                  }));
+                  const result = await interceptor.process(
+                    toolCallsNative,
+                    currentPayload,
+                    retryCount,
+                    acc.hopCount
+                  );
+                  if (result.intercepted) {
+                    if (result.circuitBreakerTripped) {
+                      currentPayload.messages.push(
+                        {
+                          role: "assistant",
+                          content: assembled.text || null,
+                          tool_calls: result.toolCalls,
+                        },
+                        ...result.toolCalls.map((tc) => ({
+                          role: "tool",
+                          tool_call_id: tc.id,
+                          name: tc.function.name,
+                          content:
+                            `SYSTEM_ERROR: Background tool budget exhausted ` +
+                            `(${MAX_GHOST_RETRIES} hops used). Do not retry this tool. ` +
+                            `Summarise what you have found so far and proceed using only standard file tools.`,
+                        }))
+                      );
+                      executeUpstreamRequest(currentPayload, 0, acc).then(resolve).catch(reject);
+                      return;
+                    }
+
+                    currentPayload.messages.push({
+                      role: "assistant",
+                      content: assembled.text || null,
+                      tool_calls: result.toolCalls,
+                    });
+
+                    for (const r of result.results) {
+                      let cfType = "text";
+                      if (r.__cf_raw) cfType = "code";
+                      else if (r.name === "contextforge_retrieve") cfType = "code";
+                      else if (
+                        typeof r.content === "string" &&
+                        r.content.trimStart().startsWith("{")
+                      )
+                        cfType = "json";
+
+                      currentPayload.messages.push({
+                        role: "tool",
+                        tool_call_id: r.tool_call_id,
+                        name: r.name,
+                        content: r.content,
+                        _cf_type: cfType,
+                        ...(r._source_file ? { _args: { file_path: r._source_file } } : {}),
+                        ...(r.__cf_raw ? { __cf_raw: true } : {}),
+                      });
+                    }
+
+                    interceptAndVaultMassiveToolResults(currentPayload);
+                    const nextRetry = computeNextRetry(result, retryCount, maxRetries);
+                    executeUpstreamRequest(currentPayload, nextRetry, acc)
+                      .then(resolve)
+                      .catch(reject);
+                    return;
+                  }
+                  // Not intercepted (unexpected — fall through to flush).
+                }
+
+                // Passthrough: flush any remaining held bytes verbatim
+                // (when live forwarding unlocked earlier, nativeHeld is
+                // already drained and bytes were streamed as they arrived).
+                if (!res.headersSent) {
+                  res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                }
+                for (const b of nativeHeld) res.write(b);
+                res.end();
+
+                // UR-10: index final answers (no tool calls) into RAG.
+                if (!assembled.toolCalls.length && assembled.text.trim().length > 0) {
+                  (async () => {
+                    try {
+                      const tokenCount = Math.floor(assembled.text.length / 4);
+                      if (tokenCount >= 50) {
+                        const embedding = await onnxEmbedder.embed(assembled.text);
+                        hybridRetriever.addDocumentWithEmbedding(
+                          "IDX_" + crypto.randomUUID(),
+                          assembled.text,
+                          embedding
+                        );
+                      }
+                    } catch (e) {
+                      console.error("[RAG Index] Indexing failed:", e.message);
+                    }
+                  })();
+                }
+                resolve({ hopEndTime, ...acc });
+                return;
+              }
+
               if (hasSeenToolCall && process.env.CF_MODE !== "passthrough") {
                 const validToolCalls = toolCalls
                   .filter((tc) => tc.name)
@@ -1107,9 +1592,34 @@ export function createUpstreamHandler(ctx) {
                     return call;
                   });
 
-                if (validToolCalls.length > 0) {
+                // G-2: split back any parallel calls the upstream streamed
+                // merged (name doubled / concatenated JSON arguments).
+                const repairedCalls = repairMergedToolCalls(validToolCalls);
+
+                // Only background calls get intercepted and appended to
+                // history, so only their parse-ability gates interception.
+                const bgStreamCalls = repairedCalls.filter((tc) =>
+                  interceptor.isBackgroundTool(tc.function?.name)
+                );
+
+                // G-3: if a BACKGROUND call is STILL unparseable after
+                // repair, do NOT intercept it and do NOT append it to
+                // history. Appending a corrupted tool call to the assistant
+                // message makes the next upstream hop 400 with "invalid tool
+                // call arguments" (a dead loop — the model never gets to
+                // see/redo the call). Instead let the stream fall through to
+                // the client: the model sees the failed tool call on its next
+                // turn and redoes it cleanly.
+                if (validToolCalls.length > 0 && bgStreamCalls.length > 0 && !allCallsInterceptable(bgStreamCalls)) {
+                  console.warn(
+                    `[Ghost Interceptor] ⚠️ Unparseable tool-call arguments (unrepairable) — ` +
+                      `passing stream through to client instead of intercepting`
+                  );
+                  // Fall through to _replayAndEnd() below: flush held events,
+                  // no interception, no history mutation.
+                } else if (validToolCalls.length > 0) {
                   const result = await interceptor.process(
-                    validToolCalls,
+                    repairedCalls,
                     currentPayload,
                     retryCount,
                     acc.hopCount
@@ -1121,9 +1631,9 @@ export function createUpstreamHandler(ctx) {
                         {
                           role: "assistant",
                           content: null,
-                          tool_calls: validToolCalls,
+                          tool_calls: repairedCalls,
                         },
-                        ...validToolCalls.map((tc) => ({
+                        ...repairedCalls.map((tc) => ({
                           role: "tool",
                           tool_call_id: tc.id,
                           name: tc.function.name,
@@ -1216,6 +1726,156 @@ export function createUpstreamHandler(ctx) {
             // NON-STREAMING
             // ═══════════════════════════════════════════════════════════════
             const fullResponseBuf = Buffer.concat(responseChunks);
+
+            // PC-3: native egress — passthrough verbatim, or ghost-intercept
+            // background tool_use blocks (then re-hop natively).
+            if (nativeMode) {
+              let nativeJson;
+              try {
+                nativeJson = JSON.parse(fullResponseBuf.toString("utf-8"));
+              } catch {
+                // Unparseable body — forward verbatim.
+                if (!res.headersSent) {
+                  res.writeHead(proxyRes.statusCode, {
+                    ...proxyRes.headers,
+                    "Access-Control-Allow-Origin": "*",
+                  });
+                }
+                res.write(fullResponseBuf);
+                res.end();
+                resolve({ hopEndTime, ...acc });
+                return;
+              }
+
+              if (nativeJson.type === "error" || nativeJson.error) {
+                if (!res.headersSent) {
+                  res.writeHead(proxyRes.statusCode, { "Content-Type": "application/json" });
+                }
+                res.end(fullResponseBuf);
+                resolve({ hopEndTime, ...acc });
+                return;
+              }
+
+              const internal = nativeMessageToInternal(nativeJson.message);
+              if (internal.usage.input || internal.usage.cacheRead || internal.usage.output) {
+                acc.accumulatedInputTokens -= hopTokens;
+                acc.accumulatedInputTokens += internal.usage.input + internal.usage.cacheRead;
+                acc.accumulatedCacheReadTokens += internal.usage.cacheRead;
+              }
+
+              const bgCallsNative = internal.toolCalls.filter((tc) =>
+                interceptor.isBackgroundTool(tc.function?.name)
+              );
+              if (
+                bgCallsNative.length > 0 &&
+                process.env.CF_MODE !== "passthrough" &&
+                allCallsInterceptable(bgCallsNative)
+              ) {
+                const result = await interceptor.process(
+                  internal.toolCalls,
+                  currentPayload,
+                  retryCount,
+                  acc.hopCount
+                );
+                if (result.intercepted) {
+                  if (result.circuitBreakerTripped) {
+                    currentPayload.messages.push(
+                      {
+                        role: "assistant",
+                        content: internal.content ?? null,
+                        tool_calls: result.toolCalls,
+                      },
+                      ...result.toolCalls.map((tc) => ({
+                        role: "tool",
+                        tool_call_id: tc.id,
+                        name: tc.function.name,
+                        content:
+                          `SYSTEM_ERROR: Background tool budget exhausted ` +
+                          `(${MAX_GHOST_RETRIES} hops used). Do not retry this tool. ` +
+                          `Summarise what you have found so far and proceed using only standard file tools.`,
+                      }))
+                    );
+                    executeUpstreamRequest(currentPayload, 0, acc).then(resolve).catch(reject);
+                    return;
+                  }
+
+                  currentPayload.messages.push({
+                    role: "assistant",
+                    content: internal.content ?? null,
+                    tool_calls: result.toolCalls,
+                  });
+
+                  for (const r of result.results) {
+                    let cfType = "text";
+                    if (r.__cf_raw) cfType = "code";
+                    else if (r.name === "contextforge_retrieve") cfType = "code";
+                    else if (
+                      typeof r.content === "string" &&
+                      r.content.trimStart().startsWith("{")
+                    )
+                      cfType = "json";
+
+                    currentPayload.messages.push({
+                      role: "tool",
+                      tool_call_id: r.tool_call_id,
+                      name: r.name,
+                      content: r.content,
+                      _cf_type: cfType,
+                      ...(r._source_file ? { _args: { file_path: r._source_file } } : {}),
+                      ...(r.__cf_raw ? { __cf_raw: true } : {}),
+                    });
+                  }
+
+                  interceptAndVaultMassiveToolResults(currentPayload);
+                  const nextRetry = computeNextRetry(result, retryCount, maxRetries);
+                  executeUpstreamRequest(currentPayload, nextRetry, acc)
+                    .then(resolve)
+                    .catch(reject);
+                  return;
+                }
+                // Not intercepted — fall through to verbatim passthrough.
+              } else if (
+                bgCallsNative.length > 0 &&
+                !allCallsInterceptable(bgCallsNative)
+              ) {
+                console.warn(
+                  "[Ghost Interceptor] ⚠️ Unparseable native tool-call arguments — " +
+                    "passing response through instead of intercepting (G-3)"
+                );
+              }
+
+              // Passthrough: forward the native JSON verbatim.
+              if (!res.headersSent) {
+                res.writeHead(proxyRes.statusCode, {
+                  ...proxyRes.headers,
+                  "Access-Control-Allow-Origin": "*",
+                });
+              }
+              res.write(fullResponseBuf);
+              res.end();
+
+              // UR-10: index final answers (no tool calls) into RAG.
+              if (!internal.toolCalls.length && internal.content?.trim().length > 0) {
+                (async () => {
+                  try {
+                    const tokenCount = Math.floor(internal.content.length / 4);
+                    if (tokenCount >= 50) {
+                      const embedding = await onnxEmbedder.embed(internal.content);
+                      hybridRetriever.addDocumentWithEmbedding(
+                        "IDX_" + crypto.randomUUID(),
+                        internal.content,
+                        embedding
+                      );
+                    }
+                  } catch (e) {
+                    console.error("[RAG Index] Indexing failed:", e.message);
+                  }
+                })();
+              }
+              resolve({ hopEndTime, ...acc });
+              return;
+            }
+
             let jsonResponse;
 
             try {
@@ -1235,13 +1895,28 @@ export function createUpstreamHandler(ctx) {
 
             const message = jsonResponse.choices?.[0]?.message;
 
+            // G-2: repair merged parallel calls (same safety net as the
+            // streaming path — non-streaming bodies usually carry proper
+            // arrays, but a concatenated-arguments string is legal JSON
+            // text and would otherwise poison the next hop).
+            const repairedToolCalls = repairMergedToolCalls(message?.tool_calls ?? []);
+            const bgCalls = repairedToolCalls.filter((tc) =>
+              interceptor.isBackgroundTool(tc.function?.name)
+            );
+
             if (
               message?.tool_calls &&
               message.tool_calls.length > 0 &&
-              process.env.CF_MODE !== "passthrough"
+              process.env.CF_MODE !== "passthrough" &&
+              // G-3: a background call whose arguments are unparseable after
+              // repair must NOT be intercepted — intercepting appends the
+              // corrupted call to history and the next hop 400s with
+              // "invalid tool call arguments". Pass the response through;
+              // the model redoes the call on its next turn.
+              (bgCalls.length === 0 || allCallsInterceptable(bgCalls))
             ) {
               const result = await interceptor.process(
-                message.tool_calls,
+              repairedToolCalls,
                 currentPayload,
                 retryCount,
                 acc.hopCount
@@ -1253,9 +1928,9 @@ export function createUpstreamHandler(ctx) {
                     {
                       role: "assistant",
                       content: message.content ?? null,
-                      tool_calls: message.tool_calls,
+                      tool_calls: repairedToolCalls,
                     },
-                    ...message.tool_calls.map((tc) => ({
+                    ...repairedToolCalls.map((tc) => ({
                       role: "tool",
                       tool_call_id: tc.id,
                       name: tc.function.name,

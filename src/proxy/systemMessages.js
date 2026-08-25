@@ -24,6 +24,7 @@
  */
 
 import crypto from "node:crypto";
+import { passesTokenGate } from "../compression/compressionHelper.js";
 
 // ─────────────────────────────────────────────
 // Constants
@@ -124,6 +125,15 @@ const MCP_PREFIX = "mcp__contextforge__";
 
 const CF_RULE = CF_NOTICE + buildToolGuidance(MCP_PREFIX) + buildPatchGuidance(MCP_PREFIX);
 
+/**
+ * PC-3 (provider-cache audit): the bare-name variant of the CF rule for the
+ * native Anthropic egress, where ContextForge appends its own tool
+ * definitions (bare names — the Ghost Interceptor intercepts bare names,
+ * and MCP sessions do not use the native egress path). Same single source
+ * of truth as CF_RULE, with the MCP alias prefix removed.
+ */
+export const CF_RULE_BARE = CF_RULE.replace(/mcp__contextforge__/g, "");
+
 // ─────────────────────────────────────────────
 // injectContextForgeRule
 // ─────────────────────────────────────────────
@@ -196,9 +206,16 @@ export function deduplicateSystemMessages(payload) {
         after.length > 0 ? `${before}\n${replacement}\n${after}` : `${before}\n${replacement}`;
 
       if (cleanContent.length < content.length) {
-        charsSaved += content.length - cleanContent.length;
-        prunedCount++;
-        content = cleanContent;
+        // A1 (headroom analysis): token-validation gate. The check above is
+        // char-based; a SHORT skills list (few items, long skill names) can
+        // be replaced by a placeholder that is actually LARGER in tokens.
+        // Gate the removed region against the replacement before accepting.
+        const removedRegion = content.slice(startIdx, endIdx);
+        if (passesTokenGate(removedRegion, replacement)) {
+          charsSaved += content.length - cleanContent.length;
+          prunedCount++;
+          content = cleanContent;
+        }
       }
     }
 

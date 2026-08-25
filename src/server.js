@@ -66,7 +66,6 @@ import { ProviderFactory } from "./providers/index.js";
 import {
   fetchFromVault,
   fetchVaultTextConcatenated,
-  invalidateByFile,
   resetEntireCache,
 } from "./logging/cacheDb.js";
 import { countTokens } from "./compression/compressionHelper.js";
@@ -84,7 +83,20 @@ import {
 } from "./proxy/messageOrigin.js";
 
 // ── Pipeline helpers ──
-import { detectMutation, hashFile } from "./utils/fileUtils.js";
+// PA-2 FIX (pipeline audit): detectMutation/hashFile import removed — their
+// only call site (post-pipeline "State Monitor") did repeated no-effect work
+// on every request: a full JSON.stringify(payload) + 3 regex passes over the
+// whole serialized body, then per match a full file read + SHA-256, feeding
+// invalidateByFile() which queries cache_dependencies — a table NOTHING in
+// the pipeline ever populates (saveToCache/registerDependency have no
+// callers), so it always returned 0 rows. Its file-op pattern
+// ("operation":"create|append" + "filename") also never matched the actual
+// contextforge_patch_ast schema ("create_file" + "file_path"), so the one
+// mutator it was designed for was invisible to it. Real patch-driven
+// invalidation is handled by patchEngine.postPatchInvalidate() at patch
+// time. Removing this saves an O(payload) serialization + regex scan per
+// request and eliminates per-request re-hashing of files whose mutating
+// tool call was already processed on an earlier turn.
 import { minimizeToolSchemas } from "./proxy/translator.js";
 import { interceptAndVaultMassiveToolResults } from "./compression/fatCatch.js";
 import { scrubToolResults, tagToolResults } from "./compression/toolScrubber.js";
@@ -103,29 +115,28 @@ import { applyCCRPipeline } from "./ccr/index.js";
 // ── Memory ──
 import { MemoryHandler } from "./memory/memoryHandler.js";
 import { setEmbedder } from "./memory/embedder.js";
-import { injectMemoryTools } from "./memory/memoryTools.js";
+// A2 NOTE: injectMemoryTools is no longer called here — memory-tool
+// availability moved into the deterministic stable tool set (stableTools.js).
+// The module stays exported for library consumers.
 
 // ── Graph + Patch ──
 import { indexWorkspace, watchWorkspace, setSymbolEmbedder } from "./graph/workspaceMapper.js";
 import {
-  injectGraphTool,
-  injectReadFileChunkTool,
-  isGraphToolCall, // RQ-7: used to detect an already-present MCP alias before injecting
-  isReadFileChunkTool, // RQ-7
   executeGraphQuery, // SV-4: static import replaces dynamic import()
   executeReadFileChunk, // SV-4: static import replaces dynamic import()
   getGraphToolDefinition, // CF-P8: served to the MCP bridge via /v1/mcp/tools
   getReadFileChunkToolDefinition, // CF-P8
 } from "./graph/graphTools.js";
 import {
-  injectPatchTool,
-  isPatchToolCall, // RQ-7: used to detect an already-present MCP alias before injecting
   executePatchToolCall, // SV-4: static import replaces dynamic import()
   getPatchToolDefinition, // CF-P8
 } from "./graph/patchTools.js";
 
 // ── Request Planner ──
-import { initPlanner, planPipeline, CAPABILITIES } from "./proxy/requestPlanner.js";
+import { initPlanner, planPipeline } from "./proxy/requestPlanner.js";
+
+// ── A2: deterministic stable tool set ──
+import { applyStableToolSet, isMcpToolSession } from "./proxy/stableTools.js";
 
 // ── Upstream handler ──
 import { createUpstreamHandler } from "./proxy/upstreamRequest.js";
@@ -755,6 +766,11 @@ async function handleRequest(req, res, chunks) {
 
   // ── Detect client format + normalize to OpenAI internal format ──
   const { adapter: clientAdapter } = detectAdapter(req.url, req.headers);
+  // PC-3 (provider-cache audit): keep the client's ORIGINAL body (with
+  // Anthropic cache_control markers on system/tools) so the native
+  // egress can forward its prefix verbatim instead of a re-serialized
+  // OpenAI translation that would carry no cache markers at all.
+  const clientOriginalBody = payload;
   const { payload: normalizedPayload } = clientAdapter.toInternal(payload, req.headers);
   payload = normalizedPayload;
 
@@ -799,6 +815,7 @@ async function handleRequest(req, res, chunks) {
     maxRetries,
     mockUpstreamPort,
     trueBaselineTokens,
+    clientOriginalBody, // PC-3: verbatim prefix for native Anthropic egress
   });
 
   // ── PASSTHROUGH MODE ──
@@ -821,6 +838,8 @@ async function handleRequest(req, res, chunks) {
       finalTokens: passthroughWireTokens,
       pipelineLatency: 0,
       upstreamLatency: passthroughLatencyMs,
+      cacheReadTokens: passthroughCacheRead,
+      inputTokens: Math.max(0, passthroughWireTokens - passthroughCacheRead),
     });
 
     console.log(`[Metrics] Total E2E Latency: ${passthroughLatencyMs.toFixed(2)}ms`);
@@ -859,60 +878,43 @@ async function handleRequest(req, res, chunks) {
     const originResult = detectMessageOrigin(payload.messages);
     console.log(`[Planner] Origin: ${originResult.origin} | Reason: ${originResult.reason}`);
 
-    if (!requiresRepositoryWork(originResult.origin)) {
+    if (requiresRepositoryWork(originResult.origin)) {
+      // SV-1 FIX: planPipeline runs every turn — no module-level cache.
+      // A2 NOTE: the plan's capabilities no longer gate tool AVAILABILITY
+      // (that is now the deterministic stable set, below — flipping the
+      // tools array per intent was a provider-cache bust, see
+      // stableTools.js). The plan is still computed for origin/telemetry
+      // and the debug-translation capture.
+      plan = await planPipeline(
+        payload,
+        { hasPriorTools, trueBaselineTokens, originHint: originResult.origin },
+        onnxEmbedder
+      );
+    } else {
       plan = {
         capabilities: new Set(),
         intent: originResult.origin,
         method: "origin_detection",
         bypass: true,
       };
-      return;
     }
 
-    // SV-1 FIX: planPipeline runs every turn — no module-level cache.
-    plan = await planPipeline(
-      payload,
-      { hasPriorTools, trueBaselineTokens, originHint: originResult.origin },
-      onnxEmbedder
-    );
-
-    // RQ-7 FIX: injectGraphTool/injectPatchTool/injectReadFileChunkTool were
-    // imported but never called — dead code. Non-MCP clients (direct
-    // OpenAI-format callers, or Claude Code with ContextForge's MCP server
-    // NOT registered) had no path to ever receive contextforge_query_graph/
-    // contextforge_patch_ast/read_file_chunk at all; those tools only ever
-    // reached the model via the separate /v1/mcp/tools + /v1/mcp/tool routes
-    // consumed by mcp/bridge.js.
-    //
-    // Guard: skip entirely if the request already carries ANY mcp__-prefixed
-    // ContextForge tool alias. This keeps MCP-registered sessions exactly as
-    // they are today (Ghost Interceptor correctly never touches mcp__ calls,
-    // per isBackgroundTool in upstreamRequest.js) while giving non-MCP
-    // clients the tools they were always supposed to get. injectGraphTool/
-    // injectPatchTool/injectReadFileChunkTool each also carry their own
-    // isGraphToolCall/isPatchToolCall/isReadFileChunkTool-based dedup check
-    // (RQ-7 in graphTools.js/patchTools.js) recognizing bare name AND both
-    // MCP alias forms, so this is not the only safety net — but checking
-    // here too avoids even calling the injector functions on an MCP session.
-    const alreadyHasMcpTools = Array.isArray(payload.tools)
-      ? payload.tools.some((t) => {
-          const name = t.name || t.function?.name;
-          return isGraphToolCall(name) || isPatchToolCall(name) || isReadFileChunkTool(name);
-        })
-      : false;
-
-    if (!alreadyHasMcpTools && plan.capabilities?.size > 0) {
-      let tools = payload.tools || [];
-      if (plan.capabilities.has(CAPABILITIES.GRAPH)) {
-        tools = injectGraphTool(tools);
-      }
-      if (plan.capabilities.has(CAPABILITIES.PATCH)) {
-        tools = injectPatchTool(tools);
-      }
-      if (plan.capabilities.has(CAPABILITIES.READ)) {
-        tools = injectReadFileChunkTool(tools);
-      }
-      payload.tools = tools;
+    // A2 (headroom analysis): deterministic stable tool set. The old
+    // capability-based injection toggled the tools array per turn (PATCH
+    // turn: 1 tool; DEBUG turn: 3; CCR retrieve tool appearing/disappearing
+    // as vaults were retrieved; memory tools keyed off the LATEST user
+    // message) — every toggle busted the provider's prompt-cache prefix
+    // (system + tools + history) for the whole next request. Now: fixed
+    // availability, fixed order, byte-identical schemas; sticky
+    // payload-derived conditions for retrieve (compression markers) and
+    // memory (memory activity). MCP sessions are left untouched.
+    // RQ-7 guard preserved: mcp__-aliased sessions already have their
+    // tools from the MCP server and must not get a second set.
+    const { added } = applyStableToolSet(payload, {
+      mcpSession: isMcpToolSession(payload.tools),
+    });
+    if (added.length > 0) {
+      console.log(`[StableTools] ✅ +${added.join(", ")}`);
     }
   });
 
@@ -945,13 +947,23 @@ async function handleRequest(req, res, chunks) {
       finalTokens: passthroughWireTokens,
       pipelineLatency: 0,
       upstreamLatency: passthroughLatencyMs,
+      cacheReadTokens: passthroughCacheRead,
+      inputTokens: Math.max(0, passthroughWireTokens - passthroughCacheRead),
     });
     return;
   }
 
   // ── COMPRESSION PIPELINE ──
-  const prePipelinePayloadStr = JSON.stringify(payload);
-  const policy = getPolicyForModel(payload.model || "");
+  // PA-1 FIX (pipeline audit): pass the payload so the pressure-aware tier
+  // is computed from the ACTUAL request size. The legacy single-arg call
+  // made estimatePayloadTokens() return 0 → pressure pinned to LOW → on the
+  // default local (ollama) upstream compressToolResults was ALWAYS false,
+  // silently disabling the AST-compression stage (and the jsonCrusher master
+  // switch) for every session regardless of window pressure. Reproduced: a
+  // 69k-token session ran with code_compress=0.0025ms and net-negative
+  // token savings. With the payload, a 45k+-token session resolves to HIGH
+  // pressure and engages full compression (see compressionPolicy.resolvePolicy).
+  const policy = getPolicyForModel(payload.model || "", payload);
   Object.defineProperty(payload, "__policy", {
     value: policy,
     writable: true,
@@ -975,10 +987,11 @@ async function handleRequest(req, res, chunks) {
       !m.content.includes("[CF_COMPRESSED_FILE") // SV-5 FIX
   );
 
-  // 1. Inject Memory Tools
-  timer.time(STAGES.MEMORY_INJECT, () => {
-    payload = injectMemoryTools(payload);
-  });
+  // 1. Memory Tools — A2: availability now comes from the deterministic
+  // stable tool set (applied in GRAPH_INJECT above, sticky on payload
+  // memory activity). Stage kept as a timing placeholder so the stage
+  // list seen by the dashboard stays stable.
+  timer.time(STAGES.MEMORY_INJECT, () => {});
 
   // 2. Scrub Tool Results
   if (hasCompressibleContent) {
@@ -1140,19 +1153,6 @@ async function handleRequest(req, res, chunks) {
     );
   }
 
-  // ── Mutation detection ──
-  const { isMutation, mutatedFile } = detectMutation(prePipelinePayloadStr);
-  if (isMutation && mutatedFile) {
-    const newHash = hashFile(mutatedFile);
-    const result = invalidateByFile(mutatedFile, newHash, semanticCache);
-    if (result.deletedIds.length > 0) {
-      console.log(
-        `\n[State Monitor] 🚨 Mutation on '${mutatedFile}'. ` +
-          `Invalidated ${result.deletedIds.length} entries.`
-      );
-    }
-  }
-
   // ── Expose metrics via HTTP headers ──
   res.setHeader("x-cf-tokens-before", trueBaselineTokens);
   res.setHeader("x-cf-tokens-after", finalTokens);
@@ -1181,7 +1181,27 @@ async function handleRequest(req, res, chunks) {
     finalTokens: wireTokens,
     pipelineLatency: pipelineLatencyMs,
     upstreamLatency: totalLatencyMs - pipelineLatencyMs,
+    cacheReadTokens: cacheReadTokens,
+    inputTokens: Math.max(0, wireTokens - cacheReadTokens),
   });
+
+  // A2.4 (headroom analysis): cache-bust drift alarm. Providers that report
+  // prompt-cache usage (openai, anthropic wire) should return cache-read
+  // tokens for a large request whose stable prefix (system + tools) was
+  // already sent this session — zero on a big request means the prefix
+  // changed (tools flip, system rewrite, compaction) or the key rotated.
+  // Ollama/Gemini don't report cache usage, so no alarm for them.
+  if (
+    (provider.name === "openai" || provider.name === "anthropic") &&
+    finalTokens >= 10_000 &&
+    cacheReadTokens === 0
+  ) {
+    console.warn(
+      `[Cache Drift] ⚠️ ${finalTokens}-token request got ZERO cache-read ` +
+        `tokens from the upstream — the stable prefix (system + tools + ` +
+        `history) was not served from the provider's prompt cache this turn`
+    );
+  }
 
   // ── Pipeline report ──
   console.log("\n=== ContextForge Pipeline Report ===");

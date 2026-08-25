@@ -14,6 +14,16 @@ class SessionState {
     this.retrievedVaultIds = new Set();
     // ── NEW: track which turn each vault was first discovered ──
     this.vaultDiscoveredTurn = new Map(); // vaultId → turnNumber
+    // PC-1 (provider-cache audit): monotonic sticky flag. Once this
+    // conversation has ever produced a compressed/vaulted payload, the
+    // contextforge_retrieve tool stays in the tools array for the rest of
+    // the session. Provider prompt caches key on the exact prefix bytes
+    // (system + tools + history); a tools array that shrinks after the
+    // model retrieves a vault changed the prefix every retrieval event and
+    // busted the cache for the next turn. Availability is now
+    // append-only: added once, never removed (a NEW conversation gets a
+    // NEW session object, so stickiness never leaks across conversations).
+    this.stickyRetrieve = false;
   }
 
   addDiscoveredVaultId(vaultId) {

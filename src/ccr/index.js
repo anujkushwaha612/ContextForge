@@ -168,7 +168,7 @@ export function applyCCRPipeline(payload, tokenCount = null) {
     return true;
   });
 
-  const shouldInject = unretrievedVaultIds.length > 0;
+  const shouldInject = unretrievedVaultIds.length > 0 || session.stickyRetrieve;
 
   if (!shouldInject) {
     return payload;

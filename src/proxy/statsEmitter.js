@@ -25,6 +25,11 @@ class StatsEmitter extends EventEmitter {
       avgUpstreamLatency: 0,
       lastPipelineLatency: 0,
       lastUpstreamLatency: 0,
+      // A2.4 (headroom analysis): provider prompt-cache telemetry.
+      cacheReadTokens: 0, // Σ cache-read tokens reported by the upstream
+      requestsWithCacheRead: 0, // requests where the upstream reported a hit
+      lastCacheReadTokens: 0,
+      lastCacheHitRatio: 0, // cacheRead / (cacheRead + input) for last request
     };
 
     // ── Per-stage latency rolling averages ──
@@ -79,6 +84,8 @@ class StatsEmitter extends EventEmitter {
     finalTokens,
     pipelineLatency,
     upstreamLatency,
+    cacheReadTokens = 0,
+    inputTokens = null,
   }) {
     this.session.totalRequests++;
     this.session.tokensBefore += baselineTokens;
@@ -86,6 +93,16 @@ class StatsEmitter extends EventEmitter {
     this.session.tokensSaved += baselineTokens - finalTokens;
     this.session.lastPipelineLatency = pipelineLatency;
     this.session.lastUpstreamLatency = upstreamLatency;
+
+    // A2.4: provider prompt-cache tracking. `inputTokens` is the
+    // non-cached input reported by the upstream usage (already split by
+    // normalizeUsage), so cacheRead + input = total prompt tokens.
+    this.session.cacheReadTokens += cacheReadTokens || 0;
+    if ((cacheReadTokens || 0) > 0) this.session.requestsWithCacheRead++;
+    this.session.lastCacheReadTokens = cacheReadTokens || 0;
+    const totalPrompt = (cacheReadTokens || 0) + (inputTokens || 0);
+    this.session.lastCacheHitRatio =
+      totalPrompt > 0 ? (cacheReadTokens || 0) / totalPrompt : 0;
 
     // Rolling averages
     const n = this.session.totalRequests;
